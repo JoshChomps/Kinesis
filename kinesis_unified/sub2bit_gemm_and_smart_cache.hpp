@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -683,11 +684,24 @@ struct SmartCacheTelemetry {
     }
 };
 
+/**
+ * Sieve policies (fixes O8 / O9 of docs/11):
+ *   - Exact (default, energy_sieve_tau == 0 and no error budget): every K-group is computed.
+ *   - Relative energy (energy_sieve_tau > 0): legacy heuristic. A group is skipped when its L1 activation
+ *     energy summed over all rows is below tau * mean. LOSSY with NO error guarantee: a single large row can
+ *     be dropped when the other rows are small. Opt-in only.
+ *   - Error budget (set_error_budget(eps > 0), overrides tau): per panel p, groups are skipped in order of
+ *     increasing bound b(p, g) = max_c |scale(p, g, c)| * max_m L1(A[m, g]) while sum of skipped b <= eps.
+ *     Because |w| <= |scale| for both W1 (+/- scale) and W2 ({-1, 0, +1} * scale),
+ *         |C_exact[m, n] - C_sieved[m, n]| <= sum_{skipped g} |scale(p, g, c)| * L1(A[m, g]) <= eps
+ *     for every output element, in exact arithmetic (floating-point rounding of the retained terms aside).
+ *     Non-finite activations give an infinite bound, so their groups are never skipped.
+ */
 class SmartTieredCache {
 public:
     explicit SmartTieredCache(size_t num_panels,
                               size_t max_vram_hot_panels,
-                              float energy_sieve_tau = 0.85f,
+                              float energy_sieve_tau = 0.0f,
                               uint32_t promotion_threshold = 2)
         : max_vram_panels_(max_vram_hot_panels),
           tau_(energy_sieve_tau),
@@ -696,6 +710,10 @@ public:
           panel_last_touch_(num_panels, 0),
           panel_in_vram_(num_panels, false),
           kv_page_slab_(256, true) {}
+
+    /** eps > 0 enables the guaranteed-error sieve (see class comment); eps <= 0 turns it off. */
+    void set_error_budget(float abs_error_budget) noexcept { error_budget_ = abs_error_budget; }
+    [[nodiscard]] bool is_exact() const noexcept { return !(error_budget_ > 0.0f) && !(tau_ > 0.0f); }
 
     /**
      * @brief Records a panel access and performs automatic hot-panel promotion into Tier-1 VRAM,
@@ -757,32 +775,15 @@ public:
         const TensorView<const float>& A,
         const W1GotoBlasPanelSet& B_packed,
         TensorView<float> C,
-        bool force_exact_zero_pruning = false
+        bool force_exact = false
     ) {
         const size_t M = static_cast<size_t>(A.size(0));
         const size_t K = B_packed.K;
         const size_t N = B_packed.N;
         const size_t num_groups = B_packed.groups_per_col;
 
-        // Step 1: Compute per-group L1 activation energy for the Tiled-CBC predictive sieve
-        std::vector<float> group_energy(num_groups, 0.0f);
-        float mean_energy = 0.0f;
-        for (size_t g = 0; g < num_groups; ++g) {
-            const size_t k_base = g * kGroupSizeG128;
-            const size_t k_end = std::min(K, k_base + kGroupSizeG128);
-            float e = 0.0f;
-            for (size_t m = 0; m < M; ++m) {
-                for (size_t k = k_base; k < k_end; ++k) {
-                    e += std::fabs(A(static_cast<int64_t>(m), static_cast<int64_t>(k)));
-                }
-            }
-            group_energy[g] = e;
-            mean_energy += e;
-        }
-        if (num_groups > 0) {
-            mean_energy /= static_cast<float>(num_groups);
-        }
-        const float threshold = force_exact_zero_pruning ? -1.0f : (tau_ * mean_energy);
+        check_gemm_shapes(A, C, K, N);
+        compute_group_energies(A, K, num_groups);
 
         // Step 2: Iterate over GotoBLAS Nr=8 panels, keeping YMM accumulators live across all K-groups
         for (size_t p = 0; p < B_packed.num_panels; ++p) {
@@ -790,15 +791,18 @@ public:
             const size_t n_valid = std::min(kNr8, N - n_base);
             const uint8_t* bits_ptr = &B_packed.packed_bits[p * K];
 
-            // Record per-(panel, group) sieve & tiered cache telemetry
+            plan_panel_sieve(B_packed.packed_scales_bf16, p, num_groups, n_valid, force_exact);
+            // Telemetry per (panel, group); the panel counts as one access per GEMM call (fixes O11)
+            size_t active_groups = 0;
             for (size_t g = 0; g < num_groups; ++g) {
                 ++telemetry_.total_tile_requests;
-                if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                if (skip_[g]) {
                     ++telemetry_.tiles_pruned_by_energy_sieve;
-                    continue;
+                } else {
+                    ++active_groups;
                 }
-                record_panel_access_and_promote(p);
             }
+            if (active_groups > 0) record_panel_access_and_promote(p);
 
             // 4x8 Register-Blocked Branchless AVX2 Unpack + FMA Micro-Kernel (p -> ir -> g -> k)
             for (size_t ir = 0; ir < M; ir += kMr4) {
@@ -811,7 +815,7 @@ public:
                 __m256 acc3 = _mm256_setzero_ps();
 
                 for (size_t g = 0; g < num_groups; ++g) {
-                    if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                    if (skip_[g]) {
                         continue;
                     }
                     const size_t k_base = g * kGroupSizeG128;
@@ -852,7 +856,7 @@ public:
 #else
                 float tmp[4][8] = {{0.0f}};
                 for (size_t g = 0; g < num_groups; ++g) {
-                    if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                    if (skip_[g]) {
                         continue;
                     }
                     const size_t k_base = g * kGroupSizeG128;
@@ -895,45 +899,33 @@ public:
         const TensorView<const float>& A,
         const W2GotoBlasPanelSet& B_packed,
         TensorView<float> C,
-        bool force_exact_zero_pruning = false
+        bool force_exact = false
     ) {
         const size_t M = static_cast<size_t>(A.size(0));
         const size_t K = B_packed.K;
         const size_t N = B_packed.N;
         const size_t num_groups = B_packed.groups_per_col;
 
-        std::vector<float> group_energy(num_groups, 0.0f);
-        float mean_energy = 0.0f;
-        for (size_t g = 0; g < num_groups; ++g) {
-            const size_t k_base = g * kGroupSizeG128;
-            const size_t k_end = std::min(K, k_base + kGroupSizeG128);
-            float e = 0.0f;
-            for (size_t m = 0; m < M; ++m) {
-                for (size_t k = k_base; k < k_end; ++k) {
-                    e += std::fabs(A(static_cast<int64_t>(m), static_cast<int64_t>(k)));
-                }
-            }
-            group_energy[g] = e;
-            mean_energy += e;
-        }
-        if (num_groups > 0) {
-            mean_energy /= static_cast<float>(num_groups);
-        }
-        const float threshold = force_exact_zero_pruning ? -1.0f : (tau_ * mean_energy);
+        check_gemm_shapes(A, C, K, N);
+        compute_group_energies(A, K, num_groups);
 
         for (size_t p = 0; p < B_packed.num_panels; ++p) {
             const size_t n_base = p * kNr8;
             const size_t n_valid = std::min(kNr8, N - n_base);
             const uint16_t* trits_ptr = &B_packed.packed_trits[p * K];
 
+            plan_panel_sieve(B_packed.packed_scales_bf16, p, num_groups, n_valid, force_exact);
+            // Telemetry per (panel, group); the panel counts as one access per GEMM call (fixes O11)
+            size_t active_groups = 0;
             for (size_t g = 0; g < num_groups; ++g) {
                 ++telemetry_.total_tile_requests;
-                if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                if (skip_[g]) {
                     ++telemetry_.tiles_pruned_by_energy_sieve;
-                    continue;
+                } else {
+                    ++active_groups;
                 }
-                record_panel_access_and_promote(p);
             }
+            if (active_groups > 0) record_panel_access_and_promote(p);
 
             for (size_t ir = 0; ir < M; ir += kMr4) {
                 const size_t m_valid = std::min(kMr4, M - ir);
@@ -945,7 +937,7 @@ public:
                 __m256 acc3 = _mm256_setzero_ps();
 
                 for (size_t g = 0; g < num_groups; ++g) {
-                    if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                    if (skip_[g]) {
                         continue;
                     }
                     const size_t k_base = g * kGroupSizeG128;
@@ -986,7 +978,7 @@ public:
 #else
                 float tmp[4][8] = {{0.0f}};
                 for (size_t g = 0; g < num_groups; ++g) {
-                    if (!force_exact_zero_pruning && group_energy[g] < threshold) {
+                    if (skip_[g]) {
                         continue;
                     }
                     const size_t k_base = g * kGroupSizeG128;
@@ -1077,16 +1069,90 @@ public:
     [[nodiscard]] const SmartCacheTelemetry& telemetry() const noexcept { return telemetry_; }
 
 private:
+    template <typename TC>
+    static void check_gemm_shapes(const TensorView<const float>& A, const TensorView<TC>& C, size_t K, size_t N) {
+        if (static_cast<size_t>(A.size(1)) != K || C.size(0) != A.size(0) || static_cast<size_t>(C.size(1)) != N) {
+            throw std::invalid_argument("SmartTieredCache GEMM: expected A[M, K] and C[M, N] matching the packed weights");
+        }
+    }
+
+    // Per-group L1 activation energy: summed over rows (legacy tau heuristic) and max over rows (error bound).
+    // Non-finite row energy is mapped to +inf so the bound never admits skipping it and sorting stays well-defined.
+    void compute_group_energies(const TensorView<const float>& A, size_t K, size_t num_groups) {
+        const size_t M = static_cast<size_t>(A.size(0));
+        group_energy_sum_.assign(num_groups, 0.0f);
+        group_row_max_l1_.assign(num_groups, 0.0f);
+        float total = 0.0f;
+        for (size_t g = 0; g < num_groups; ++g) {
+            const size_t k_base = g * kGroupSizeG128;
+            const size_t k_end = std::min(K, k_base + kGroupSizeG128);
+            float sum = 0.0f, row_max = 0.0f;
+            for (size_t m = 0; m < M; ++m) {
+                float row_l1 = 0.0f;
+                for (size_t k = k_base; k < k_end; ++k) {
+                    row_l1 += std::fabs(A(static_cast<int64_t>(m), static_cast<int64_t>(k)));
+                }
+                if (!std::isfinite(row_l1)) row_l1 = std::numeric_limits<float>::infinity();
+                sum += row_l1;
+                row_max = std::max(row_max, row_l1);
+            }
+            group_energy_sum_[g] = sum;
+            group_row_max_l1_[g] = row_max;
+            total += sum;
+        }
+        mean_energy_ = (num_groups > 0) ? total / static_cast<float>(num_groups) : 0.0f;
+    }
+
+    // Fills skip_[g] for panel p according to the active sieve policy (see class comment).
+    void plan_panel_sieve(const std::vector<uint16_t>& scales_bf16, size_t p, size_t num_groups,
+                          size_t n_valid, bool force_exact) {
+        skip_.assign(num_groups, 0);
+        if (force_exact) return;
+        if (error_budget_ > 0.0f) {
+            bound_.resize(num_groups);
+            order_.resize(num_groups);
+            for (size_t g = 0; g < num_groups; ++g) {
+                float smax = 0.0f;
+                for (size_t c = 0; c < n_valid; ++c) {
+                    smax = std::max(smax, std::fabs(bf16_bits_to_fp32(scales_bf16[(p * num_groups + g) * kNr8 + c])));
+                }
+                const float e = group_row_max_l1_[g];
+                bound_[g] = std::isinf(e) ? e : smax * e;
+                if (!std::isfinite(bound_[g])) bound_[g] = std::numeric_limits<float>::infinity();
+            }
+            std::iota(order_.begin(), order_.end(), size_t{0});
+            std::stable_sort(order_.begin(), order_.end(), [&](size_t x, size_t y) { return bound_[x] < bound_[y]; });
+            double spent = 0.0;
+            for (const size_t g : order_) {
+                if (spent + static_cast<double>(bound_[g]) > static_cast<double>(error_budget_)) break;
+                spent += static_cast<double>(bound_[g]);
+                skip_[g] = 1;
+            }
+        } else if (tau_ > 0.0f) {
+            const float threshold = tau_ * mean_energy_;
+            for (size_t g = 0; g < num_groups; ++g) skip_[g] = (group_energy_sum_[g] < threshold) ? 1 : 0;
+        }
+    }
+
+private:
     size_t                max_vram_panels_{0};
     size_t                current_vram_panels_{0};
     uint64_t              access_clock_{0};
-    float                 tau_{0.85f};
+    float                 tau_{0.0f};
+    float                 error_budget_{0.0f};
     uint32_t              promotion_threshold_{2};
     std::vector<uint32_t> panel_access_counts_;
     std::vector<uint64_t> panel_last_touch_;
     std::vector<bool>     panel_in_vram_;
     SlabAllocator<UHA_KV_PAGE_INT4_BYTES> kv_page_slab_;
     SmartCacheTelemetry   telemetry_{};
+    // Scratch reused across GEMM calls (not thread-safe: one cache instance per thread)
+    std::vector<float>    group_energy_sum_;
+    std::vector<float>    group_row_max_l1_;
+    std::vector<float>    bound_;
+    std::vector<size_t>   order_;
+    std::vector<uint8_t>  skip_;
+    float                 mean_energy_{0.0f};
 };
 
 } // namespace kinesis::unified

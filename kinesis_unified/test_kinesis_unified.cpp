@@ -139,7 +139,7 @@ int main() {
 
     SmartTieredCache smart_cache(w1_panels.num_panels, w1_panels.num_panels / 2, 0.90f, 1);
     TensorView<float> C_w1_exact(C_buf, Shape{static_cast<int64_t>(M), static_cast<int64_t>(N)});
-    smart_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact_zero_pruning=*/true);
+    smart_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact=*/true);
 
     // Compute exact dequantized W1 reference and verify zero mismatch with AVX2 branchless unpacker
     float max_w1_unpack_err = 0.0f;
@@ -172,7 +172,7 @@ int main() {
     UHA_VERIFY(w2_comp_ratio > 15.0); // 32 bits / 2.125 bits = 15.06x compression vs FP32
 
     TensorView<float> C_w2_exact(C_buf, Shape{static_cast<int64_t>(M), static_cast<int64_t>(N)});
-    smart_cache.execute_smart_w2_gemm(A_view, w2_panels, C_w2_exact, /*force_exact_zero_pruning=*/true);
+    smart_cache.execute_smart_w2_gemm(A_view, w2_panels, C_w2_exact, /*force_exact=*/true);
     float max_w2_unpack_err = 0.0f;
     for (size_t i = 0; i < M; ++i) {
         for (size_t j = 0; j < N; ++j) {
@@ -237,12 +237,12 @@ int main() {
     }
     SmartTieredCache tiered_cache(w1_panels.num_panels, /*max_vram_hot_panels=*/4, /*tau=*/0.85f, /*promo=*/1);
     // Pass 1: Cold panels computed in CPU L3 via AVX2 and first 4 panels promoted to Tier-1 VRAM
-    tiered_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact_zero_pruning=*/false);
+    tiered_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact=*/false);
     // Touch panel 5 repeatedly so it out-heats resident panel 0 and triggers LFU Tier-1 VRAM eviction
     tiered_cache.record_panel_access_and_promote(5);
     tiered_cache.record_panel_access_and_promote(5);
     // Pass 2: Promoted panels now hit directly in Tier-1 Single-GPU VRAM cache
-    tiered_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact_zero_pruning=*/false);
+    tiered_cache.execute_smart_w1_gemm(A_view, w1_panels, C_w1_exact, /*force_exact=*/false);
 
     void* kv_page = tiered_cache.allocate_kv_page();
     UHA_VERIFY(kv_page != nullptr);
@@ -258,7 +258,7 @@ int main() {
                 tel.total_tile_requests, tel.tiles_pruned_by_energy_sieve, tel.pruning_ratio_percent());
     std::printf("    Tier-2 CPU L3 Hits = %zu | Promotions = %zu | Evictions = %zu | Tier-1 VRAM Hits = %zu\n",
                 tel.tier2_cpu_l3_hits, tel.hot_tile_promotions, tel.tier1_vram_evictions, tel.tier1_vram_hits);
-    std::printf("    Effective Weight Bandwidth Amplification = %.2fx (vs FP32) / %.2fx (vs FP16) -> PASS\n",
+    std::printf("    Modelled weight-traffic ratio (compression x 1/(1 - skipped), NOT measured) = %.2fx (vs FP32) / %.2fx (vs FP16) -> PASS\n",
                 tel.effective_bandwidth_multiplier(comp_ratio),
                 tel.effective_bandwidth_multiplier(comp_ratio / 2.0));
 
@@ -310,7 +310,7 @@ int main() {
         TensorView<float> Cz(c_zero.data(), Shape{1, 8});
         const W1GotoBlasPanelSet wz = pack_w1_gotoblas_panels(Wz);
         SmartTieredCache zero_cache(wz.num_panels, 0, 0.0f, 1);
-        zero_cache.execute_smart_w1_gemm(Az, wz, Cz, /*force_exact_zero_pruning=*/true);
+        zero_cache.execute_smart_w1_gemm(Az, wz, Cz, /*force_exact=*/true);
         for (size_t j = 0; j < 8; ++j) UHA_VERIFY(c_zero[j] == 0.0f);
 
         // (d) Offline power-law seeding places exactly the top-scoring panels; aging halves counters
@@ -334,6 +334,104 @@ int main() {
         std::printf("    pshufb vs scalar LUT mismatches = 0 | max |err| vs FP32 W1 = %.3e (%.1f%% of analytic bound) | zero-group exact = PASS\n",
                     max_lut_err, 100.0 * worst_ratio);
         std::printf("    NOTE: accuracy only; no speedup is claimed or measured for this kernel -> PASS\n");
+    }
+
+    // 8. Sieve policies: exact by default, guaranteed error budget, and a negative control for the
+    //    legacy relative-energy heuristic (docs/11 O8, O9)
+    {
+        const size_t Ms = 8, Ks = 1024, Ns = 24; // 8 K-groups, 3 panels
+        uint32_t lcg = 12345U;
+        auto rnd = [&lcg]() {
+            lcg = lcg * 1664525U + 1013904223U;
+            return static_cast<float>((lcg >> 8) & 0xFFFFU) / 32768.0f - 1.0f; // [-1, 1)
+        };
+        std::vector<float> w_s(Ks * Ns), a_s(Ms * Ks);
+        for (auto& v : w_s) v = rnd();
+        for (size_t m = 0; m < Ms; ++m) {
+            for (size_t k = 0; k < Ks; ++k) {
+                const size_t g = k / kGroupSizeG128;
+                // Groups 0..3 are quiet for every row; group 1 has ONE loud row (row 5): the case where the
+                // summed-over-rows heuristic drops a group that matters to a single row.
+                float amp = (g < 4) ? 0.0005f : 1.0f;
+                if (g == 1 && m == 5) amp = 0.5f;
+                a_s[m * Ks + k] = amp * rnd();
+            }
+        }
+        TensorView<const float> Ws(w_s.data(), Shape{static_cast<int64_t>(Ks), static_cast<int64_t>(Ns)});
+        TensorView<const float> As(a_s.data(), Shape{static_cast<int64_t>(Ms), static_cast<int64_t>(Ks)});
+        const W1GotoBlasPanelSet w1s = pack_w1_gotoblas_panels(Ws);
+        const W2GotoBlasPanelSet w2s = pack_w2_gotoblas_panels(Ws);
+
+        std::vector<float> c_ref(Ms * Ns), c_def(Ms * Ns), c_bud(Ms * Ns), c_tau(Ms * Ns);
+        auto view = [&](std::vector<float>& v) {
+            return TensorView<float>(v.data(), Shape{static_cast<int64_t>(Ms), static_cast<int64_t>(Ns)});
+        };
+        auto max_abs_diff = [&](const std::vector<float>& x, const std::vector<float>& y) {
+            float d = 0.0f;
+            for (size_t i = 0; i < x.size(); ++i) d = std::max(d, std::fabs(x[i] - y[i]));
+            return d;
+        };
+        float c_max = 0.0f;
+
+        // (a) Default-constructed cache is exact and bit-identical to an explicit exact call
+        SmartTieredCache c_exact(w1s.num_panels, 1);
+        UHA_VERIFY(c_exact.is_exact());
+        c_exact.execute_smart_w1_gemm(As, w1s, view(c_ref), /*force_exact=*/true);
+        SmartTieredCache c_default(w1s.num_panels, 1);
+        c_default.execute_smart_w1_gemm(As, w1s, view(c_def));
+        UHA_VERIFY(c_def == c_ref);
+        UHA_VERIFY(c_default.telemetry().tiles_pruned_by_energy_sieve == 0);
+        for (float v : c_ref) c_max = std::max(c_max, std::fabs(v));
+
+        // (b) Error budget: every output element stays within eps (plus float reassociation slack)
+        const float eps = 0.05f;
+        const float slack = 1e-5f * c_max;
+        size_t budget_skips_w1 = 0, budget_skips_w2 = 0;
+        float err_w1 = 0.0f, err_w2 = 0.0f;
+        {
+            SmartTieredCache c_b(w1s.num_panels, 1);
+            c_b.set_error_budget(eps);
+            UHA_VERIFY(!c_b.is_exact());
+            c_b.execute_smart_w1_gemm(As, w1s, view(c_bud));
+            budget_skips_w1 = c_b.telemetry().tiles_pruned_by_energy_sieve;
+            err_w1 = max_abs_diff(c_bud, c_ref);
+            UHA_VERIFY(err_w1 <= eps + slack);
+        }
+        {
+            std::vector<float> c_ref2(Ms * Ns), c_bud2(Ms * Ns);
+            SmartTieredCache c_e(w2s.num_panels, 1), c_b(w2s.num_panels, 1);
+            c_e.execute_smart_w2_gemm(As, w2s, view(c_ref2));
+            c_b.set_error_budget(eps);
+            c_b.execute_smart_w2_gemm(As, w2s, view(c_bud2));
+            budget_skips_w2 = c_b.telemetry().tiles_pruned_by_energy_sieve;
+            err_w2 = max_abs_diff(c_bud2, c_ref2);
+            UHA_VERIFY(err_w2 <= eps + slack);
+        }
+        UHA_VERIFY(budget_skips_w1 > 0 && budget_skips_w2 > 0); // the budget actually removes work
+
+        // (c) Negative control: the legacy summed-energy heuristic drops group 1 and breaks the same budget
+        SmartTieredCache c_t(w1s.num_panels, 1, /*tau=*/0.85f);
+        c_t.execute_smart_w1_gemm(As, w1s, view(c_tau));
+        const float err_tau = max_abs_diff(c_tau, c_ref);
+        UHA_VERIFY(err_tau > eps);
+
+        // (d) Shape mismatch is rejected instead of reading out of bounds
+        bool threw = false;
+        try {
+            std::vector<float> bad(Ms * (Ns - 8));
+            TensorView<float> v_bad(bad.data(), Shape{static_cast<int64_t>(Ms), static_cast<int64_t>(Ns - 8)});
+            SmartTieredCache c_x(w1s.num_panels, 1);
+            c_x.execute_smart_w1_gemm(As, w1s, v_bad);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        UHA_VERIFY(threw);
+
+        std::printf("[8] Sieve policies (exact default, guaranteed error budget, legacy-heuristic control):\n");
+        std::printf("    default == exact (bitwise), 0 tiles skipped | budget eps = %.3f: W1 skipped %zu tiles, max err %.3e; W2 skipped %zu, max err %.3e\n",
+                    eps, budget_skips_w1, err_w1, budget_skips_w2, err_w2);
+        std::printf("    legacy tau=0.85 heuristic on the same data: max err %.3e (> eps, loud single row dropped) | shape check -> PASS\n",
+                    err_tau);
     }
 
     return 0;
