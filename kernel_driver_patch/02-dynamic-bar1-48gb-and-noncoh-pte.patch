@@ -1,0 +1,39 @@
+--- a/src/nvidia/src/kernel/gpu/uvm/nv_gpu_ops.c
++++ b/src/nvidia/src/kernel/gpu/uvm/nv_gpu_ops.c
+@@ -2645,19 +2645,35 @@ nvGpuOpsBuildExternalAllocPtes
+     if ((offset + size) > memdescGetSize(pMemDesc))
+         return NV_ERR_INVALID_ARGUMENT;
+ 
+-    *pAperture = GMMU_APERTURE_PEER;
++    // Consumer GA10x/AD10x/GB20x GMMUs fault on GMMU_APERTURE_PEER; use SYS_NONCOH over BAR1
++    *pAperture = GMMU_APERTURE_SYS_NONCOH;
+ 
+     if (kbusIsStaticBar1Enabled_HAL(pRemoteGpu, GPU_GET_KERNEL_BUS(pRemoteGpu)))
+     {
+         kbusGetBar1P2PDmaInfo_HAL(pMappingGpu, pRemoteGpu, GPU_GET_KERNEL_BUS(pRemoteGpu),
+                                   &dmaBaseAddress, &dmaSize);
+         NvU64 fbPhysOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, offset);
+         for (NvU64 i = 0; i < pteCount; i++)
+         {
+             physicalAddresses[i] = dmaBaseAddress + fbPhysOffset + (i * (NvU64)mappingPageSize);
+         }
+     }
+     else
+     {
++        // Modded 48GB RTX 4090 path where BAR1 (32GB) < FB (48GB):
++        // Dynamically map only the active P2P allocation into a free 32GB BAR1 VA slot
++        NvU64 dynBar1VirtOffset = 0;
++        NvU64 mapLen = size;
++        KernelBus *pRemoteBus = GPU_GET_KERNEL_BUS(pRemoteGpu);
++        NV_STATUS status = kbusMapFbAperture_HAL(
++            pRemoteGpu, pRemoteBus, pMemDesc, offset, &dynBar1VirtOffset, &mapLen,
++            BUS_MAP_FB_FLAGS_MAP_UNICAST | BUS_MAP_FB_FLAGS_PREFER_CONTIGUOUS, NULL
++        );
++        if (status != NV_OK)
++            return status;
++        NvU64 dynBar1DmaBase = pRemoteBus->bar1[GFID_PF].physAddr + dynBar1VirtOffset;
++        for (NvU64 i = 0; i < pteCount; i++)
++            physicalAddresses[i] = dynBar1DmaBase + (i * (NvU64)mappingPageSize);
+     }
+     return NV_OK;
+ }

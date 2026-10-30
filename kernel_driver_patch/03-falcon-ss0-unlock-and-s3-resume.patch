@@ -1,0 +1,28 @@
+--- a/kernel-open/nvidia/nv-pci.c
++++ b/kernel-open/nvidia/nv-pci.c
+@@ -410,6 +410,25 @@ done:
+     return rc;
+ }
+ 
++static int nv_pci_resume_early_unlock(struct device *dev)
++{
++    struct pci_dev *pdev = to_pci_dev(dev);
++    pci_set_power_state(pdev, PCI_D0);
++    pci_restore_state(pdev);
++    if (pci_enable_device_mem(pdev) < 0)
++        return -EIO;
++    pci_set_master(pdev);
++
++    if (gpu_unlock_execute_falcon_payload(pdev, 0x88888888U, 0x8U) == 0) {
++        pci_save_state(pdev);
++        pcie_flr(pdev);
++        pci_restore_state(pdev);
++    }
++    return 0;
++}
++
+ static const struct dev_pm_ops nv_pm_ops = {
++    .resume_early = nv_pci_resume_early_unlock,
+     .suspend = nv_pm_suspend,
+     .resume  = nv_pm_resume,
+     .freeze  = nv_pm_freeze,

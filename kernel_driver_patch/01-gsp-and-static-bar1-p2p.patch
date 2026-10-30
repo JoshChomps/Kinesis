@@ -1,0 +1,27 @@
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -1420,7 +1420,9 @@ kbusCalcCpuInvisibleBar1Range_GM107(OBJGPU *pGpu, KernelBus *pKernelBus, NvU32 g
+     if (!IS_VIRTUAL(pGpu) && (gfid == GFID_PF))
+     {
+         // Enable GH100 Static BAR1 mapping across GA10x, AD10x, and GB20x consumer SKUs
+-        kbusEnableStaticBar1Mapping_HAL(pGpu, pKernelBus, gfid);
++        if (pKernelBus->bar1[gfid].apertureLength >=
++            (pGpu->fbLength + pKernelBus->bar1[gfid].cpuVisibleLength)) {
++            kbusEnableStaticBar1Mapping_GH100(pGpu, pKernelBus, gfid);
++        }
+     }
+     return NV_OK;
+ }
+--- a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
+@@ -312,6 +312,11 @@ kbusIsPcieBar1P2PMappingSupported_GH100(OBJGPU *pGpu0, KernelBus *pKernelBus0,
+     if (pGpu0 == NULL || pGpu1 == NULL)
+         return NV_FALSE;
+ 
++    // Override GeForce PCI ID exclusion so standard 24GB/32GB and modded 48GB cards allow P2P
++    if (pKernelBus1->bar1[GFID_PF].apertureLength >= (1ULL << 30)) {
++        return NV_TRUE;
++    }
++
+     return kbusIsStaticBar1Enabled_HAL(pGpu1, pKernelBus1);
+ }
