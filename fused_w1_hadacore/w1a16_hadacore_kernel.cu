@@ -8,6 +8,27 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
+#include "../kinesis_unified/unified_sizing.h"
+
+// ==============================================================================
+// 0. Tile-geometry contract (single source of truth: unified_sizing.h)
+//
+// The kernels below are hand-written against a fixed CTA/warp tiling and spell the sizes as literals
+// inline (blockIdx.y * 128, warp_n_idx * 64, >> 5 for K/32, acc[4][8][4], ...) because the PTX layout
+// depends on them. These static_asserts pin those literals to unified_sizing.h so that if the header is
+// ever retuned the build breaks here instead of silently miscomputing. Changing a value here means
+// re-deriving the ldmatrix/MMA fragment math below -- it is NOT a knob.
+// ==============================================================================
+static_assert(UHA_CTA_BLOCK_M == 128, "kernel hardcodes blockIdx.y * 128");
+static_assert(UHA_CTA_BLOCK_N == 256, "kernel hardcodes blockIdx.x * 256");
+static_assert(UHA_CTA_BLOCK_K == 32,  "kernel streams K in 32-wide tiles (num_k_tiles = (K+31)>>5)");
+static_assert(UHA_CTA_THREADS == 256, "kernel launch_bounds and warp indexing assume 256 threads / 8 warps");
+static_assert(UHA_WARP_TILE_M == 64 && UHA_WARP_TILE_N == 64,
+              "warp owns a 64x64 output tile (warp_m_idx*64, warp_n_idx*64)");
+static_assert(UHA_WARP_TILE_M / UHA_MMA_M == 4 && UHA_WARP_TILE_N / UHA_MMA_N == 8,
+              "acc[4][8][4]: 4 m16 slices x 8 n8 slices x 4 fragment regs");
+static_assert(UHA_W1_WEIGHTS_PER_U32 == 32, "interleaved 16-bit split packs 32 W1 weights per uint32");
+
 // ==============================================================================
 // 1. Asynchronous Global-to-Shared Copy & Shared-to-Register ldmatrix Primitives
 // ==============================================================================

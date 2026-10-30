@@ -2,6 +2,22 @@
 
 This document is the honest ledger for the project. It records what an adversarial logic and code review found, what was fixed, what is still open, and exactly what has and has not been executed. It supersedes any stronger wording in docs 08 to 10 where the two disagree.
 
+## 0. 2026-10-30 development pass (host CPU only; no GPU, driver, or firmware action)
+
+A second pass fixed several review items and audited cross-file consistency. Everything below was built and run on the host CPU with gcc/g++/clang/python; the project is now under local git (baseline commit is the pre-pass snapshot, each round is its own commit). No GPU kernel was compiled or run, no driver patch applied, no shim loaded, no firmware/MMIO touched, and no system setting changed.
+
+* **O8 fixed** - `SmartTieredCache` now defaults to exact (tau = 0). The lossy relative-energy sieve is opt-in; a default-constructed cache is bit-identical to the plain FP32 GEMM (test [8]).
+* **O9 fixed** - new `set_error_budget(eps)`: a K-group is skipped only while a worst-case per-output bound (max column |scale| x max row L1 of the activations) keeps the total skipped mass <= eps. Holds for W1 and W2; non-finite activations are never skipped. Verified error <= eps on both; the old summed-energy heuristic breaks the same budget on a single-loud-row input (negative control, test [8]).
+* **O11 fixed** - panel promotion counts once per GEMM call, not once per K-group.
+* **O14 fixed** - on a GaLore projector refresh the Adam moments are rotated into the new basis (M exactly via P_new^T P_old; V via the squared rotation).
+* **GaLore numerical hardening** - 8-bit sqrt(V) now rounds up on quantization so a small coordinate next to a large row max can no longer become 0 and spike the next step; BF16 master-weight writes use unbiased stochastic rounding so sub-ulp updates (e.g. lr 2e-4 on ~0.02 weights) are no longer silently dropped.
+* **Memory table corrected** - `compute_32b_qat_memory_table` now derives each peak as sum(components)/n_gpus instead of a hard-coded figure. The GaLore peak was 22.15 but its own components sum to 23.63 GB/GPU; the honest 23.63 still fits a real 24 GiB (= 25.77 decimal GB) card. Host-staged HugePage weights and streamed optimizer moments are explicitly excluded from VRAM.
+* **Test-output honesty** - the kinesis "56.89x bandwidth" line is relabelled as a modelled ratio (compression x 1/(1 - skipped)), not a measurement.
+* **Sizing-contract audit** - group size 128, weights-per-uint32 (32 for W1, 16 for W2), the Nr=8/Mr=4 CPU micro-tile, and FP32 accumulation are consistent across `unified_sizing.h`, the C++ engine, the PTX emulator and the Python kernels. The C++ constants already derive from the header; the previously free-standing tile literals in `w1a16_hadacore_kernel.cu` are now pinned to the header with `static_assert`s (verified by compiling the asserts on the host; the kernel body itself is still unbuilt, O1).
+* **Sanitizers** - the C++ suite, the PTX emulator, the governor and the AMX worker run clean under AddressSanitizer + UBSan.
+
+Scope note: the device-ID interposer (`compiler_unlock/`) and the firmware/driver unlock code (`kernel_driver_patch/`) were left exactly as the baseline; this pass neither extended nor weakened them. O1-O7, O10, O12-O13, O15-O17 below remain open and still need a GPU / real driver tree.
+
 ## 1. What can and cannot be verified in this environment
 
 | Component | How it was exercised | What that proves | What it does NOT prove |
@@ -50,13 +66,13 @@ Severity: **S1** wrong results or will not build, **S2** unsafe or silently misl
 | O5 | S2 | Patch 01 returns "P2P supported" for any GPU whose BAR1 is at least 1 GB, skipping the static-BAR1 check. With IOMMU or ACS misconfigured this can cause faults or corruption instead of a clean refusal. | Needs a topology check (same root complex, ACS, IOMMU mode). |
 | O6 | S2 | The "isolated IOMMU peer domain" function is an arithmetic checker. It does not program any IOMMU, ACS or access policy, so it does not make devices "only talk to each other". Likewise the VBIOS "rollback" is a struct update; nothing touches flash. | Real enforcement is IOMMU group policy plus ACS; real rollback is a verified flash of the stock image. Neither is implemented. |
 | O7 | S2 | `ACS` redirect clearing exists only as an opt-in helper in the mock, never auto-invoked, because it weakens isolation. | Prefer `pci=config_acs=` kernel parameters. |
-| O8 | S2 | Tiled-CBC sieve and the default `energy_sieve_tau = 0.85` in `SmartTieredCache` are LOSSY. A caller using defaults silently gets approximate results. The "effective bandwidth amplification" in test output (for example 56.89x) is a computed ratio (compression x 1/(1 - pruned)), not a measurement. | Make exactness the default, require explicit opt-in to prune. |
-| O9 | S2 | The new scale-weighted sub-tile gate uses mean row L1, an average-case estimate, not a worst-case bound. | A sound gate needs the max over rows. |
+| **O8 (FIXED 2026-10-30)** | S2 | Tiled-CBC sieve and the default `energy_sieve_tau = 0.85` in `SmartTieredCache` are LOSSY. A caller using defaults silently gets approximate results. The "effective bandwidth amplification" in test output (for example 56.89x) is a computed ratio (compression x 1/(1 - pruned)), not a measurement. | Make exactness the default, require explicit opt-in to prune. |
+| **O9 (FIXED 2026-10-30)** | S2 | The new scale-weighted sub-tile gate uses mean row L1, an average-case estimate, not a worst-case bound. | A sound gate needs the max over rows. |
 | O10 | S3 | `chorus_amx_moe.c` unpacks weights with a scalar 16x32 store loop per K step, which will dominate the single `tdpbf16ps` it feeds. There is no consumer thread, no `cudaHostRegister`, no NUMA binding; "pinned" currently means hugepage-backed only. The emulation uses plain float arithmetic and will not match TDPBF16PS rounding or denormal flushing. | Vectorise the unpack, add worker and NUMA logic, validate on AMX hardware. |
-| O11 | S3 | `record_panel_access_and_promote` is called once per (panel, group), so promotion counts scale with group count rather than GEMM calls; victim search is O(panels) per call. | Count per GEMM, keep a heap or CLOCK. |
+| **O11 (FIXED 2026-10-30)** | S3 | `record_panel_access_and_promote` is called once per (panel, group), so promotion counts scale with group count rather than GEMM calls; victim search is O(panels) per call. | Count per GEMM, keep a heap or CLOCK. |
 | O12 | S3 | The `ptx_bf162_emu.c` Kronecker test checks the H2 mixing and ternary MMA arithmetic against a reference built from the same arithmetic. It does not exercise the H16 stage. | Chain the emulated H16 MMA into the test. |
 | O13 | S3 | The two bf16 rounding steps (after H16 and after the H2 butterfly) compound; no end-to-end error budget for rotated activations has been measured. | Measure on real activation statistics. |
-| O14 | S3 | After a Q-GaLore projector refresh the Adam moments stay in the old basis (inherited from GaLore). | Re-project or reset moments on refresh. |
+| **O14 (FIXED 2026-10-30)** | S3 | After a Q-GaLore projector refresh the Adam moments stay in the old basis (inherited from GaLore). | Re-project or reset moments on refresh. |
 | O15 | S3 | The lazy-schedule test forces doubling with threshold 0.0 to test the mechanism; the 0.90 default is taken from the paper, not tuned here. | Tune on a real run. |
 | O16 | S3 | The Stream-K and hetero tables in `smsp_roofline_sim.py` are driven by an assumption (50% of SMs saturate DRAM, DDR5 80 GB/s, PCIe 25 GB/s). Their speedups follow from the assumption. Split-K with FP32 `atomicAdd` is also non-deterministic in summation order. | Measure; consider a deterministic reduction. |
 | O17 | S3 | Unverified device IDs: RTX 4090 D `0x2685`, RTX 5090 `0x2B85`, RTX PRO 6000 Blackwell `0x2BB1` come from community reports. | Confirm on hardware. |

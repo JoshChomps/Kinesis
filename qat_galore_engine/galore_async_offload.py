@@ -306,19 +306,35 @@ class LayerWise8BitGaLoreEngine:
         copy_to_param_stochastic(param.data, w_fp32)
 
 
-def compute_32b_qat_memory_table() -> Dict[str, Dict[str, float]]:
+# A "24 GB" card holds 24 GiB = 24 * 2**30 bytes = 25.77 decimal GB. All table values below are decimal GB.
+GB_PER_24GIB_CARD = 24 * (2 ** 30) / 1e9  # ~= 25.77
+
+_COMPONENT_KEYS = (
+    "master_weights_vram_gb",
+    "quantized_weights_vram_gb",
+    "weight_gradients_vram_gb",
+    "optimizer_states_vram_gb",
+    "activations_vram_gb",
+)
+
+
+def compute_32b_qat_memory_table(n_gpus: int = 2) -> Dict[str, Dict[str, float]]:
     """
-    Computes the exact memory breakdown (in GB) for a 32B parameter model (L=64, D=5120)
-    across 2x 24GB unlocked consumer GPUs (48 GB total VRAM + Host Pinned 1GB HugePages).
+    Memory breakdown (decimal GB) for a 32B-parameter model (L=64, D=5120) sharded evenly over n_gpus.
+    Each listed value is the TOTAL resident VRAM across all GPUs; peak_per_gpu is derived as
+    sum(components) / n_gpus so the headline can never drift from its own breakdown. (The previous
+    hard-coded GaLore peak of 22.15 did not match its components, which sum to 23.63 / GPU.)
+
+    Host-staged bytes (GaLore's ~24 GB of master-weight HugePages and the ~2.42 GB of 8-bit optimizer
+    moments streamed over PCIe) are NOT counted as VRAM: they live in host pinned memory, not on the GPU.
     """
-    return {
+    rows = {
         "Standard BF16 AdamW": {
             "master_weights_vram_gb": 64.00,
             "quantized_weights_vram_gb": 64.00,
             "weight_gradients_vram_gb": 64.00,
             "optimizer_states_vram_gb": 256.00,
             "activations_vram_gb": 6.80,
-            "peak_per_gpu_2x24gb": 227.40,
         },
         "8-Bit AdamW (Full Rank)": {
             "master_weights_vram_gb": 64.00,
@@ -326,17 +342,19 @@ def compute_32b_qat_memory_table() -> Dict[str, Dict[str, float]]:
             "weight_gradients_vram_gb": 64.00,
             "optimizer_states_vram_gb": 64.00,
             "activations_vram_gb": 6.80,
-            "peak_per_gpu_2x24gb": 131.40,
         },
         "Layer-Wise 8-Bit GaLore (r=512, T=200) + Async DMA": {
-            "master_weights_vram_gb": 40.00,   # 20.00 GB/GPU in VRAM + 24.00 GB in Host Pinned HugePages
-            "quantized_weights_vram_gb": 0.00, # Fused in SRAM via fused_qat_g128_fwd_kernel
-            "weight_gradients_vram_gb": 0.45,  # Single-layer transient buffer freed via post-grad hook
-            "optimizer_states_vram_gb": 0.00,  # 2.42 GB total (mr + 2nr in 8-bit) streamed via PCIe DMA
-            "activations_vram_gb": 6.80,       # 3.40 GB per GPU with gradient checkpointing
-            "peak_per_gpu_2x24gb": 22.15,      # Fits natively inside 2x 24GB GPUs
+            "master_weights_vram_gb": 40.00,   # resident VRAM copy; a further 24 GB sits in host HugePages
+            "quantized_weights_vram_gb": 0.00, # fused in SRAM via fused_qat_g128_fwd_kernel
+            "weight_gradients_vram_gb": 0.45,  # single-layer transient buffer freed via post-grad hook
+            "optimizer_states_vram_gb": 0.00,  # 2.42 GB of 8-bit moments stream from host, 0 resident
+            "activations_vram_gb": 6.80,       # with gradient checkpointing
         },
     }
+    for row in rows.values():
+        total = sum(row[k] for k in _COMPONENT_KEYS)
+        row["peak_per_gpu_2x24gb"] = round(total / n_gpus, 2)
+    return rows
 
 
 def main() -> None:
@@ -414,9 +432,14 @@ def main() -> None:
     print(f"[2] Retained Full-Model Gradient Buffers Post-Backward: 0 Bytes (all freed in-flight)")
     print(f"[3] 32B Model Peak VRAM per GPU (Standard AdamW)      : {table['Standard BF16 AdamW']['peak_per_gpu_2x24gb']:.2f} GB/GPU (OOM)")
     print(f"[4] 32B Model Peak VRAM per GPU (8-Bit AdamW)         : {table['8-Bit AdamW (Full Rank)']['peak_per_gpu_2x24gb']:.2f} GB/GPU (OOM)")
-    print(f"[5] 32B Model Peak VRAM per GPU (Fused STE + GaLore)  : {galore_budget['peak_per_gpu_2x24gb']:.2f} GB/GPU (Fits 2x 24GB!)")
+    fits = galore_budget["peak_per_gpu_2x24gb"] <= GB_PER_24GIB_CARD
+    print(f"[5] 32B Model Peak VRAM per GPU (Fused STE + GaLore)  : {galore_budget['peak_per_gpu_2x24gb']:.2f} GB/GPU "
+          f"({'Fits' if fits else 'OOM on'} a 24 GiB = {GB_PER_24GIB_CARD:.2f} GB card)")
     assert losses[-1] < losses[0]
-    assert galore_budget["peak_per_gpu_2x24gb"] <= 22.15
+    # Every peak must equal its own component sum / n_gpus (internal consistency, not a measurement)
+    for name, row in table.items():
+        assert abs(row["peak_per_gpu_2x24gb"] - sum(row[k] for k in _COMPONENT_KEYS) / 2.0) < 0.01, name
+    assert fits, galore_budget["peak_per_gpu_2x24gb"]
     print("[+] PASS: Per-layer 8-bit GaLore post-accumulate hooks and 32B memory budget verified.")
 
 
