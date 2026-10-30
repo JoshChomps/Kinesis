@@ -39,10 +39,32 @@ def dequantize_signed_int8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return q.to(torch.float32) * scale
 
 
-def quantize_unsigned_uint8(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quantize_unsigned_uint8(t: torch.Tensor, round_up: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    round_up=True rounds towards +inf so every positive input dequantizes to a value >= itself and never to 0.
+    Used for sqrt(V): rounding a small sqrt(V) down to 0 next to a large row maximum would make the next
+    step m / (0 + eps) explode. Rounding up only shrinks steps (conservative).
+    """
     scale = (t.clamp(min=0.0).amax(dim=-1, keepdim=True) / 255.0).clamp(min=1e-16)
-    q = torch.clamp(torch.round(t.clamp(min=0.0) / scale), 0.0, 255.0).to(torch.uint8)
+    scaled = t.clamp(min=0.0) / scale
+    q = torch.clamp(torch.ceil(scaled) if round_up else torch.round(scaled), 0.0, 255.0).to(torch.uint8)
     return q, scale
+
+
+def copy_to_param_stochastic(param_data: torch.Tensor, value_fp32: torch.Tensor) -> None:
+    """
+    Writes an fp32 value into a parameter. For bf16 parameters, round-to-nearest silently drops any update
+    smaller than half a bf16 ulp (e.g. lr 2e-4 on weights ~0.02), so training stalls. Stochastic rounding
+    (add uniform random low 16 bits, then truncate) is unbiased: E[bf16(x)] = x. Other dtypes copy directly.
+    """
+    if param_data.dtype != torch.bfloat16:
+        param_data.copy_(value_fp32.to(param_data.dtype))
+        return
+    bits = value_fp32.contiguous().view(torch.int32)
+    noise = torch.randint(0, 1 << 16, bits.shape, dtype=torch.int32, device=bits.device)
+    finite = torch.isfinite(value_fp32)
+    rounded = torch.where(finite, (bits + noise) & -65536, bits)  # -65536 == 0xFFFF0000 as int32
+    param_data.copy_(rounded.view(torch.float32).to(torch.bfloat16))
 
 
 def dequantize_unsigned_uint8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -117,6 +139,7 @@ class LayerWise8BitGaLoreEngine:
         cos_sim_threshold: float = 0.90,
         max_proj_gap: int = 1600,
         subspace_iters: int = 0,
+        reproject_moments: bool = True,
     ) -> None:
         assert proj_bits in (4, 8)
         self.proj_bits = proj_bits
@@ -124,6 +147,10 @@ class LayerWise8BitGaLoreEngine:
         self.cos_sim_threshold = cos_sim_threshold
         self.max_proj_gap = max_proj_gap
         self.subspace_iters = subspace_iters  # 0 = exact SVD refresh; >0 = warm-started subspace iteration
+        # On a projector refresh, rotate the Adam moments into the new basis (docs/11 O14). M is linear in the
+        # gradient, so M_new = (P_new^T P_old) M_old is exact. V holds squares and has no exact transform;
+        # V_new = (P_new^T P_old)^2 V_old (elementwise square) is exact when the old coordinates are uncorrelated.
+        self.reproject_moments = reproject_moments
         self.svd_calls = 0
         self.refresh_calls = 0
         self.rank = rank
@@ -192,6 +219,17 @@ class LayerWise8BitGaLoreEngine:
         return dequantize_signed_int8(st.proj_q.to(device), st.proj_scale.to(device))
 
     @torch.no_grad()
+    def _reproject_moments(self, st: GaLoreState8Bit, rot: torch.Tensor, dev: torch.device) -> None:
+        m_old = dequantize_signed_int8(st.exp_avg_q.to(dev), st.exp_avg_scale.to(dev))
+        sv_old = dequantize_unsigned_uint8(st.exp_avg_sq_q.to(dev), st.exp_avg_sq_scale.to(dev))
+        m_new = rot @ m_old
+        v_new = (rot * rot) @ (sv_old * sv_old)
+        q_m, sc_m = quantize_signed_int8(m_new)
+        q_sv, sc_sv = quantize_unsigned_uint8(torch.sqrt(v_new.clamp(min=0.0)), round_up=True)
+        st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
+        st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
+
+    @torch.no_grad()
     def _step_parameter(self, param: torch.nn.Parameter) -> None:
         st = self.states[param]
         grad = param.grad.to(torch.float32)
@@ -218,6 +256,8 @@ class LayerWise8BitGaLoreEngine:
             self._store_projector(st, p_mat)
             # Use the exact value that will be re-read next step so both paths see the same quantized projector
             p_mat = self._load_projector(st, dev)
+            if self.reproject_moments and has_prev:
+                self._reproject_moments(st, p_mat.T @ p_old, dev)
         else:
             p_mat = self._load_projector(st, dev)
 
@@ -244,7 +284,7 @@ class LayerWise8BitGaLoreEngine:
 
         # Quantize updated moments (M_t and sqrt(V_t)) to 8-bit before transferring to Host RAM
         q_m, sc_m = quantize_signed_int8(m_t)
-        q_sv, sc_sv = quantize_unsigned_uint8(sqrt_v_t)
+        q_sv, sc_sv = quantize_unsigned_uint8(sqrt_v_t, round_up=True)
         st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
         st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
 
@@ -263,7 +303,7 @@ class LayerWise8BitGaLoreEngine:
         if self.weight_decay > 0.0:
             w_fp32.mul_(1.0 - self.lr * self.weight_decay)
         w_fp32.add_(full_update, alpha=-step_size)
-        param.data.copy_(w_fp32.to(param.dtype))
+        copy_to_param_stochastic(param.data, w_fp32)
 
 
 def compute_32b_qat_memory_table() -> Dict[str, Dict[str, float]]:
