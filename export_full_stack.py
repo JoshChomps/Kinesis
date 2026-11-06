@@ -68,7 +68,7 @@ SOURCE_FILES = [
 def export_everything() -> None:
     root = os.path.dirname(os.path.abspath(__file__))
     parts = [
-        "# First-Principles Co-Design of Unlocked GPU Silicon, Zero-Copy Bus Fabrics, and Fused Sub-2-Bit Tensor Kernels\n"
+        "# Unified Hardware Acceleration (UHA): Extreme Hardware Capability & Systems Co-Design Research Framework\n"
     ]
 
     for doc_rel in DOC_FILES:
@@ -92,7 +92,7 @@ def export_everything() -> None:
     html_out = os.path.join(root, "Full_Unlocked_GPU_CoDesign_Stack.html")
     with open(html_out, "w", encoding="utf-8") as f:
         f.write(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>First-Principles Co-Design of Unlocked GPU Silicon</title>
+<title>Unified Hardware Acceleration (UHA): Systems Co-Design Research Framework</title>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 920px; margin: 24px auto; padding: 0 20px; color: #1f2328; }}
   .bar {{ background: #0969da; color: #fff; padding: 12px 16px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}

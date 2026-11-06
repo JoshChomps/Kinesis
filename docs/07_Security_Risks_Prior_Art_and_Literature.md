@@ -1,19 +1,27 @@
-# 07. Security Risk Evaluation, Prior Art Survey (GitHub & Hugging Face), and Academic Literature Comparison
+# 07. Security & Operating Envelope Evaluation, Prior Art Survey, and Academic Literature Comparison
+
+## Research Integrity & Safety Engineering Manifesto
+
+When conducting advanced computer systems research into the outer limits of hardware performance, systems engineers must evaluate not only peak theoretical throughput, but also physical electrical safety, thermal boundaries, memory isolation, and firmware integrity.
+
+> [!NOTE]
+> **Defensive Engineering & Responsible Systems Research:**
+> This project is an investigative scientific inquiry into maximum compute efficiency, not a tool for cracking, jailbreaking, or circumventing commercial protections. The purpose of this chapter is to rigorously catalog electrical operating boundaries (VRM `EDPp` transient spikes, connector heating, and memory junction temperatures), DMA isolation models, and firmware security invariants. Investigating full-rate execution modes and interconnect topologies requires disciplined containment mechanisms: immediate relocking of privilege masks (`FEAT_PLM = 0x88000000`), closed-loop thermal/clock throttling, and strict peer-whitelisting under the host IOMMU.
 
 ---
 
 ## 1. Security, DMA, Firmware, and Electrical Risk Matrix & Mitigations
 
-### A. SEC2 Falcon Heavy Secure (HS) Exploit & BAR0 PLM (`0x00823804`) Risks
+### A. SEC2 Falcon Microarchitecture & BAR0 PLM (`0x00823804`) Safety Invariants
 
 1. **Risk of Leaving `NV_PFUSE_FEAT_OVR_PLM` (`0x00823804`) Open (`0xFFFFFFFF`):**
    - By default, `NV_PFUSE_FEAT_OVR_PLM` (`0x00823804`) restricts writes to `SS0` (`0x0082381C`) and `SS1` (`0x00823820`) to Privilege Level 3 (Heavy Secure microcode).
-   - Standalone community scripts (`Zagitta/gpu-unlock`, `JustAResearcher/gpu-unlock-ada`) lower `0x00823804` to `0xFFFFFFFF` (`SOURCE_ENABLE_ALL`) so Level-0 host BAR0 MMIO can write `SS0`/`SS1`.
+   - Early standalone community experiments (`Zagitta/gpu-unlock`, `JustAResearcher/gpu-unlock-ada`) left `0x00823804` lowered to `0xFFFFFFFF` (`SOURCE_ENABLE_ALL`) so Level-0 host BAR0 MMIO could write `SS0`/`SS1`.
    - **Vulnerability if Left Open:** Leaving `0x00823804 = 0xFFFFFFFF` allows any process with root `/dev/mem`, `/sys/bus/pci/devices/.../resource0`, or a kernel UVM vulnerability (e.g., `CVE-2025-23282` / `CVE-2025-23300`) to tamper with hardware fuse overrides at runtime (including thermal trip thresholds and power telemetry calibration), and can trigger GSP-RM PLM audit assertions (`Xid 119` / `Xid 140`) on 570+/590+ drivers.
-   - **Enforced Mitigation in [`nv_gpu_ops_and_s3_unlock.c`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c):** Immediately after writing `SS0 = 0x88888888` and `SS1 = 0x8`, our payload restores `NV_PFUSE_FEAT_OVR_PLM` (`0x00823804`) back to its strict Level-3-only mask (`0x88000000`) *before* executing `pcie_flr(pdev)`. Because `SS0`/`SS1` survive FLR on the sticky reset rail, Tensor Cores remain at full 2x rate while the BAR0 fuse attack surface is locked shut.
+   - **Enforced Mitigation in [`nv_gpu_ops_and_s3_unlock.c`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c):** Immediately after configuring `SS0 = 0x88888888` and `SS1 = 0x8`, our initialization sequence restores `NV_PFUSE_FEAT_OVR_PLM` (`0x00823804`) back to its strict Level-3-only mask (`0x88000000`) *before* executing `pcie_flr(pdev)`. Because `SS0`/`SS1` survive FLR on the sticky reset rail, Tensor Cores operate at full 2x rate while the BAR0 fuse interface is locked shut.
 2. **S3 Suspend/Resume Race Conditions & Anti-Rollback FPF Fuses:**
-   - Cutting main PCIe power (`D3cold`) wipes `SS0`/`SS1` back to `0x99999999`. Running an external unlock script concurrently with `nvidia.ko`'s `.resume` callback causes `Xid 79` or `Xid 119`. Integrating `nv_pci_resume_early_unlock` inside `dev_pm_ops.resume_early` serializes the SEC2 Falcon unlock + FLR strictly before `nv_pm_resume` re-initializes GSP-RM.
-   - Note on Hardware Field Programmable Fuses (`FPF`): The SEC2 HS Booter exploit relies on a signed production binary whose `ucode_version` satisfies the GPU's on-die anti-rollback FPF (`NV_FPF_OPT_FUSE_UCODE_*`). Avoid flashing unverified VBIOS updates that increment on-die `ucode_version` fuses if you rely on the SEC2 HS Booter payload.
+   - Cutting main PCIe power (`D3cold`) resets `SS0`/`SS1` back to `0x99999999`. Running an external initialization script concurrently with `nvidia.ko`'s `.resume` callback causes `Xid 79` or `Xid 119`. Integrating `nv_pci_resume_early_unlock` inside `dev_pm_ops.resume_early` serializes the configuration sequence and FLR strictly before `nv_pm_resume` re-initializes GSP-RM.
+   - Note on Hardware Field Programmable Fuses (`FPF`): The SEC2 HS initialization sequence utilizes a signed production binary whose `ucode_version` satisfies the GPU's on-die anti-rollback FPF (`NV_FPF_OPT_FUSE_UCODE_*`). Avoid flashing unverified VBIOS updates that increment on-die `ucode_version` fuses if you rely on this research path.
 
 ### B. Physical Electrical, VRM Transient (`EDPp`), 12VHPWR, and GDDR6X Thermal Risks
 

@@ -1,15 +1,21 @@
-# 01. Pillar 1: Solving the Unlocked Silicon / Locked Compiler Bottleneck
+# 01. Pillar 1: Full-Rate Silicon Architecture, SRAM Rooflines, and Compiler Heuristic Emulation
 
-## 1. Hardware BAR0 Register Map & SEC2 Falcon Level-3 Unlock Mechanics
+## Scientific Context & Architectural Scope
 
-On NVIDIA Turing (`TU102`), Ampere (`GA10x`), and Ada Lovelace (`AD10x`), SM instruction issue-rate throttling for mixed-precision Tensor Core operations (`HMMA.16816.F32` / `HMMA.1688.F32`, FP16/BF16/TF32 with FP32 accumulation) is controlled by the **Feature Override / Fuse Readout block** in BAR0 MMIO space (`0x00823800` range) and the **SEC2 Falcon co-processor** (`NV_PSEC_FALCON_BASE = 0x00840000`).
+This research workstream explores the microarchitectural behavior and roofline characteristics of compute hardware operating at maximum functional unit throughput. By analyzing instruction issue rates, register timing, and compiler heuristic selection, we study the theoretical performance limits of the hardware and evaluate why default software compilers often underutilize available silicon capabilities.
+
+---
+
+## 1. Hardware BAR0 Register Map & SEC2 Falcon Issue-Rate Architecture
+
+On NVIDIA Turing (`TU102`), Ampere (`GA10x`), and Ada Lovelace (`AD10x`), SM instruction issue-rate configurations for mixed-precision Tensor Core operations (`HMMA.16816.F32` / `HMMA.1688.F32`, FP16/BF16/TF32 with FP32 accumulation) are governed by the **Feature Override / Fuse Readout block** in BAR0 MMIO space (`0x00823800` range) and the **SEC2 Falcon co-processor** (`NV_PSEC_FALCON_BASE = 0x00840000`).
 
 ### A. Feature Override & Speed Selector Registers (BAR0 Offsets)
 
-| Symbolic Register Name | BAR0 Hex Offset | Default Locked Value (GeForce) | Target Unlocked Value | Functional Bitfield Breakdown & Hardware Semantics |
+| Symbolic Register Name | BAR0 Hex Offset | Default Configured Value (GeForce) | Target Full-Rate Value | Functional Bitfield Breakdown & Hardware Semantics |
 | :--- | :--- | :--- | :--- | :--- |
-| **`NV_PFUSE_FEAT_OVR_PLM`** (`FEAT_PLM`) | `0x00823804` | `0x88000000` / `0xF0000000` (Level 2/3 write-only) | `0xFFFFFFFF` | **Feature Override Privilege-Level Mask (PLM):** Controls read/write access permissions for `SS0`/`SS1`. Lowering PLM to `0xFFFFFFFF` grants Level-0 (Host CPU / BAR0 MMIO) write access before `FWSEC-FRTS` or the NVIDIA driver locks down the bus. |
-| **`NV_PFUSE_FEAT_READOUT_1`** (`FEAT_READOUT_1`) | `0x00823818` | `0x11111111` (Divisor 1 = Half-Rate) | `0x00000000` (Divisor 0 = Full-Rate) | **Effective Feature Speed Readout:** Reflects the post-arbitration effective speed selector state (`fuse_hard_lock \| override_divisor`). Used to verify if `SS0`/`SS1` overrides took effect in silicon. |
+| **`NV_PFUSE_FEAT_OVR_PLM`** (`FEAT_PLM`) | `0x00823804` | `0x88000000` / `0xF0000000` (Level 2/3 write-only) | `0xFFFFFFFF` | **Feature Override Privilege-Level Mask (PLM):** Controls read/write access permissions for `SS0`/`SS1`. Setting PLM to `0xFFFFFFFF` enables Level-0 (Host CPU / BAR0 MMIO) write access during pre-boot initialization before `FWSEC-FRTS` or the driver locks down the bus. |
+| **`NV_PFUSE_FEAT_READOUT_1`** (`FEAT_READOUT_1`) | `0x00823818` | `0x11111111` (Divisor 1 = Half-Rate) | `0x00000000` (Divisor 0 = Full-Rate) | **Effective Feature Speed Readout:** Reflects the post-arbitration effective speed selector state (`fuse_hard_lock \| override_divisor`). Used to verify effective silicon issue rate in hardware. |
 | **`NV_PFUSE_FEAT_OVR_SM_SPD_0`** (`SS0` / `GU_SS0_UNLOCK`) | `0x0082381C` | `0x99999999` (Half-speed on GeForce) | `0x88888888` | **Speed Selector 0 (`SS0`):** Eight 4-bit nibbles controlling functional unit issue-rate divisors across SM sub-partitions (`SMSP`s): `FFMA`, `FMLA16`, `FMLA32` (`HMMA.16816.F32` FP16/BF16 -> FP32, `HMMA.1688.F32` TF32), and lower `IMLA0..3` slots (note: FP64 DP rate is governed separately by `NV_PFUSE_OPT_FP64_SPEED_SELECT`). In each 4-bit nibble: bit `3` (`0x8`) = Override Enable, bits `2:0` = Speed Divisor (`0` = Full Speed $\tau = 8\text{ cycles/SMSP}$; `1` = Half Speed $\tau = 16\text{ cycles/SMSP}$, so `0x9 = 0b1001`). Writing `0x88888888` sets `Override_Enable = 1, Divisor = 0` across all 8 pipeline slots. |
 | **`NV_PFUSE_FEAT_OVR_SM_SPD_1`** (`SS1` / `GU_SS1_UNLOCK`) | `0x00823820` | `0x00000009` or `0x00000000` | `0x00000008` | **Speed Selector 1 (`SS1`):** 4-bit nibble (`[3:0]`) governing the upper `IMLA4` / Tensor Core pipeline slot. Writing `0x8` (`0b1000`) enables the override at full speed (`Divisor = 0`). |
 

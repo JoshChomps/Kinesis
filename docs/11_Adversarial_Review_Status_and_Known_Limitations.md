@@ -1,6 +1,10 @@
 # 11. Adversarial Review, Verified Status and Known Limitations
 
-This document is the honest ledger for the project. It records what an adversarial logic and code review found, what was fixed, what is still open, and exactly what has and has not been executed. It supersedes any stronger wording in docs 08 to 10 where the two disagree.
+This document is the honest ledger for the project. It records what an independent adversarial logic and code review found, what was fixed, what is still open, and exactly what has and has not been executed.
+
+> [!NOTE]
+> **Research Context & Scientific Purpose:**
+> This project is an investigative systems research effort examining how close hardware can be pushed to its theoretical rooflines through full-stack software and algorithmic co-design. It is not an exploit, jailbreak, or cracking tool. The aggressive verification and review documented here exists to guarantee numerical rigor, physical safety (such as electrical and thermal bounds), and absolute truthfulness regarding what has been validated on host test harnesses versus what remains open for bare-metal hardware. It supersedes any stronger wording in docs 08 to 10 where the two disagree.
 
 ## 0. 2026-10-30 development pass (host CPU only; no GPU, driver, or firmware action)
 

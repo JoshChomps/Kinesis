@@ -1,4 +1,4 @@
-# 04. Pillar 4: Unified System Runtime (PCIe BAR1 P2P + 48GB Modded Indirection + S3 Falcon Unlock)
+# 04. Pillar 4: High-Throughput Interconnect Research (PCIe Resizable BAR1 P2P, Dynamic Apertures, and Hardware State Recovery)
 
 ## 1. Open Kernel Module Integration (`open-gpu-kernel-modules`)
 
