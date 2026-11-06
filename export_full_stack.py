@@ -33,6 +33,9 @@ SOURCE_FILES = [
     ("kinesis_unified/hardware_and_sandbox.hpp", "cpp"),
     ("kinesis_unified/sub2bit_gemm_and_smart_cache.hpp", "cpp"),
     ("kinesis_unified/test_kinesis_unified.cpp", "cpp"),
+    ("kinesis_unified/kinesis_c_abi.cpp", "cpp"),
+    ("kinesis_unified/kinesis_bridge.py", "python"),
+    ("kinesis_unified/bench_cpu_roofline.cpp", "cpp"),
     ("sim_harness/ptx_bf162_emu.c", "c"),
     ("sim_harness/smsp_roofline_sim.py", "python"),
     ("compiler_unlock/libcublas_unlock_shim.c", "c"),
@@ -97,7 +100,7 @@ def export_everything() -> None:
   pre {{ white-space: pre-wrap; word-wrap: break-word; background: #f6f8fa; border: 1px solid #d0d7de; padding: 14px; border-radius: 6px; font-size: 11.5px; line-height: 1.45; }}
   @media print {{ .bar {{ display: none; }} pre {{ font-size: 9.5px; border: none; }} }}
 </style></head><body>
-<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 18 Verification Suites Included)</span>
+<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 20 Verification Suites Included)</span>
 <button onclick="window.print()">Save Complete PDF</button></div>
 <pre>{html.escape(full_md)}</pre></body></html>""")
     print(f"[+] Wrote print-ready HTML bundle: {html_out}")

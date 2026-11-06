@@ -29,6 +29,7 @@ hetero:
 
 kinesis_unified:
 	$(CXX) $(CXXFLAGS) -o kinesis_unified/test_kinesis_unified kinesis_unified/test_kinesis_unified.cpp
+	$(CXX) $(CXXFLAGS) -o kinesis_unified/bench_cpu_roofline kinesis_unified/bench_cpu_roofline.cpp
 
 cuda_host_verify:
 	$(CXX) -O2 -std=c++20 -Wall -Wextra -DSTANDALONE_VERIFY -x c++ fused_w1_hadacore/w1a16_hadacore_kernel.cu -o fused_w1_hadacore/test_w1a16_kernel
@@ -55,9 +56,11 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	./hetero_runtime/test_governor_c
 	$(PYTHON) hetero_runtime/closed_loop_governor.py
 	./kinesis_unified/test_kinesis_unified
+	$(PYTHON) kinesis_unified/kinesis_bridge.py
+	./kinesis_unified/bench_cpu_roofline
 	$(PYTHON) e2e_transformer_pipeline.py
 
 clean:
 	rm -f sim_harness/ptx_bf162_emu* compiler_unlock/test_cublas_shim* compiler_unlock/*.so
 	rm -f kernel_driver_patch/test_kernel_patch* hetero_runtime/test_chorus_amx* hetero_runtime/test_governor_c*
-	rm -f kinesis_unified/test_kinesis_unified* fused_w1_hadacore/*.o structural_filters/*.o
+	rm -f kinesis_unified/test_kinesis_unified* kinesis_unified/bench_cpu_roofline* kinesis_unified/libkinesis_unified* fused_w1_hadacore/*.o structural_filters/*.o

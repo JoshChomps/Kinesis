@@ -21,10 +21,12 @@ for subdir in (
     "qat_galore_engine",
     "structural_filters",
     "hetero_runtime",
+    "kinesis_unified",
 ):
     sys.path.insert(0, str(ROOT / subdir))
 
 from unlocked_gemm import unlocked_bf16_gemm  # noqa: E402
+from kinesis_bridge import KinesisNativeBridge  # noqa: E402
 from spinquant_packer import (  # noqa: E402
     build_kernel_online_rotation,
     optimize_kronecker_stiefel_rotation,
@@ -150,6 +152,21 @@ def run_e2e_transformer_pipeline() -> None:
     assert w1_gt_cos > 0.75, f"1-bit W1A16 vs FP32 ground-truth cosine similarity too low: {w1_gt_cos}"
     assert w2_gt_cos > 0.85, f"1.58-bit W2A16 vs FP32 ground-truth cosine similarity too low: {w2_gt_cos}"
 
+    # Also execute the compiled C++20 AVX2 W1 & 256-bit T-MAC LUT kernels via KinesisNativeBridge
+    native_bridge = KinesisNativeBridge()
+    w_hot_rot_kn = (w_hot_fp32 @ r_kron).T.contiguous()
+    w1_bits_cpp, w1_scales_cpp = native_bridge.pack_w1_panels(w_hot_rot_kn)
+    gpu_u32_bridged, gpu_scales_bridged = native_bridge.convert_w1_to_gpu_interleaved(
+        w1_bits_cpp, w1_scales_cpp, D_model, N_ffn
+    )
+    w1_dequant_bridged = unpack_w1_g128_lop3_reference(gpu_u32_bridged, gpu_scales_bridged)
+    y_hot_cpp_w1, _ = native_bridge.smart_w1_gemm(
+        h_online_rot.float(), w1_bits_cpp, w1_scales_cpp, N=N_ffn, error_budget_eps=0.0
+    )
+    y_hot_fp32_lop3_ref = h_online_rot.float() @ w1_dequant_bridged.float().T
+    cpp_vs_py_w1_err = float((y_hot_cpp_w1 - y_hot_fp32_lop3_ref).abs().max().item())
+    assert cpp_vs_py_w1_err < 1e-5, f"Native C++20 W1 vs Python lop3 reference error too high: {cpp_vs_py_w1_err}"
+
     # -------------------------------------------------------------------------
     # Stage 3 (Pillar 4 + Pillar 5B): Closed-Loop Chorus MoE Routing & Row-Max Tiled-CBC Sieve
     # -------------------------------------------------------------------------
@@ -225,7 +242,7 @@ def run_e2e_transformer_pipeline() -> None:
     )
     print(
         f"[2] Pillar 1+2 Kronecker R_P(x)H_16 & lop3.b32  : Kurtosis {k_init:.2f} -> {k_h16:.2f} -> {k_kron:.2f} | "
-        f"Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f}"
+        f"Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f} | CppW1Err={cpp_vs_py_w1_err:.2e}"
     )
     print(
         f"[3] Pillar 4+5B Chorus Governor & RowMax Sieve  : Route={gov_decision['execution_target']} | "

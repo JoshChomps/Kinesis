@@ -119,7 +119,7 @@ inline void pack_B_nr8_panel(
 inline void gemm_fp32_register_blocked_4x8(
     const TensorView<const float>& A,
     const TensorView<const float>& B,
-    TensorView<float> C,
+    const TensorView<float>& C,
     ArenaAllocator& scratch_arena
 ) {
     if (B.shape().rank() != 2) {
@@ -187,11 +187,14 @@ inline void gemm_fp32_register_blocked_4x8(
                             acc3 = _mm256_fmadd_ps(_mm256_set1_ps(ap[3]), vb, acc3);
                         }
 
-                        alignas(32) float tmp[4][8];
-                        _mm256_store_ps(tmp[0], acc0);
-                        _mm256_store_ps(tmp[1], acc1);
-                        _mm256_store_ps(tmp[2], acc2);
-                        _mm256_store_ps(tmp[3], acc3);
+                        // Do not use alignas(32) on local stack arrays: on x86_64-w64-mingw32 (GCC PR 54412),
+                        // MAX_STACK_ALIGNMENT is 16 bytes, yet alignas(32) causes GCC -O3 to fold _mm256_storeu_ps
+                        // back into vmovaps, faulting when RSP % 32 == 16 (e.g. from Python ctypes).
+                        float tmp[4][8];
+                        _mm256_storeu_ps(tmp[0], acc0);
+                        _mm256_storeu_ps(tmp[1], acc1);
+                        _mm256_storeu_ps(tmp[2], acc2);
+                        _mm256_storeu_ps(tmp[3], acc3);
 
                         for (size_t r = 0; r < m_valid; ++r) {
                             for (size_t c = 0; c < n_valid; ++c) {
@@ -573,7 +576,7 @@ struct TmacRunStats {
 inline TmacRunStats execute_tmac_lut_w1_gemm(
     const TensorView<const float>& A,
     const W1TmacLutPanelSet& B,
-    TensorView<float> C,
+    const TensorView<float>& C,
     float energy_sieve_tau = 0.0f,
     bool force_scalar = false
 ) {
@@ -624,33 +627,22 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                 if (g_scale[g] != 0.0f) ++stats.groups_skipped; // skipped by the sieve, not by true zeros
                 continue;
             }
-            // Build 16-entry int16 tables for every 4-wide chunk of this group, and hoist
-            // the 16-byte low/high LUT splits and 256-bit broadcasts outside the panel loop p.
-            alignas(16) int16_t lut[32][16];
-#if defined(KINESIS_UNIFIED_HAS_AVX2)
-            __m128i lut_lo_128[32];
-            __m128i lut_hi_128[32];
-            __m256i lut_lo_256[32];
-            __m256i lut_hi_256[32];
-#endif
+            // Build 16-entry int16 tables for every 4-wide chunk of this group, and store
+            // the 16-byte low/high LUT splits in unaligned byte tables (avoiding __m256i[32]
+            // stack arrays that trigger vmovdqa under GCC PR 54412 on Windows x64).
+            int16_t lut[32][16];
+            uint8_t lut_lo_bytes[32][16];
+            uint8_t lut_hi_bytes[32][16];
             for (size_t q = 0; q < chunks_per_group; ++q) {
                 const int8_t* a4 = &aq[g * kGroupSizeG128 + q * kTmacChunk];
-                alignas(16) uint8_t lo_bytes[16];
-                alignas(16) uint8_t hi_bytes[16];
                 for (int idx = 0; idx < 16; ++idx) {
                     int sum = 0;
                     for (int j = 0; j < 4; ++j) sum += ((idx >> j) & 1) ? a4[j] : -a4[j];
                     const int16_t s16 = static_cast<int16_t>(sum);
                     lut[q][idx] = s16;
-                    lo_bytes[idx] = static_cast<uint8_t>(static_cast<uint16_t>(s16) & 0xFFU);
-                    hi_bytes[idx] = static_cast<uint8_t>(static_cast<uint16_t>(s16) >> 8);
+                    lut_lo_bytes[q][idx] = static_cast<uint8_t>(static_cast<uint16_t>(s16) & 0xFFU);
+                    lut_hi_bytes[q][idx] = static_cast<uint8_t>(static_cast<uint16_t>(s16) >> 8);
                 }
-#if defined(KINESIS_UNIFIED_HAS_AVX2)
-                lut_lo_128[q] = _mm_load_si128(reinterpret_cast<const __m128i*>(lo_bytes));
-                lut_hi_128[q] = _mm_load_si128(reinterpret_cast<const __m128i*>(hi_bytes));
-                lut_lo_256[q] = _mm256_broadcastsi128_si256(lut_lo_128[q]);
-                lut_hi_256[q] = _mm256_broadcastsi128_si256(lut_hi_128[q]);
-#endif
             }
 
             size_t p = 0;
@@ -668,14 +660,20 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                     const uint32_t* wp2 = &B.nibbles[(p + 2) * B.chunks() + g * chunks_per_group];
                     const uint32_t* wp3 = &B.nibbles[(p + 3) * B.chunks() + g * chunks_per_group];
                     for (size_t q = 0; q < chunks_per_group; ++q) {
+                        const __m256i lut_lo_q = _mm256_broadcastsi128_si256(
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut_lo_bytes[q]))
+                        );
+                        const __m256i lut_hi_q = _mm256_broadcastsi128_si256(
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut_hi_bytes[q]))
+                        );
                         const __m256i raw0123 = _mm256_setr_epi32(
                             static_cast<int>(wp0[q]), static_cast<int>(wp1[q]), 0, 0,
                             static_cast<int>(wp2[q]), static_cast<int>(wp3[q]), 0, 0);
                         const __m256i idx0123 = _mm256_unpacklo_epi8(
                             _mm256_and_si256(raw0123, mask0f_256),
                             _mm256_and_si256(_mm256_srli_epi16(raw0123, 4), mask0f_256));
-                        const __m256i lo = _mm256_shuffle_epi8(lut_lo_256[q], idx0123);
-                        const __m256i hi = _mm256_shuffle_epi8(lut_hi_256[q], idx0123);
+                        const __m256i lo = _mm256_shuffle_epi8(lut_lo_q, idx0123);
+                        const __m256i hi = _mm256_shuffle_epi8(lut_hi_q, idx0123);
                         const __m256i s16_02 = _mm256_unpacklo_epi8(lo, hi); // low 128b: p+0, high 128b: p+2
                         const __m256i s16_13 = _mm256_unpackhi_epi8(lo, hi); // low 128b: p+1, high 128b: p+3
                         vacc0 = _mm256_add_epi32(vacc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(s16_02)));
@@ -683,11 +681,11 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                         vacc2 = _mm256_add_epi32(vacc2, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(s16_02, 1)));
                         vacc3 = _mm256_add_epi32(vacc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(s16_13, 1)));
                     }
-                    alignas(32) int32_t acc4[4][8];
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(acc4[0]), vacc0);
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(acc4[1]), vacc1);
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(acc4[2]), vacc2);
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(acc4[3]), vacc3);
+                    int32_t acc4[4][8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc4[0]), vacc0);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc4[1]), vacc1);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc4[2]), vacc2);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc4[3]), vacc3);
                     for (size_t sub = 0; sub < 4; ++sub) {
                         const size_t n_base = (p + sub) * kNr8;
                         const size_t n_valid = std::min(kNr8, N - n_base);
@@ -703,23 +701,27 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
             for (; p < B.num_panels; ++p) {
                 const size_t n_base = p * kNr8;
                 const size_t n_valid = std::min(kNr8, N - n_base);
-                alignas(32) int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 const uint32_t* wp = &B.nibbles[p * B.chunks() + g * chunks_per_group];
 #if defined(KINESIS_UNIFIED_HAS_AVX2)
                 if (!force_scalar) {
                     __m256i vacc = _mm256_setzero_si256();
                     const __m128i mask0f = _mm_set1_epi8(0x0F);
                     for (size_t q = 0; q < chunks_per_group; ++q) {
+                        const __m128i lut_lo_128_q =
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut_lo_bytes[q]));
+                        const __m128i lut_hi_128_q =
+                            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut_hi_bytes[q]));
                         // Expand eight nibbles (4 bytes) into eight index bytes: nibble c -> byte c
                         const __m128i raw = _mm_cvtsi32_si128(static_cast<int>(wp[q]));
                         const __m128i idx = _mm_unpacklo_epi8(_mm_and_si128(raw, mask0f),
                                                                _mm_and_si128(_mm_srli_epi16(raw, 4), mask0f));
-                        const __m128i lo = _mm_shuffle_epi8(lut_lo_128[q], idx);
-                        const __m128i hi = _mm_shuffle_epi8(lut_hi_128[q], idx);
+                        const __m128i lo = _mm_shuffle_epi8(lut_lo_128_q, idx);
+                        const __m128i hi = _mm_shuffle_epi8(lut_hi_128_q, idx);
                         const __m128i s16 = _mm_unpacklo_epi8(lo, hi); // eight int16 partial sums
                         vacc = _mm256_add_epi32(vacc, _mm256_cvtepi16_epi32(s16));
                     }
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(acc), vacc);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc), vacc);
                 } else
 #endif
                 {
@@ -860,7 +862,7 @@ public:
     void execute_smart_w1_gemm(
         const TensorView<const float>& A,
         const W1GotoBlasPanelSet& B_packed,
-        TensorView<float> C,
+        const TensorView<float>& C,
         bool force_exact = false
     ) {
         const size_t M = static_cast<size_t>(A.size(0));
@@ -908,11 +910,11 @@ public:
                     const size_t k_end = std::min(K, k_base + kGroupSizeG128);
                     const uint16_t* scale_bf16_ptr =
                         &B_packed.packed_scales_bf16[(p * num_groups + g) * kNr8];
-                    alignas(32) float scale_f32[kNr8];
+                    float scale_f32[kNr8];
                     for (size_t c = 0; c < kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_load_ps(scale_f32);
+                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
 
                     for (size_t k = k_base; k < k_end; ++k) {
                         const __m256 vb = avx2_unpack_w1_nr8_byte(bits_ptr[k], v_scale);
@@ -927,11 +929,11 @@ public:
                     }
                 }
 
-                alignas(32) float tmp[4][8];
-                _mm256_store_ps(tmp[0], acc0);
-                _mm256_store_ps(tmp[1], acc1);
-                _mm256_store_ps(tmp[2], acc2);
-                _mm256_store_ps(tmp[3], acc3);
+                float tmp[4][8];
+                _mm256_storeu_ps(tmp[0], acc0);
+                _mm256_storeu_ps(tmp[1], acc1);
+                _mm256_storeu_ps(tmp[2], acc2);
+                _mm256_storeu_ps(tmp[3], acc3);
 
                 for (size_t r = 0; r < m_valid; ++r) {
                     for (size_t c = 0; c < n_valid; ++c) {
@@ -984,7 +986,7 @@ public:
     void execute_smart_w2_gemm(
         const TensorView<const float>& A,
         const W2GotoBlasPanelSet& B_packed,
-        TensorView<float> C,
+        const TensorView<float>& C,
         bool force_exact = false
     ) {
         const size_t M = static_cast<size_t>(A.size(0));
@@ -1030,11 +1032,11 @@ public:
                     const size_t k_end = std::min(K, k_base + kGroupSizeG128);
                     const uint16_t* scale_bf16_ptr =
                         &B_packed.packed_scales_bf16[(p * num_groups + g) * kNr8];
-                    alignas(32) float scale_f32[kNr8];
+                    float scale_f32[kNr8];
                     for (size_t c = 0; c < kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_load_ps(scale_f32);
+                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
 
                     for (size_t k = k_base; k < k_end; ++k) {
                         const __m256 vb = avx2_unpack_w2_nr8_u16(trits_ptr[k], v_scale);
@@ -1049,11 +1051,11 @@ public:
                     }
                 }
 
-                alignas(32) float tmp[4][8];
-                _mm256_store_ps(tmp[0], acc0);
-                _mm256_store_ps(tmp[1], acc1);
-                _mm256_store_ps(tmp[2], acc2);
-                _mm256_store_ps(tmp[3], acc3);
+                float tmp[4][8];
+                _mm256_storeu_ps(tmp[0], acc0);
+                _mm256_storeu_ps(tmp[1], acc1);
+                _mm256_storeu_ps(tmp[2], acc2);
+                _mm256_storeu_ps(tmp[3], acc3);
 
                 for (size_t r = 0; r < m_valid; ++r) {
                     for (size_t c = 0; c < n_valid; ++c) {

@@ -177,6 +177,24 @@ SUITES: List[VerificationSuite] = [
         run_cmd=["./kinesis_unified/test_kinesis_unified.exe"],
     ),
     VerificationSuite(
+        suite_id="F2",
+        workstream="WS-F (Kinesis Bridge)",
+        name="Native C++20 ctypes ABI Bridge & SafeTensors Sub-2-Bit Converter",
+        build_cmd=None,
+        run_cmd=[sys.executable, "kinesis_unified/kinesis_bridge.py"],
+    ),
+    VerificationSuite(
+        suite_id="F3",
+        workstream="WS-F (CPU Roofline)",
+        name="Empirical Host CPU GFLOPS, Cache Residency & Bandwidth Benchmark",
+        build_cmd=[
+            "g++", "-std=c++20", "-O3", "-mavx2", "-mfma", "-Wall", "-Wextra", "-I.",
+            "kinesis_unified/bench_cpu_roofline.cpp",
+            "-o", "kinesis_unified/bench_cpu_roofline.exe",
+        ],
+        run_cmd=["./kinesis_unified/bench_cpu_roofline.exe"],
+    ),
+    VerificationSuite(
         suite_id="G1",
         workstream="WS-G (E2E 5-Pillar)",
         name="End-to-End 5-Pillar Transformer Block & QAT Verification Pipeline",
@@ -267,6 +285,9 @@ def main() -> int:
     print("================================================================================")
 
     total_start = time.perf_counter()
+    # Pre-build the shared C++20 ABI library once so F2 and G1 do not race on DLL creation
+    from kinesis_unified.kinesis_bridge import build_or_locate_kinesis_shared_lib
+    build_or_locate_kinesis_shared_lib()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         results = list(pool.map(run_single_suite, SUITES))
 

@@ -7,7 +7,7 @@
   pre { white-space: pre-wrap; word-wrap: break-word; background: #f6f8fa; border: 1px solid #d0d7de; padding: 14px; border-radius: 6px; font-size: 11.5px; line-height: 1.45; }
   @media print { .bar { display: none; } pre { font-size: 9.5px; border: none; } }
 </style></head><body>
-<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 18 Verification Suites Included)</span>
+<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 20 Verification Suites Included)</span>
 <button onclick="window.print()">Save Complete PDF</button></div>
 <pre># First-Principles Co-Design of Unlocked GPU Silicon, Zero-Copy Bus Fabrics, and Fused Sub-2-Bit Tensor Kernels
 
@@ -884,11 +884,32 @@ Wave 3 completed the remaining multi-pillar integration, real OS multi-threaded 
 * **F19 fixed (True 32-Lane Warp-Collective Execution of `tiled_cbc_sieve.cu` in Suite `C1`)** - Removed the `#ifdef __CUDACC__` guard that hid the `__device__` functions during host compilation of `structural_filters/tiled_cbc_sieve.cu`, added `__ballot_sync` (`HOST_COLL_BALLOT`) to `w1a16_host_cta_shim.hpp`, updated `tiled_cbc_sieve_pred` to use `warp_reduce_rowmax_l1_k32`, and executed the actual `__device__` functions across 32 warp fiber lanes in `test_tiled_cbc.exe`.
 * **F20 fixed (Sign-Preserving QR Orthonormalization of `p_old` &amp; INT4 Column Normalization in `galore_async_offload.py` + `kinesis_unified` Safety Guards)** - Plain Householder QR `torch.linalg.qr(p_old)` can flip column signs ($R_{ii} &lt; 0$), causing `_reproject_moments` to negate `M_old`. Enforced $\text{diag}(R) &gt; 0$ (`q_qr * sign(diag(r_qr))`) on `p_old_orth` and column-normalized `_load_projector` after INT4 dequantization. Also added signed-stride overflow checks (`Shape::contiguous_strides`), `SlabAllocator` double-free protection (`is_free_` bitmap), and `VirtualMemory`/`SlabAllocator` multiplication overflow guards in `kinesis_unified/`.
 
+## 0.3 2026-11-05 Wave 4 Native C++20 `ctypes` ABI, SafeTensors Converter &amp; Empirical Host CPU Roofline Pass
+
+Wave 4 added the native C++20 shared-library ABI bridge, a spec-compliant Hugging Face SafeTensors sub-2-bit checkpoint converter, and an empirical host CPU GFLOPS/cache-residency/bandwidth benchmark suite across all 20 verification suites (`python run_all_tests.py`):
+
+* **Wave 4A (`kinesis_unified/kinesis_c_abi.cpp` + `kinesis_unified/kinesis_bridge.py`, Suite `F2`, &amp; `e2e_transformer_pipeline.py`, Suite `G1`)** - Built a zero-copy C++20 `extern &quot;C&quot;` shared library (`libkinesis_unified.dll` / `.so`) and Python `ctypes` wrapper (`KinesisNativeBridge`) exposing `pack_w1_gotoblas_panels`, `pack_w2_gotoblas_panels`, `pack_w1_tmac_lut_panels`, `convert_w1_gotoblas_to_gpu_interleaved_u32`, `gemm_fp32_register_blocked_4x8`, `execute_smart_w1_gemm`, `execute_smart_w2_gemm`, and `execute_tmac_lut_w1_gemm` directly to PyTorch CPU tensors. Also implemented a zero-dependency Hugging Face SafeTensors serializer/deserializer (`save_safetensors_bytes` / `load_safetensors_bytes`) and `convert_hf_transformer_layer_to_sub2bit` performing offline Kronecker-Stiefel $W_O&#x27; = (R_P^\top \otimes I_{16}) W_O$ absorption (reducing activation kurtosis from `19.81 -&gt; 2.68`), packing attention projections into W2 ternary (`2.125 bpw`) and FFN projections into W1 binary (`1.125 bpw`) for both CPU GotoBLAS / T-MAC and GPU Interleaved `uint32` layouts (`19.69x` total layer compression, `154,520` SafeTensors bytes, 0 bit errors on round-trip reload).
+* **F21 fixed (Windows x64 SEH 16-Byte Stack Alignment / GCC Bugzilla PR 54412 in `sub2bit_gemm_and_smart_cache.hpp` &amp; `memory_primitives.hpp`)** - On `x86_64-w64-mingw32`, Windows x64 SEH locks `MAX_STACK_ALIGNMENT` to 16 bytes (`RSP % 16 == 0`), yet passing 128-byte `TensorView&lt;float&gt;` or 56-byte `Shape`/`Strides` descriptors by value or declaring local stack arrays with `alignas(32)` / `__m256i[32]` caused GCC `-O3 -mavx2` to emit 32-byte aligned `vmovdqa`/`vmovaps` instructions onto 16-byte aligned stack slots when invoked from Python `ctypes`. Fixed by passing `TensorView`, `Shape`, and `Strides` by `const&amp;` and using unaligned `_mm256_storeu_ps`, `_mm256_loadu_ps`, `_mm256_storeu_si256`, and `_mm256_broadcastsi128_si256(_mm_loadu_si128(...))` on stack buffers.
+* **Wave 4B (`kinesis_unified/bench_cpu_roofline.cpp`, Suite `F3`)** - Added an empirical single-core AVX2/FMA host CPU benchmark (`GenuineIntel`, 16 logical cores, `L1D = 48 KB`, `L2 = 1280 KB`, `L3 = 24576 KB`, `KC = 512, MC = 320, NC = 4096`) measuring wall-clock latency (`ms`), compute throughput (`GFLOPS`), physical read bandwidth (`GB/s`), and FP32-equivalent effective bandwidth (`GB/s`) across all 5 compiled CPU GEMM paths:
+
+| Regime | Kernel / Precision Path | Weight Footprint | Best Latency | Measured GFLOPS | Physical Read BW | Effective FP32 BW | Speedup vs. FP32 GotoBLAS |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Regime A: Decode (`M=4, K=1024, N=1024`)** | 1. FP32 `4x8` GotoBLAS | `4096.0 KB` | `1.085 ms` | `7.73 GFLOPS` | `3.90 GB/s` | `3.90 GB/s` | `1.00x` |
+| **Regime A: Decode (`M=4, K=1024, N=1024`)** | 2. W1 AVX2 FMA (Exact) | `144.0 KB` | `0.327 ms` | `25.65 GFLOPS` | `0.55 GB/s` | `12.92 GB/s` | **`3.32x`** |
+| **Regime A: Decode (`M=4, K=1024, N=1024`)** | 3. W1 AVX2 FMA + Holder Sieve (50%) | `72.0 KB` | `0.197 ms` | `42.63 GFLOPS` | `0.54 GB/s` | `21.48 GB/s` | **`5.51x`** |
+| **Regime A: Decode (`M=4, K=1024, N=1024`)** | 4. W2 Ternary AVX2 FMA (Exact) | `272.0 KB` | `0.355 ms` | `23.65 GFLOPS` | `0.88 GB/s` | `11.92 GB/s` | **`3.06x`** |
+| **Regime A: Decode (`M=4, K=1024, N=1024`)** | 5. W1 T-MAC 256-bit `vpshufb` LUT | `144.0 KB` | `0.164 ms` | **`51.03 GFLOPS`** | `1.10 GB/s` | **`25.71 GB/s`** | **`6.60x`** |
+| **Regime B: Prefill (`M=64, K=1024, N=1024`)** | 1. FP32 `4x8` GotoBLAS | `4096.0 KB` | `3.898 ms` | `34.43 GFLOPS` | `1.21 GB/s` | `1.21 GB/s` | `1.00x` |
+| **Regime B: Prefill (`M=64, K=1024, N=1024`)** | 2. W1 AVX2 FMA (Exact) | `144.0 KB` | `4.399 ms` | `30.51 GFLOPS` | `0.15 GB/s` | `1.07 GB/s` | `0.89x` (compute-bound unpack cost) |
+| **Regime B: Prefill (`M=64, K=1024, N=1024`)** | 3. W1 AVX2 FMA + Holder Sieve (50%) | `72.0 KB` | `2.476 ms` | **`54.21 GFLOPS`** | `0.24 GB/s` | `1.91 GB/s` | **`1.57x`** |
+| **Regime B: Prefill (`M=64, K=1024, N=1024`)** | 4. W2 Ternary AVX2 FMA (Exact) | `272.0 KB` | `5.523 ms` | `24.30 GFLOPS` | `0.15 GB/s` | `0.85 GB/s` | `0.71x` (compute-bound unpack cost) |
+| **Regime B: Prefill (`M=64, K=1024, N=1024`)** | 5. W1 T-MAC 256-bit `vpshufb` LUT | `144.0 KB` | `2.761 ms` | `48.60 GFLOPS` | `0.24 GB/s` | `1.71 GB/s` | **`1.41x`** |
+
 ## 1. What can and cannot be verified in this environment
 
 | Component | How it was exercised | What that proves | What it does NOT prove |
 | :--- | :--- | :--- | :--- |
-| `kinesis_unified` (C++20, AVX2) | Compiled and run on the host CPU | Numerical correctness of packing, FP32 GEMM, W1/W2 unpack, T-MAC LUT vs FP32 | Performance on any target, AVX-512 or AMX paths |
+| `kinesis_unified` (C++20, AVX2, `ctypes` ABI, SafeTensors) | Compiled and run on the host CPU (`test_kinesis_unified.exe`, `bench_cpu_roofline.exe`, and `libkinesis_unified.dll`/`.so` via `kinesis_bridge.py`) | Numerical correctness of packing, FP32 GEMM, W1/W2 unpack, T-MAC LUT vs FP32, SafeTensors layer conversion, and **measured single-core AVX2 GFLOPS / L2-residency speedups (`3.06x..6.60x` at `M=4`) on the host CPU** | Multi-socket Xeon AVX-512 or physical AMX tile silicon speed |
 | `sim_harness/ptx_bf162_emu.c` | Host C emulator of PTX semantics | Unpack constants and bit layouts are self-consistent under the emulated semantics | That real hardware or `ptxas` accepts the PTX (see finding F1) |
 | `fused_w1_hadacore/*.cu`, `structural_filters/tiled_cbc_sieve.cu` device code | **Compiled and run on host CPU** via 256-fiber CTA / 32-lane Warp-Collective execution shim (`w1a16_host_cta_shim.hpp`, `-Wall -Wextra`, 0 warnings) | Bit-exact correctness of `__global__` CTA/warp tiling, `Swizzle&lt;3,3,3&gt;` shared memory, `ldmatrix.x4`, `mma.m16n8k16`, online HadaCore (`H_16` &amp; `H_32`), Stream-K decode, `__shfl_xor_sync` / `__ballot_sync` row-max sieve, and odd `(M, N, K)` tail guards across 45 test cases | Hardware `nvcc`/`ptxas` register count, occupancy, and real GPU execution speed |
 | `hetero_runtime/chorus_amx_moe.c` | Compiled and run on host CPU with real OS worker thread (`_beginthreadex`/`pthread_create`), `VirtualLock`/`mlock`, and AMX FTZ emulation | Layout indexing, 64B ring-slot cache-line isolation, multi-threaded SPSC lock-free ring handshake (`8/8` slots), and AMX BF16/FP32 denormal flush-to-zero semantics | Real hardware `_tile_dpbf16ps` silicon execution and Linux 1GB `MAP_HUGETLB` allocation on a Xeon host |
@@ -928,6 +949,7 @@ Severity: **S1** wrong results or will not build, **S2** unsafe or silently misl
 | F18 | S1 | `ptx_bf162_emu.c` Stage 2 Kronecker $H_2$ butterfly used `0x3F003F00U` (`0.5f`) instead of orthonormal `1/sqrt(2)` (`0x3F353F35U`). | Updated `ptx_bf162_emu.c` and `smsp_roofline_sim.py` to `0x3F353F35U` / `0xBF35BF35U` ($\pm 0.70703125_{\text{bf16}}$), matching `w1a16_hadacore_kernel.cu`. |
 | F19 | S2 | `structural_filters/tiled_cbc_sieve.cu` hid `__device__` functions behind `#ifdef __CUDACC__` during host compilation and tested a scalar duplicate in `main()`. | Included `w1a16_host_cta_shim.hpp` (with `__ballot_sync` emulation) in `tiled_cbc_sieve.cu` and executed the real `__device__` functions across 32 warp fiber lanes. |
 | F20 | S1 | Householder QR `torch.linalg.qr(p_old)` in `_reproject_moments` (`galore_async_offload.py`) could flip column signs ($R_{ii} &lt; 0$), negating `M_old` on projector refresh. | Enforced positive diagonal entries on $R$ (`p_old_orth = q_qr * sign(diag(r_qr))`) and column-normalized INT4 projectors on load (`0.9811` trajectory cosine similarity). |
+| F21 | S1 | Passing 128-byte `TensorView&lt;float&gt;` by value or using `alignas(32)` / `__m256i[32]` on local stack variables on `x86_64-w64-mingw32` caused GCC `-O3 -mavx2` to emit 32-byte aligned `vmovdqa`/`vmovaps` onto 16-byte aligned Windows x64 SEH stacks (GCC PR 54412), crashing when invoked via Python `ctypes`. | Passed `TensorView`, `Shape`, and `Strides` by `const&amp;` and replaced aligned stack intrinsics/arrays with `_mm256_storeu_ps`, `_mm256_loadu_ps`, `_mm256_storeu_si256`, and `_mm256_broadcastsi128_si256(_mm_loadu_si128(...))`. |
 
 ### 2.2 Status of Open &amp; Hardware-Dependent Items (`O1..O17`)
 
@@ -1676,7 +1698,7 @@ class TensorView {
 public:
     constexpr TensorView() noexcept = default;
 
-    constexpr TensorView(T* data, Shape shape,
+    constexpr TensorView(T* data, const Shape&amp; shape,
                          MemorySpace space = MemorySpace::HostPinnedLocked) noexcept
         : data_(data),
           offset_(0),
@@ -1685,7 +1707,7 @@ public:
         shape_.set_memory_space(space);
     }
 
-    constexpr TensorView(T* data, Shape shape, Strides strides, int64_t offset = 0,
+    constexpr TensorView(T* data, const Shape&amp; shape, const Strides&amp; strides, int64_t offset = 0,
                          MemorySpace space = MemorySpace::HostPinnedLocked) noexcept
         : data_(data), offset_(offset), shape_(shape), strides_(strides) {
         shape_.set_memory_space(space);
@@ -2244,7 +2266,7 @@ inline void pack_B_nr8_panel(
 inline void gemm_fp32_register_blocked_4x8(
     const TensorView&lt;const float&gt;&amp; A,
     const TensorView&lt;const float&gt;&amp; B,
-    TensorView&lt;float&gt; C,
+    const TensorView&lt;float&gt;&amp; C,
     ArenaAllocator&amp; scratch_arena
 ) {
     if (B.shape().rank() != 2) {
@@ -2312,11 +2334,14 @@ inline void gemm_fp32_register_blocked_4x8(
                             acc3 = _mm256_fmadd_ps(_mm256_set1_ps(ap[3]), vb, acc3);
                         }
 
-                        alignas(32) float tmp[4][8];
-                        _mm256_store_ps(tmp[0], acc0);
-                        _mm256_store_ps(tmp[1], acc1);
-                        _mm256_store_ps(tmp[2], acc2);
-                        _mm256_store_ps(tmp[3], acc3);
+                        // Do not use alignas(32) on local stack arrays: on x86_64-w64-mingw32 (GCC PR 54412),
+                        // MAX_STACK_ALIGNMENT is 16 bytes, yet alignas(32) causes GCC -O3 to fold _mm256_storeu_ps
+                        // back into vmovaps, faulting when RSP % 32 == 16 (e.g. from Python ctypes).
+                        float tmp[4][8];
+                        _mm256_storeu_ps(tmp[0], acc0);
+                        _mm256_storeu_ps(tmp[1], acc1);
+                        _mm256_storeu_ps(tmp[2], acc2);
+                        _mm256_storeu_ps(tmp[3], acc3);
 
                         for (size_t r = 0; r &lt; m_valid; ++r) {
                             for (size_t c = 0; c &lt; n_valid; ++c) {
@@ -2698,7 +2723,7 @@ struct TmacRunStats {
 inline TmacRunStats execute_tmac_lut_w1_gemm(
     const TensorView&lt;const float&gt;&amp; A,
     const W1TmacLutPanelSet&amp; B,
-    TensorView&lt;float&gt; C,
+    const TensorView&lt;float&gt;&amp; C,
     float energy_sieve_tau = 0.0f,
     bool force_scalar = false
 ) {
@@ -2749,33 +2774,22 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                 if (g_scale[g] != 0.0f) ++stats.groups_skipped; // skipped by the sieve, not by true zeros
                 continue;
             }
-            // Build 16-entry int16 tables for every 4-wide chunk of this group, and hoist
-            // the 16-byte low/high LUT splits and 256-bit broadcasts outside the panel loop p.
-            alignas(16) int16_t lut[32][16];
-#if defined(KINESIS_UNIFIED_HAS_AVX2)
-            __m128i lut_lo_128[32];
-            __m128i lut_hi_128[32];
-            __m256i lut_lo_256[32];
-            __m256i lut_hi_256[32];
-#endif
+            // Build 16-entry int16 tables for every 4-wide chunk of this group, and store
+            // the 16-byte low/high LUT splits in unaligned byte tables (avoiding __m256i[32]
+            // stack arrays that trigger vmovdqa under GCC PR 54412 on Windows x64).
+            int16_t lut[32][16];
+            uint8_t lut_lo_bytes[32][16];
+            uint8_t lut_hi_bytes[32][16];
             for (size_t q = 0; q &lt; chunks_per_group; ++q) {
                 const int8_t* a4 = &amp;aq[g * kGroupSizeG128 + q * kTmacChunk];
-                alignas(16) uint8_t lo_bytes[16];
-                alignas(16) uint8_t hi_bytes[16];
                 for (int idx = 0; idx &lt; 16; ++idx) {
                     int sum = 0;
                     for (int j = 0; j &lt; 4; ++j) sum += ((idx &gt;&gt; j) &amp; 1) ? a4[j] : -a4[j];
                     const int16_t s16 = static_cast&lt;int16_t&gt;(sum);
                     lut[q][idx] = s16;
-                    lo_bytes[idx] = static_cast&lt;uint8_t&gt;(static_cast&lt;uint16_t&gt;(s16) &amp; 0xFFU);
-                    hi_bytes[idx] = static_cast&lt;uint8_t&gt;(static_cast&lt;uint16_t&gt;(s16) &gt;&gt; 8);
+                    lut_lo_bytes[q][idx] = static_cast&lt;uint8_t&gt;(static_cast&lt;uint16_t&gt;(s16) &amp; 0xFFU);
+                    lut_hi_bytes[q][idx] = static_cast&lt;uint8_t&gt;(static_cast&lt;uint16_t&gt;(s16) &gt;&gt; 8);
                 }
-#if defined(KINESIS_UNIFIED_HAS_AVX2)
-                lut_lo_128[q] = _mm_load_si128(reinterpret_cast&lt;const __m128i*&gt;(lo_bytes));
-                lut_hi_128[q] = _mm_load_si128(reinterpret_cast&lt;const __m128i*&gt;(hi_bytes));
-                lut_lo_256[q] = _mm256_broadcastsi128_si256(lut_lo_128[q]);
-                lut_hi_256[q] = _mm256_broadcastsi128_si256(lut_hi_128[q]);
-#endif
             }
 
             size_t p = 0;
@@ -2793,14 +2807,20 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                     const uint32_t* wp2 = &amp;B.nibbles[(p + 2) * B.chunks() + g * chunks_per_group];
                     const uint32_t* wp3 = &amp;B.nibbles[(p + 3) * B.chunks() + g * chunks_per_group];
                     for (size_t q = 0; q &lt; chunks_per_group; ++q) {
+                        const __m256i lut_lo_q = _mm256_broadcastsi128_si256(
+                            _mm_loadu_si128(reinterpret_cast&lt;const __m128i*&gt;(lut_lo_bytes[q]))
+                        );
+                        const __m256i lut_hi_q = _mm256_broadcastsi128_si256(
+                            _mm_loadu_si128(reinterpret_cast&lt;const __m128i*&gt;(lut_hi_bytes[q]))
+                        );
                         const __m256i raw0123 = _mm256_setr_epi32(
                             static_cast&lt;int&gt;(wp0[q]), static_cast&lt;int&gt;(wp1[q]), 0, 0,
                             static_cast&lt;int&gt;(wp2[q]), static_cast&lt;int&gt;(wp3[q]), 0, 0);
                         const __m256i idx0123 = _mm256_unpacklo_epi8(
                             _mm256_and_si256(raw0123, mask0f_256),
                             _mm256_and_si256(_mm256_srli_epi16(raw0123, 4), mask0f_256));
-                        const __m256i lo = _mm256_shuffle_epi8(lut_lo_256[q], idx0123);
-                        const __m256i hi = _mm256_shuffle_epi8(lut_hi_256[q], idx0123);
+                        const __m256i lo = _mm256_shuffle_epi8(lut_lo_q, idx0123);
+                        const __m256i hi = _mm256_shuffle_epi8(lut_hi_q, idx0123);
                         const __m256i s16_02 = _mm256_unpacklo_epi8(lo, hi); // low 128b: p+0, high 128b: p+2
                         const __m256i s16_13 = _mm256_unpackhi_epi8(lo, hi); // low 128b: p+1, high 128b: p+3
                         vacc0 = _mm256_add_epi32(vacc0, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(s16_02)));
@@ -2808,11 +2828,11 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                         vacc2 = _mm256_add_epi32(vacc2, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(s16_02, 1)));
                         vacc3 = _mm256_add_epi32(vacc3, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(s16_13, 1)));
                     }
-                    alignas(32) int32_t acc4[4][8];
-                    _mm256_store_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[0]), vacc0);
-                    _mm256_store_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[1]), vacc1);
-                    _mm256_store_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[2]), vacc2);
-                    _mm256_store_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[3]), vacc3);
+                    int32_t acc4[4][8];
+                    _mm256_storeu_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[0]), vacc0);
+                    _mm256_storeu_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[1]), vacc1);
+                    _mm256_storeu_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[2]), vacc2);
+                    _mm256_storeu_si256(reinterpret_cast&lt;__m256i*&gt;(acc4[3]), vacc3);
                     for (size_t sub = 0; sub &lt; 4; ++sub) {
                         const size_t n_base = (p + sub) * kNr8;
                         const size_t n_valid = std::min(kNr8, N - n_base);
@@ -2828,23 +2848,27 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
             for (; p &lt; B.num_panels; ++p) {
                 const size_t n_base = p * kNr8;
                 const size_t n_valid = std::min(kNr8, N - n_base);
-                alignas(32) int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                int32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                 const uint32_t* wp = &amp;B.nibbles[p * B.chunks() + g * chunks_per_group];
 #if defined(KINESIS_UNIFIED_HAS_AVX2)
                 if (!force_scalar) {
                     __m256i vacc = _mm256_setzero_si256();
                     const __m128i mask0f = _mm_set1_epi8(0x0F);
                     for (size_t q = 0; q &lt; chunks_per_group; ++q) {
+                        const __m128i lut_lo_128_q =
+                            _mm_loadu_si128(reinterpret_cast&lt;const __m128i*&gt;(lut_lo_bytes[q]));
+                        const __m128i lut_hi_128_q =
+                            _mm_loadu_si128(reinterpret_cast&lt;const __m128i*&gt;(lut_hi_bytes[q]));
                         // Expand eight nibbles (4 bytes) into eight index bytes: nibble c -&gt; byte c
                         const __m128i raw = _mm_cvtsi32_si128(static_cast&lt;int&gt;(wp[q]));
                         const __m128i idx = _mm_unpacklo_epi8(_mm_and_si128(raw, mask0f),
                                                                _mm_and_si128(_mm_srli_epi16(raw, 4), mask0f));
-                        const __m128i lo = _mm_shuffle_epi8(lut_lo_128[q], idx);
-                        const __m128i hi = _mm_shuffle_epi8(lut_hi_128[q], idx);
+                        const __m128i lo = _mm_shuffle_epi8(lut_lo_128_q, idx);
+                        const __m128i hi = _mm_shuffle_epi8(lut_hi_128_q, idx);
                         const __m128i s16 = _mm_unpacklo_epi8(lo, hi); // eight int16 partial sums
                         vacc = _mm256_add_epi32(vacc, _mm256_cvtepi16_epi32(s16));
                     }
-                    _mm256_store_si256(reinterpret_cast&lt;__m256i*&gt;(acc), vacc);
+                    _mm256_storeu_si256(reinterpret_cast&lt;__m256i*&gt;(acc), vacc);
                 } else
 #endif
                 {
@@ -2985,7 +3009,7 @@ public:
     void execute_smart_w1_gemm(
         const TensorView&lt;const float&gt;&amp; A,
         const W1GotoBlasPanelSet&amp; B_packed,
-        TensorView&lt;float&gt; C,
+        const TensorView&lt;float&gt;&amp; C,
         bool force_exact = false
     ) {
         const size_t M = static_cast&lt;size_t&gt;(A.size(0));
@@ -3033,11 +3057,11 @@ public:
                     const size_t k_end = std::min(K, k_base + kGroupSizeG128);
                     const uint16_t* scale_bf16_ptr =
                         &amp;B_packed.packed_scales_bf16[(p * num_groups + g) * kNr8];
-                    alignas(32) float scale_f32[kNr8];
+                    float scale_f32[kNr8];
                     for (size_t c = 0; c &lt; kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_load_ps(scale_f32);
+                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
 
                     for (size_t k = k_base; k &lt; k_end; ++k) {
                         const __m256 vb = avx2_unpack_w1_nr8_byte(bits_ptr[k], v_scale);
@@ -3052,11 +3076,11 @@ public:
                     }
                 }
 
-                alignas(32) float tmp[4][8];
-                _mm256_store_ps(tmp[0], acc0);
-                _mm256_store_ps(tmp[1], acc1);
-                _mm256_store_ps(tmp[2], acc2);
-                _mm256_store_ps(tmp[3], acc3);
+                float tmp[4][8];
+                _mm256_storeu_ps(tmp[0], acc0);
+                _mm256_storeu_ps(tmp[1], acc1);
+                _mm256_storeu_ps(tmp[2], acc2);
+                _mm256_storeu_ps(tmp[3], acc3);
 
                 for (size_t r = 0; r &lt; m_valid; ++r) {
                     for (size_t c = 0; c &lt; n_valid; ++c) {
@@ -3109,7 +3133,7 @@ public:
     void execute_smart_w2_gemm(
         const TensorView&lt;const float&gt;&amp; A,
         const W2GotoBlasPanelSet&amp; B_packed,
-        TensorView&lt;float&gt; C,
+        const TensorView&lt;float&gt;&amp; C,
         bool force_exact = false
     ) {
         const size_t M = static_cast&lt;size_t&gt;(A.size(0));
@@ -3155,11 +3179,11 @@ public:
                     const size_t k_end = std::min(K, k_base + kGroupSizeG128);
                     const uint16_t* scale_bf16_ptr =
                         &amp;B_packed.packed_scales_bf16[(p * num_groups + g) * kNr8];
-                    alignas(32) float scale_f32[kNr8];
+                    float scale_f32[kNr8];
                     for (size_t c = 0; c &lt; kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_load_ps(scale_f32);
+                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
 
                     for (size_t k = k_base; k &lt; k_end; ++k) {
                         const __m256 vb = avx2_unpack_w2_nr8_u16(trits_ptr[k], v_scale);
@@ -3174,11 +3198,11 @@ public:
                     }
                 }
 
-                alignas(32) float tmp[4][8];
-                _mm256_store_ps(tmp[0], acc0);
-                _mm256_store_ps(tmp[1], acc1);
-                _mm256_store_ps(tmp[2], acc2);
-                _mm256_store_ps(tmp[3], acc3);
+                float tmp[4][8];
+                _mm256_storeu_ps(tmp[0], acc0);
+                _mm256_storeu_ps(tmp[1], acc1);
+                _mm256_storeu_ps(tmp[2], acc2);
+                _mm256_storeu_ps(tmp[3], acc3);
 
                 for (size_t r = 0; r &lt; m_valid; ++r) {
                     for (size_t c = 0; c &lt; n_valid; ++c) {
@@ -3800,6 +3824,1229 @@ int main() {
                     err_tau);
     }
 
+    return 0;
+}
+```
+
+## File: `kinesis_unified/kinesis_c_abi.cpp`
+```cpp
+/**
+ * @file kinesis_c_abi.cpp
+ * @brief C-Linkage Shared Library ABI for Kinesis Unified C++20 Sub-2-Bit AVX2 Kernels &amp; Smart Tiered Cache.
+ *
+ * Exposes exception-safe extern &quot;C&quot; entry points for Python ctypes / PyTorch integration:
+ *   1. uha_kinesis_pack_w1_panels
+ *   2. uha_kinesis_pack_w2_panels
+ *   3. uha_kinesis_pack_tmac_w1_panels
+ *   4. uha_kinesis_convert_w1_to_gpu_interleaved_u32
+ *   5. uha_kinesis_gemm_fp32_4x8
+ *   6. uha_kinesis_smart_w1_gemm
+ *   7. uha_kinesis_smart_w2_gemm
+ *   8. uha_kinesis_tmac_lut_w1_gemm
+ */
+
+#include &lt;cstddef&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstring&gt;
+#include &lt;exception&gt;
+
+#include &quot;hardware_and_sandbox.hpp&quot;
+#include &quot;memory_primitives.hpp&quot;
+#include &quot;sub2bit_gemm_and_smart_cache.hpp&quot;
+#include &quot;unified_sizing.h&quot;
+
+#if defined(_WIN32)
+#define UHA_KINESIS_API extern &quot;C&quot; __declspec(dllexport)
+#else
+#define UHA_KINESIS_API extern &quot;C&quot; __attribute__((visibility(&quot;default&quot;)))
+#endif
+
+using namespace kinesis::unified;
+
+UHA_KINESIS_API int uha_kinesis_pack_w1_panels(
+    const float* w_kn,
+    size_t K,
+    size_t N,
+    uint8_t* out_bits,
+    uint16_t* out_scales_bf16
+) {
+    if (!w_kn || !out_bits || !out_scales_bf16 || K == 0 || N == 0) {
+        return -1;
+    }
+    try {
+        TensorView&lt;const float&gt; W(
+            w_kn, Shape{static_cast&lt;int64_t&gt;(K), static_cast&lt;int64_t&gt;(N)}
+        );
+        W1GotoBlasPanelSet panels = pack_w1_gotoblas_panels(W);
+        std::memcpy(out_bits, panels.packed_bits.data(), panels.packed_bits.size() * sizeof(uint8_t));
+        std::memcpy(
+            out_scales_bf16,
+            panels.packed_scales_bf16.data(),
+            panels.packed_scales_bf16.size() * sizeof(uint16_t)
+        );
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_pack_w2_panels(
+    const float* w_kn,
+    size_t K,
+    size_t N,
+    uint16_t* out_trits,
+    uint16_t* out_scales_bf16
+) {
+    if (!w_kn || !out_trits || !out_scales_bf16 || K == 0 || N == 0) {
+        return -1;
+    }
+    try {
+        TensorView&lt;const float&gt; W(
+            w_kn, Shape{static_cast&lt;int64_t&gt;(K), static_cast&lt;int64_t&gt;(N)}
+        );
+        W2GotoBlasPanelSet panels = pack_w2_gotoblas_panels(W);
+        std::memcpy(out_trits, panels.packed_trits.data(), panels.packed_trits.size() * sizeof(uint16_t));
+        std::memcpy(
+            out_scales_bf16,
+            panels.packed_scales_bf16.data(),
+            panels.packed_scales_bf16.size() * sizeof(uint16_t)
+        );
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_pack_tmac_w1_panels(
+    const float* w_kn,
+    size_t K,
+    size_t N,
+    uint32_t* out_nibbles,
+    uint16_t* out_scales_bf16
+) {
+    if (!w_kn || !out_nibbles || !out_scales_bf16 || K == 0 || N == 0 || (K % kGroupSizeG128) != 0) {
+        return -1;
+    }
+    try {
+        TensorView&lt;const float&gt; W(
+            w_kn, Shape{static_cast&lt;int64_t&gt;(K), static_cast&lt;int64_t&gt;(N)}
+        );
+        W1GotoBlasPanelSet w1_panels = pack_w1_gotoblas_panels(W);
+        W1TmacLutPanelSet tmac_panels = pack_w1_tmac_lut_panels(w1_panels);
+        std::memcpy(out_nibbles, tmac_panels.nibbles.data(), tmac_panels.nibbles.size() * sizeof(uint32_t));
+        std::memcpy(
+            out_scales_bf16,
+            tmac_panels.scales_bf16.data(),
+            tmac_panels.scales_bf16.size() * sizeof(uint16_t)
+        );
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_convert_w1_to_gpu_interleaved_u32(
+    const uint8_t* in_bits,
+    const uint16_t* in_scales_bf16,
+    size_t K,
+    size_t N,
+    uint32_t* out_gpu_u32,
+    uint16_t* out_gpu_scales_bf16
+) {
+    if (!in_bits || !in_scales_bf16 || !out_gpu_u32 || !out_gpu_scales_bf16 ||
+        K == 0 || N == 0 || (K % UHA_W1_WEIGHTS_PER_U32) != 0) {
+        return -1;
+    }
+    try {
+        W1GotoBlasPanelSet cpu_panels;
+        cpu_panels.K = K;
+        cpu_panels.N = N;
+        cpu_panels.num_panels = (N + kNr8 - 1) / kNr8;
+        cpu_panels.groups_per_col = (K + kGroupSizeG128 - 1) / kGroupSizeG128;
+        cpu_panels.packed_bits.assign(in_bits, in_bits + cpu_panels.num_panels * K);
+        cpu_panels.packed_scales_bf16.assign(
+            in_scales_bf16,
+            in_scales_bf16 + cpu_panels.num_panels * cpu_panels.groups_per_col * kNr8
+        );
+
+        std::vector&lt;uint32_t&gt; gpu_u32;
+        std::vector&lt;uint16_t&gt; gpu_scales;
+        convert_w1_gotoblas_to_gpu_interleaved_u32(cpu_panels, gpu_u32, gpu_scales);
+
+        std::memcpy(out_gpu_u32, gpu_u32.data(), gpu_u32.size() * sizeof(uint32_t));
+        std::memcpy(out_gpu_scales_bf16, gpu_scales.data(), gpu_scales.size() * sizeof(uint16_t));
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_gemm_fp32_4x8(
+    const float* a_mk,
+    const float* b_kn,
+    float* c_mn,
+    size_t M,
+    size_t N,
+    size_t K
+) {
+    if (!a_mk || !b_kn || !c_mn || M == 0 || N == 0 || K == 0) {
+        return -1;
+    }
+    try {
+        const CpuFeatures cpu = HardwareInfo::query_cpu_features();
+        const BlisCacheBlocks blis = HardwareInfo::compute_blis_blocks(cpu);
+        const size_t scratch_bytes = std::max&lt;size_t&gt;(
+            (blis.mc * blis.kc + blis.kc * ((blis.nc + kNr8 - 1) / kNr8) * kNr8) * sizeof(float) + 65536,
+            256 * 1024
+        );
+        ArenaAllocator scratch(scratch_bytes, true, MemorySpace::HostPinnedLocked);
+
+        TensorView&lt;const float&gt; A(a_mk, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+        TensorView&lt;const float&gt; B(b_kn, Shape{static_cast&lt;int64_t&gt;(K), static_cast&lt;int64_t&gt;(N)});
+        TensorView&lt;float&gt; C(c_mn, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+        gemm_fp32_register_blocked_4x8(A, B, C, scratch);
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_smart_w1_gemm(
+    const float* a_mk,
+    const uint8_t* packed_bits,
+    const uint16_t* packed_scales_bf16,
+    float* c_mn,
+    size_t M,
+    size_t N,
+    size_t K,
+    float error_budget_eps,
+    size_t* out_total_groups,
+    size_t* out_pruned_groups
+) {
+    if (!a_mk || !packed_bits || !packed_scales_bf16 || !c_mn || M == 0 || N == 0 || K == 0) {
+        return -1;
+    }
+    try {
+        W1GotoBlasPanelSet panels;
+        panels.K = K;
+        panels.N = N;
+        panels.num_panels = (N + kNr8 - 1) / kNr8;
+        panels.groups_per_col = (K + kGroupSizeG128 - 1) / kGroupSizeG128;
+        panels.packed_bits.assign(packed_bits, packed_bits + panels.num_panels * K);
+        panels.packed_scales_bf16.assign(
+            packed_scales_bf16,
+            packed_scales_bf16 + panels.num_panels * panels.groups_per_col * kNr8
+        );
+
+        SmartTieredCache cache(panels.num_panels, panels.num_panels / 2, 0.0f, 1);
+        if (error_budget_eps &gt; 0.0f) {
+            cache.set_error_budget(error_budget_eps);
+        }
+
+        TensorView&lt;const float&gt; A(a_mk, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+        TensorView&lt;float&gt; C(c_mn, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+        cache.execute_smart_w1_gemm(A, panels, C, error_budget_eps &lt;= 0.0f);
+
+        if (out_total_groups) {
+            *out_total_groups = cache.telemetry().total_tile_requests;
+        }
+        if (out_pruned_groups) {
+            *out_pruned_groups = cache.telemetry().tiles_pruned_by_energy_sieve;
+        }
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_smart_w2_gemm(
+    const float* a_mk,
+    const uint16_t* packed_trits,
+    const uint16_t* packed_scales_bf16,
+    float* c_mn,
+    size_t M,
+    size_t N,
+    size_t K,
+    float error_budget_eps,
+    size_t* out_total_groups,
+    size_t* out_pruned_groups
+) {
+    if (!a_mk || !packed_trits || !packed_scales_bf16 || !c_mn || M == 0 || N == 0 || K == 0) {
+        return -1;
+    }
+    try {
+        W2GotoBlasPanelSet panels;
+        panels.K = K;
+        panels.N = N;
+        panels.num_panels = (N + kNr8 - 1) / kNr8;
+        panels.groups_per_col = (K + kGroupSizeG128 - 1) / kGroupSizeG128;
+        panels.packed_trits.assign(packed_trits, packed_trits + panels.num_panels * K);
+        panels.packed_scales_bf16.assign(
+            packed_scales_bf16,
+            packed_scales_bf16 + panels.num_panels * panels.groups_per_col * kNr8
+        );
+
+        SmartTieredCache cache(panels.num_panels, panels.num_panels / 2, 0.0f, 1);
+        if (error_budget_eps &gt; 0.0f) {
+            cache.set_error_budget(error_budget_eps);
+        }
+
+        TensorView&lt;const float&gt; A(a_mk, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+        TensorView&lt;float&gt; C(c_mn, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+        cache.execute_smart_w2_gemm(A, panels, C, error_budget_eps &lt;= 0.0f);
+
+        if (out_total_groups) {
+            *out_total_groups = cache.telemetry().total_tile_requests;
+        }
+        if (out_pruned_groups) {
+            *out_pruned_groups = cache.telemetry().tiles_pruned_by_energy_sieve;
+        }
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+
+UHA_KINESIS_API int uha_kinesis_tmac_lut_w1_gemm(
+    const float* a_mk,
+    const uint32_t* nibbles,
+    const uint16_t* scales_bf16,
+    float* c_mn,
+    size_t M,
+    size_t N,
+    size_t K,
+    float energy_sieve_tau,
+    size_t* out_total_groups,
+    size_t* out_pruned_groups
+) {
+    if (!a_mk || !nibbles || !scales_bf16 || !c_mn || M == 0 || N == 0 || K == 0 || (K % kGroupSizeG128) != 0) {
+        return -1;
+    }
+    try {
+        W1TmacLutPanelSet tmac;
+        tmac.K = K;
+        tmac.N = N;
+        tmac.num_panels = (N + kNr8 - 1) / kNr8;
+        tmac.groups_per_col = K / kGroupSizeG128;
+        const size_t chunks = K / kTmacChunk;
+        tmac.nibbles.assign(nibbles, nibbles + tmac.num_panels * chunks);
+        tmac.scales_bf16.assign(
+            scales_bf16,
+            scales_bf16 + tmac.num_panels * tmac.groups_per_col * kNr8
+        );
+
+        TensorView&lt;const float&gt; A(a_mk, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+        TensorView&lt;float&gt; C(c_mn, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+        const TmacRunStats stats = execute_tmac_lut_w1_gemm(A, tmac, C, energy_sieve_tau, false);
+
+        if (out_total_groups) {
+            *out_total_groups = stats.groups_total;
+        }
+        if (out_pruned_groups) {
+            *out_pruned_groups = stats.groups_skipped;
+        }
+        return 0;
+    } catch (...) {
+        return -2;
+    }
+}
+```
+
+## File: `kinesis_unified/kinesis_bridge.py`
+```python
+#!/usr/bin/env python3
+&quot;&quot;&quot;
+File: kinesis_unified/kinesis_bridge.py
+Native C++20 Shared-Library Bridge (ctypes) &amp; SafeTensors / Hugging Face Sub-2-Bit Checkpoint Converter (Suite F2).
+
+Provides:
+  1. KinesisNativeBridge: Zero-copy ctypes wrapper around kinesis_unified/kinesis_c_abi.cpp
+     (compiling libkinesis_unified.dll / libkinesis_unified.so automatically via g++ -std=c++20 -O3 -mavx2 -mfma).
+  2. Spec-compliant Hugging Face SafeTensors binary serializer/deserializer (save_safetensors_bytes /
+     load_safetensors_bytes) with zero external third-party dependencies.
+  3. Hugging Face Transformer layer state-dict converter (convert_hf_transformer_layer_to_sub2bit) with
+     offline Kronecker-Stiefel W_O absorption (W_O&#x27; = (R_P^T (x) I_16) W_O), GotoBLAS W1/W2/T-MAC packing,
+     and lossless CPU GotoBLAS -&gt; GPU Interleaved 16-Bit Split uint32 layout conversion.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import struct
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import torch
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+KINESIS_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR / &quot;fused_w1_hadacore&quot;) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR / &quot;fused_w1_hadacore&quot;))
+
+from spinquant_packer import (  # noqa: E402
+    optimize_kronecker_stiefel_rotation,
+    quantize_and_pack_w1_g128_interleaved,
+    unpack_w1_g128_lop3_reference,
+)
+
+
+def build_or_locate_kinesis_shared_lib(force_rebuild: bool = False) -&gt; Path:
+    ext = &quot;.dll&quot; if os.name == &quot;nt&quot; else &quot;.so&quot;
+    lib_path = KINESIS_DIR / f&quot;libkinesis_unified{ext}&quot;
+    src_path = KINESIS_DIR / &quot;kinesis_c_abi.cpp&quot;
+    hdr_paths = [
+        KINESIS_DIR / &quot;sub2bit_gemm_and_smart_cache.hpp&quot;,
+        KINESIS_DIR / &quot;memory_primitives.hpp&quot;,
+        KINESIS_DIR / &quot;hardware_and_sandbox.hpp&quot;,
+        KINESIS_DIR / &quot;unified_sizing.h&quot;,
+    ]
+
+    need_build = force_rebuild or (not lib_path.exists())
+    if not need_build:
+        lib_mtime = lib_path.stat().st_mtime
+        if src_path.stat().st_mtime &gt; lib_mtime or any(h.stat().st_mtime &gt; lib_mtime for h in hdr_paths):
+            need_build = True
+
+    if need_build:
+        tmp_path = lib_path.with_name(f&quot;{lib_path.stem}.{os.getpid()}.tmp{ext}&quot;)
+        cmd = [
+            &quot;g++&quot;,
+            &quot;-std=c++20&quot;,
+            &quot;-O3&quot;,
+            &quot;-mavx2&quot;,
+            &quot;-mfma&quot;,
+            &quot;-mstackrealign&quot;,
+            &quot;-Wall&quot;,
+            &quot;-Wextra&quot;,
+            &quot;-shared&quot;,
+        ]
+        if os.name == &quot;nt&quot;:
+            cmd.extend([&quot;-static-libgcc&quot;, &quot;-static-libstdc++&quot;, &quot;-static&quot;])
+        else:
+            cmd.append(&quot;-fPIC&quot;)
+        cmd.extend([
+            f&quot;-I{ROOT_DIR}&quot;,
+            f&quot;-I{KINESIS_DIR}&quot;,
+            str(src_path),
+            &quot;-o&quot;,
+            str(tmp_path),
+        ])
+        res = subprocess.run(cmd, cwd=str(ROOT_DIR), capture_output=True, text=True)
+        if res.returncode != 0:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f&quot;Failed to build {lib_path.name} (exit {res.returncode}):\n{res.stdout}\n{res.stderr}&quot;
+            )
+        try:
+            os.replace(str(tmp_path), str(lib_path))
+        except PermissionError:
+            # Another process already holds the freshly built DLL open on Windows
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+    return lib_path
+
+
+class KinesisNativeBridge:
+    &quot;&quot;&quot;
+    Zero-copy ctypes wrapper over the compiled C++20 AVX2 micro-kernels in kinesis_c_abi.cpp.
+    &quot;&quot;&quot;
+
+    def __init__(self, lib_path: Optional[Path] = None) -&gt; None:
+        resolved = lib_path if lib_path is not None else build_or_locate_kinesis_shared_lib()
+        self.lib_path = resolved
+        self._lib = ctypes.CDLL(str(resolved))
+        self._bind_signatures()
+
+    def _bind_signatures(self) -&gt; None:
+        c_f32_p = ctypes.POINTER(ctypes.c_float)
+        c_u8_p = ctypes.POINTER(ctypes.c_uint8)
+        c_u16_p = ctypes.POINTER(ctypes.c_uint16)
+        c_u32_p = ctypes.POINTER(ctypes.c_uint32)
+        c_size_p = ctypes.POINTER(ctypes.c_size_t)
+
+        self._lib.uha_kinesis_pack_w1_panels.argtypes = [
+            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u8_p, c_u16_p
+        ]
+        self._lib.uha_kinesis_pack_w1_panels.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_pack_w2_panels.argtypes = [
+            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u16_p, c_u16_p
+        ]
+        self._lib.uha_kinesis_pack_w2_panels.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_pack_tmac_w1_panels.argtypes = [
+            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u32_p, c_u16_p
+        ]
+        self._lib.uha_kinesis_pack_tmac_w1_panels.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32.argtypes = [
+            c_u8_p, c_u16_p, ctypes.c_size_t, ctypes.c_size_t, c_u32_p, c_u16_p
+        ]
+        self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_gemm_fp32_4x8.argtypes = [
+            c_f32_p, c_f32_p, c_f32_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t
+        ]
+        self._lib.uha_kinesis_gemm_fp32_4x8.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_smart_w1_gemm.argtypes = [
+            c_f32_p, c_u8_p, c_u16_p, c_f32_p,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, c_size_p, c_size_p,
+        ]
+        self._lib.uha_kinesis_smart_w1_gemm.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_smart_w2_gemm.argtypes = [
+            c_f32_p, c_u16_p, c_u16_p, c_f32_p,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, c_size_p, c_size_p,
+        ]
+        self._lib.uha_kinesis_smart_w2_gemm.restype = ctypes.c_int
+
+        self._lib.uha_kinesis_tmac_lut_w1_gemm.argtypes = [
+            c_f32_p, c_u32_p, c_u16_p, c_f32_p,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_float, c_size_p, c_size_p,
+        ]
+        self._lib.uha_kinesis_tmac_lut_w1_gemm.restype = ctypes.c_int
+
+    def pack_w1_panels(self, w_kn: torch.Tensor) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+        &quot;&quot;&quot;Packs a [K, N] FP32 weight matrix into W1GotoBlasPanelSet (uint8 bits, uint16 BF16 scales).&quot;&quot;&quot;
+        w_c = w_kn.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        K, N = w_c.shape
+        num_panels = (N + 7) // 8
+        groups_per_col = (K + 127) // 128
+        bits = torch.empty((num_panels * K,), dtype=torch.uint8, device=&quot;cpu&quot;)
+        scales_u16 = torch.empty((num_panels * groups_per_col * 8,), dtype=torch.int16, device=&quot;cpu&quot;)
+        rc = self._lib.uha_kinesis_pack_w1_panels(
+            ctypes.cast(w_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            K,
+            N,
+            ctypes.cast(bits.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_pack_w1_panels failed with status {rc}&quot;)
+        return bits, scales_u16
+
+    def pack_w2_panels(self, w_kn: torch.Tensor) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+        &quot;&quot;&quot;Packs a [K, N] FP32 weight matrix into W2GotoBlasPanelSet (uint16 trits, uint16 BF16 scales).&quot;&quot;&quot;
+        w_c = w_kn.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        K, N = w_c.shape
+        num_panels = (N + 7) // 8
+        groups_per_col = (K + 127) // 128
+        trits_u16 = torch.empty((num_panels * K,), dtype=torch.int16, device=&quot;cpu&quot;)
+        scales_u16 = torch.empty((num_panels * groups_per_col * 8,), dtype=torch.int16, device=&quot;cpu&quot;)
+        rc = self._lib.uha_kinesis_pack_w2_panels(
+            ctypes.cast(w_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            K,
+            N,
+            ctypes.cast(trits_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_pack_w2_panels failed with status {rc}&quot;)
+        return trits_u16, scales_u16
+
+    def pack_tmac_w1_panels(self, w_kn: torch.Tensor) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+        &quot;&quot;&quot;Packs a [K, N] FP32 weight matrix into W1TmacLutPanelSet (int32 nibbles, int16 BF16 scales).&quot;&quot;&quot;
+        w_c = w_kn.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        K, N = w_c.shape
+        assert K % 128 == 0, &quot;T-MAC LUT packer requires K % 128 == 0&quot;
+        num_panels = (N + 7) // 8
+        groups_per_col = K // 128
+        chunks = K // 4
+        nibbles_u32 = torch.empty((num_panels * chunks,), dtype=torch.int32, device=&quot;cpu&quot;)
+        scales_u16 = torch.empty((num_panels * groups_per_col * 8,), dtype=torch.int16, device=&quot;cpu&quot;)
+        rc = self._lib.uha_kinesis_pack_tmac_w1_panels(
+            ctypes.cast(w_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            K,
+            N,
+            ctypes.cast(nibbles_u32.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_pack_tmac_w1_panels failed with status {rc}&quot;)
+        return nibbles_u32, scales_u16
+
+    def convert_w1_to_gpu_interleaved(
+        self, bits: torch.Tensor, scales_u16: torch.Tensor, K: int, N: int
+    ) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+        &quot;&quot;&quot;Losslessly converts CPU GotoBLAS W1 panels into GPU [N, K/32] Interleaved uint32 layout.&quot;&quot;&quot;
+        bits_c = bits.detach().to(device=&quot;cpu&quot;, dtype=torch.uint8).contiguous()
+        scales_c = scales_u16.detach().to(device=&quot;cpu&quot;, dtype=torch.int16).contiguous()
+        gpu_u32 = torch.empty((N, K // 32), dtype=torch.int32, device=&quot;cpu&quot;)
+        gpu_scales_bf16 = torch.empty((N, K // 128), dtype=torch.bfloat16, device=&quot;cpu&quot;)
+        rc = self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32(
+            ctypes.cast(bits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            K,
+            N,
+            ctypes.cast(gpu_u32.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            ctypes.cast(gpu_scales_bf16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_convert_w1_to_gpu_interleaved_u32 failed with status {rc}&quot;)
+        return gpu_u32, gpu_scales_bf16
+
+    def gemm_fp32_4x8(self, a_mk: torch.Tensor, b_kn: torch.Tensor) -&gt; torch.Tensor:
+        a_c = a_mk.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        b_c = b_kn.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        M, K = a_c.shape
+        K2, N = b_c.shape
+        assert K == K2, (K, K2)
+        c_mn = torch.empty((M, N), dtype=torch.float32, device=&quot;cpu&quot;)
+        rc = self._lib.uha_kinesis_gemm_fp32_4x8(
+            ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(b_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            M,
+            N,
+            K,
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_gemm_fp32_4x8 failed with status {rc}&quot;)
+        return c_mn
+
+    def smart_w1_gemm(
+        self,
+        a_mk: torch.Tensor,
+        bits: torch.Tensor,
+        scales_u16: torch.Tensor,
+        N: int,
+        error_budget_eps: float = 0.0,
+    ) -&gt; Tuple[torch.Tensor, Dict[str, float]]:
+        a_c = a_mk.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        bits_c = bits.detach().to(device=&quot;cpu&quot;, dtype=torch.uint8).contiguous()
+        scales_c = scales_u16.detach().to(device=&quot;cpu&quot;, dtype=torch.int16).contiguous()
+        M, K = a_c.shape
+        c_mn = torch.empty((M, N), dtype=torch.float32, device=&quot;cpu&quot;)
+        tot = ctypes.c_size_t(0)
+        pruned = ctypes.c_size_t(0)
+        rc = self._lib.uha_kinesis_smart_w1_gemm(
+            ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(bits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            M,
+            N,
+            K,
+            ctypes.c_float(error_budget_eps),
+            ctypes.byref(tot),
+            ctypes.byref(pruned),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_smart_w1_gemm failed with status {rc}&quot;)
+        total_req = int(tot.value)
+        pruned_req = int(pruned.value)
+        return c_mn, {
+            &quot;total_groups&quot;: total_req,
+            &quot;pruned_groups&quot;: pruned_req,
+            &quot;pruned_pct&quot;: (100.0 * pruned_req / total_req) if total_req &gt; 0 else 0.0,
+        }
+
+    def smart_w2_gemm(
+        self,
+        a_mk: torch.Tensor,
+        trits_u16: torch.Tensor,
+        scales_u16: torch.Tensor,
+        N: int,
+        error_budget_eps: float = 0.0,
+    ) -&gt; Tuple[torch.Tensor, Dict[str, float]]:
+        a_c = a_mk.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        trits_c = trits_u16.detach().to(device=&quot;cpu&quot;, dtype=torch.int16).contiguous()
+        scales_c = scales_u16.detach().to(device=&quot;cpu&quot;, dtype=torch.int16).contiguous()
+        M, K = a_c.shape
+        c_mn = torch.empty((M, N), dtype=torch.float32, device=&quot;cpu&quot;)
+        tot = ctypes.c_size_t(0)
+        pruned = ctypes.c_size_t(0)
+        rc = self._lib.uha_kinesis_smart_w2_gemm(
+            ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(trits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            M,
+            N,
+            K,
+            ctypes.c_float(error_budget_eps),
+            ctypes.byref(tot),
+            ctypes.byref(pruned),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_smart_w2_gemm failed with status {rc}&quot;)
+        total_req = int(tot.value)
+        pruned_req = int(pruned.value)
+        return c_mn, {
+            &quot;total_groups&quot;: total_req,
+            &quot;pruned_groups&quot;: pruned_req,
+            &quot;pruned_pct&quot;: (100.0 * pruned_req / total_req) if total_req &gt; 0 else 0.0,
+        }
+
+    def tmac_lut_w1_gemm(
+        self,
+        a_mk: torch.Tensor,
+        nibbles_u32: torch.Tensor,
+        scales_u16: torch.Tensor,
+        N: int,
+        energy_sieve_tau: float = 0.0,
+    ) -&gt; Tuple[torch.Tensor, Dict[str, float]]:
+        a_c = a_mk.detach().to(device=&quot;cpu&quot;, dtype=torch.float32).contiguous()
+        nibbles_c = nibbles_u32.detach().to(device=&quot;cpu&quot;, dtype=torch.int32).contiguous()
+        scales_c = scales_u16.detach().to(device=&quot;cpu&quot;, dtype=torch.int16).contiguous()
+        M, K = a_c.shape
+        c_mn = torch.empty((M, N), dtype=torch.float32, device=&quot;cpu&quot;)
+        tot = ctypes.c_size_t(0)
+        pruned = ctypes.c_size_t(0)
+        rc = self._lib.uha_kinesis_tmac_lut_w1_gemm(
+            ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            ctypes.cast(nibbles_c.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+            M,
+            N,
+            K,
+            ctypes.c_float(energy_sieve_tau),
+            ctypes.byref(tot),
+            ctypes.byref(pruned),
+        )
+        if rc != 0:
+            raise RuntimeError(f&quot;uha_kinesis_tmac_lut_w1_gemm failed with status {rc}&quot;)
+        total_req = int(tot.value)
+        pruned_req = int(pruned.value)
+        return c_mn, {
+            &quot;total_groups&quot;: total_req,
+            &quot;pruned_groups&quot;: pruned_req,
+            &quot;pruned_pct&quot;: (100.0 * pruned_req / total_req) if total_req &gt; 0 else 0.0,
+        }
+
+
+# =============================================================================
+# Spec-Compliant SafeTensors Binary Serializer &amp; HF Checkpoint Converter
+# =============================================================================
+
+_TORCH_TO_SAFETENSORS_DTYPE = {
+    torch.float32: (&quot;F32&quot;, 4),
+    torch.bfloat16: (&quot;BF16&quot;, 2),
+    torch.float16: (&quot;F16&quot;, 2),
+    torch.int32: (&quot;I32&quot;, 4),
+    torch.int16: (&quot;I16&quot;, 2),
+    torch.uint8: (&quot;U8&quot;, 1),
+    torch.int8: (&quot;I8&quot;, 1),
+}
+
+_SAFETENSORS_TO_TORCH_DTYPE = {
+    &quot;F32&quot;: (torch.float32, 4),
+    &quot;BF16&quot;: (torch.bfloat16, 2),
+    &quot;F16&quot;: (torch.float16, 2),
+    &quot;I32&quot;: (torch.int32, 4),
+    &quot;I16&quot;: (torch.int16, 2),
+    &quot;U8&quot;: (torch.uint8, 1),
+    &quot;I8&quot;: (torch.int8, 1),
+}
+
+
+def save_safetensors_bytes(
+    tensors: Dict[str, torch.Tensor], metadata: Optional[Dict[str, str]] = None
+) -&gt; bytes:
+    &quot;&quot;&quot;
+    Serializes a dictionary of PyTorch tensors into the standard Hugging Face SafeTensors binary format:
+      [8-byte uint64 little-endian header size N][N-byte UTF-8 JSON header][raw tensor byte buffers]
+    &quot;&quot;&quot;
+    header_obj: Dict[str, object] = {}
+    if metadata:
+        header_obj[&quot;__metadata__&quot;] = dict(metadata)
+
+    raw_chunks = []
+    offset = 0
+    for name in sorted(tensors.keys()):
+        t = tensors[name].detach().to(device=&quot;cpu&quot;).contiguous()
+        if t.dtype not in _TORCH_TO_SAFETENSORS_DTYPE:
+            raise ValueError(f&quot;Unsupported tensor dtype {t.dtype} for tensor {name}&quot;)
+        st_dtype, elem_bytes = _TORCH_TO_SAFETENSORS_DTYPE[t.dtype]
+        nbytes = t.numel() * elem_bytes
+        buf = ctypes.string_at(t.data_ptr(), nbytes) if nbytes &gt; 0 else b&quot;&quot;
+        header_obj[name] = {
+            &quot;dtype&quot;: st_dtype,
+            &quot;shape&quot;: list(t.shape),
+            &quot;data_offsets&quot;: [offset, offset + nbytes],
+        }
+        raw_chunks.append(buf)
+        offset += nbytes
+
+    header_json = json.dumps(header_obj, separators=(&quot;,&quot;, &quot;:&quot;)).encode(&quot;utf-8&quot;)
+    pad_len = (8 - (len(header_json) % 8)) % 8
+    header_padded = header_json + (b&quot; &quot; * pad_len)
+    return struct.pack(&quot;&lt;Q&quot;, len(header_padded)) + header_padded + b&quot;&quot;.join(raw_chunks)
+
+
+def load_safetensors_bytes(blob: bytes) -&gt; Tuple[Dict[str, torch.Tensor], Dict[str, str]]:
+    &quot;&quot;&quot;
+    Deserializes a standard Hugging Face SafeTensors binary payload back into PyTorch CPU tensors.
+    &quot;&quot;&quot;
+    if len(blob) &lt; 8:
+        raise ValueError(&quot;Invalid SafeTensors payload: fewer than 8 bytes&quot;)
+    (header_len,) = struct.unpack(&quot;&lt;Q&quot;, blob[:8])
+    data_start = 8 + header_len
+    if data_start &gt; len(blob):
+        raise ValueError(&quot;Invalid SafeTensors payload: header length exceeds buffer size&quot;)
+
+    header_obj = json.loads(blob[8:data_start].decode(&quot;utf-8&quot;))
+    metadata = header_obj.pop(&quot;__metadata__&quot;, {})
+    out_tensors: Dict[str, torch.Tensor] = {}
+
+    for name, info in header_obj.items():
+        st_dtype = info[&quot;dtype&quot;]
+        shape = tuple(info[&quot;shape&quot;])
+        start_off, end_off = info[&quot;data_offsets&quot;]
+        torch_dtype, elem_bytes = _SAFETENSORS_TO_TORCH_DTYPE[st_dtype]
+        raw_slice = blob[data_start + start_off : data_start + end_off]
+        numel = 1
+        for d in shape:
+            numel *= d
+        assert len(raw_slice) == numel * elem_bytes, (name, len(raw_slice), numel * elem_bytes)
+        if numel == 0:
+            out_tensors[name] = torch.empty(shape, dtype=torch_dtype)
+        else:
+            u8 = torch.frombuffer(bytearray(raw_slice), dtype=torch.uint8)
+            out_tensors[name] = u8.view(torch_dtype).reshape(shape).clone()
+
+    return out_tensors, metadata
+
+
+def convert_hf_transformer_layer_to_sub2bit(
+    hf_state_dict: Dict[str, torch.Tensor],
+    calibration_activations: torch.Tensor,
+    bridge: Optional[KinesisNativeBridge] = None,
+) -&gt; Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+    &quot;&quot;&quot;
+    Converts a Hugging Face Transformer layer state dict:
+      - &#x27;self_attn.o_proj.weight&#x27;  [D_model, D_model]
+      - &#x27;mlp.gate_proj.weight&#x27;     [N_ffn, D_model]    -&gt; W1 Binary g128 (CPU GotoBLAS + T-MAC LUT + GPU u32)
+      - &#x27;mlp.up_proj.weight&#x27;       [N_ffn, D_model]    -&gt; W2 Ternary b1.58 (CPU GotoBLAS)
+    Applies Kronecker-Stiefel optimization R_kron = R_P (x) H_16 on post-o_proj activations,
+    absorbs (R_P^T (x) I_16) offline into self_attn.o_proj.weight, and packs the rotated MLP weights.
+    &quot;&quot;&quot;
+    kb = bridge if bridge is not None else KinesisNativeBridge()
+    w_o = hf_state_dict[&quot;self_attn.o_proj.weight&quot;].detach().to(torch.float32)
+    w_gate = hf_state_dict[&quot;mlp.gate_proj.weight&quot;].detach().to(torch.float32)
+    w_up = hf_state_dict[&quot;mlp.up_proj.weight&quot;].detach().to(torch.float32)
+
+    h_pre = calibration_activations.detach().to(torch.float32) @ w_o.T
+    r_kron, r_p, k_init, k_h16, k_kron = optimize_kronecker_stiefel_rotation(
+        h_pre, q_hadamard=16, steps=15, lr=0.25
+    )
+    r_prev_absorb = torch.kron(r_p, torch.eye(16, dtype=torch.float32))
+    w_o_absorbed = (r_prev_absorb.T @ w_o).to(torch.bfloat16)
+
+    # Rotate MLP weights offline by R_kron: W_rot [N, K] = W @ R_kron; transpose to [K, N] for GotoBLAS panels
+    w_gate_rot_kn = (w_gate @ r_kron).T.contiguous()
+    w_up_rot_kn = (w_up @ r_kron).T.contiguous()
+
+    w1_bits, w1_scales_u16 = kb.pack_w1_panels(w_gate_rot_kn)
+    tmac_nibbles_u32, tmac_scales_u16 = kb.pack_tmac_w1_panels(w_gate_rot_kn)
+    gpu_w1_u32, gpu_w1_scales_bf16 = kb.convert_w1_to_gpu_interleaved(
+        w1_bits, w1_scales_u16, K=w_gate.shape[1], N=w_gate.shape[0]
+    )
+    w2_trits_u16, w2_scales_u16 = kb.pack_w2_panels(w_up_rot_kn)
+
+    orig_bytes = (w_gate.numel() + w_up.numel()) * 4
+    compressed_bytes = (
+        w1_bits.numel() * 1
+        + w1_scales_u16.numel() * 2
+        + w2_trits_u16.numel() * 2
+        + w2_scales_u16.numel() * 2
+    )
+
+    packed_dict = {
+        &quot;self_attn.o_proj.weight_absorbed_bf16&quot;: w_o_absorbed,
+        &quot;mlp.gate_proj.w1_gotoblas_bits_u8&quot;: w1_bits,
+        &quot;mlp.gate_proj.w1_gotoblas_scales_i16&quot;: w1_scales_u16,
+        &quot;mlp.gate_proj.w1_tmac_nibbles_i32&quot;: tmac_nibbles_u32,
+        &quot;mlp.gate_proj.w1_tmac_scales_i16&quot;: tmac_scales_u16,
+        &quot;mlp.gate_proj.w1_gpu_interleaved_i32&quot;: gpu_w1_u32,
+        &quot;mlp.gate_proj.w1_gpu_scales_bf16&quot;: gpu_w1_scales_bf16,
+        &quot;mlp.up_proj.w2_gotoblas_trits_i16&quot;: w2_trits_u16,
+        &quot;mlp.up_proj.w2_gotoblas_scales_i16&quot;: w2_scales_u16,
+    }
+    stats = {
+        &quot;kurtosis_init&quot;: k_init,
+        &quot;kurtosis_h16&quot;: k_h16,
+        &quot;kurtosis_kron&quot;: k_kron,
+        &quot;mlp_compression_vs_fp32&quot;: orig_bytes / max(compressed_bytes, 1),
+    }
+    return packed_dict, stats
+
+
+def run_kinesis_bridge_verification() -&gt; None:
+    print(&quot;================================================================================&quot;)
+    print(&quot;  SUITE F2: NATIVE C++20 CTYPES BRIDGE &amp; SAFETENSORS SUB-2-BIT CONVERTER&quot;)
+    print(&quot;================================================================================\n&quot;)
+
+    torch.manual_seed(42)
+    bridge = KinesisNativeBridge()
+
+    # [1] Verify native C++20 4x8 register-blocked FP32 GEMM against PyTorch
+    M, K, N = 19, 256, 67
+    a_f32 = torch.randn((M, K), dtype=torch.float32)
+    b_f32 = torch.randn((K, N), dtype=torch.float32)
+    c_cpp = bridge.gemm_fp32_4x8(a_f32, b_f32)
+    c_ref = (a_f32.double() @ b_f32.double()).float()
+    fp32_max_err = float((c_cpp - c_ref).abs().max().item())
+    assert fp32_max_err &lt; 1e-4, f&quot;FP32 4x8 C++ GEMM mismatch: {fp32_max_err}&quot;
+    print(f&quot;[1] Native C++20 gemm_fp32_4x8 (19x67x256)      : MaxAbsErr = {fp32_max_err:.3e} | PASS&quot;)
+
+    # [2] Verify native C++20 W1 GotoBLAS packer, CPU-&gt;GPU Interleaved u32 bridge, and AVX2 W1 GEMM
+    M_w1, K_w1, N_w1 = 16, 256, 64
+    a_w1 = torch.randn((M_w1, K_w1), dtype=torch.float32)
+    w_nk = torch.randn((N_w1, K_w1), dtype=torch.float32) * 0.08
+    w_kn = w_nk.T.contiguous()
+
+    bits_u8, scales_i16 = bridge.pack_w1_panels(w_kn)
+    gpu_u32_cpp, gpu_scales_cpp = bridge.convert_w1_to_gpu_interleaved(bits_u8, scales_i16, K_w1, N_w1)
+    gpu_u32_py, gpu_scales_py = quantize_and_pack_w1_g128_interleaved(w_nk)
+
+    u32_mismatches = int((gpu_u32_cpp.view(torch.int32) != gpu_u32_py.view(torch.int32)).sum().item())
+    scale_mismatches = int(
+        (gpu_scales_cpp.view(torch.int16) != gpu_scales_py.view(torch.int16)).sum().item()
+    )
+    assert u32_mismatches == 0 and scale_mismatches == 0, (u32_mismatches, scale_mismatches)
+
+    w1_dequant_f32 = unpack_w1_g128_lop3_reference(gpu_u32_py, gpu_scales_py).to(torch.float32)
+    c_w1_cpp, w1_stats = bridge.smart_w1_gemm(a_w1, bits_u8, scales_i16, N=N_w1, error_budget_eps=0.0)
+    c_w1_ref = a_w1 @ w1_dequant_f32.T
+    w1_max_err = float((c_w1_cpp - c_w1_ref).abs().max().item())
+    assert w1_max_err &lt; 1e-5, f&quot;Native C++20 W1 GEMM mismatch vs lop3 reference: {w1_max_err}&quot;
+
+    # Verify guaranteed Holder error-budget sieve across the C ABI boundary
+    a_w1_sparse = a_w1.clone()
+    a_w1_sparse[:, 128:256] *= 1e-4
+    c_w1_sieved, sieve_stats = bridge.smart_w1_gemm(
+        a_w1_sparse, bits_u8, scales_i16, N=N_w1, error_budget_eps=0.05
+    )
+    c_w1_sparse_exact, _ = bridge.smart_w1_gemm(
+        a_w1_sparse, bits_u8, scales_i16, N=N_w1, error_budget_eps=0.0
+    )
+    sieve_bound_err = float((c_w1_sieved - c_w1_sparse_exact).abs().max().item())
+    assert sieve_stats[&quot;pruned_pct&quot;] == 50.0 and sieve_bound_err &lt;= 0.05 + 1e-5
+    print(
+        f&quot;[2] Native C++20 W1 AVX2 + GPU u32 Bridge       : u32/Scale Err = 0 | &quot;
+        f&quot;GEMM Err = {w1_max_err:.3e} | Holder Pruned = {sieve_stats[&#x27;pruned_pct&#x27;]:.1f}% (MaxErr={sieve_bound_err:.3e} &lt;= 0.05) | PASS&quot;
+    )
+
+    # [3] Verify native C++20 W2 Ternary AVX2 GEMM and T-MAC 256-bit 32-lane LUT GEMM
+    trits_i16, w2_scales_i16 = bridge.pack_w2_panels(w_kn)
+    c_w2_cpp, _ = bridge.smart_w2_gemm(a_w1, trits_i16, w2_scales_i16, N=N_w1, error_budget_eps=0.0)
+    assert torch.isfinite(c_w2_cpp).all()
+
+    nibbles_i32, tmac_scales_i16 = bridge.pack_tmac_w1_panels(w_kn)
+    c_tmac_cpp, _ = bridge.tmac_lut_w1_gemm(a_w1, nibbles_i32, tmac_scales_i16, N=N_w1)
+    tmac_cos = float(
+        torch.nn.functional.cosine_similarity(c_tmac_cpp.flatten(), c_w1_cpp.flatten(), dim=0).item()
+    )
+    assert tmac_cos &gt; 0.9999, f&quot;T-MAC 256-bit LUT cosine similarity vs exact W1 too low: {tmac_cos}&quot;
+    print(
+        f&quot;[3] Native C++20 W2 Ternary &amp; T-MAC 256b LUT    : T-MAC vs Exact W1 CosSim = {tmac_cos:.6f} | PASS&quot;
+    )
+
+    # [4] Verify Hugging Face Transformer layer conversion + SafeTensors binary round-trip
+    D_model, N_ffn = 256, 128
+    hf_layer = {
+        &quot;self_attn.o_proj.weight&quot;: torch.randn((D_model, D_model), dtype=torch.float32) * 0.05,
+        &quot;mlp.gate_proj.weight&quot;: torch.randn((N_ffn, D_model), dtype=torch.float32) * 0.05,
+        &quot;mlp.up_proj.weight&quot;: torch.randn((N_ffn, D_model), dtype=torch.float32) * 0.05,
+    }
+    hf_layer[&quot;self_attn.o_proj.weight&quot;][2, :] *= 14.0
+    cal_x = torch.randn((32, D_model), dtype=torch.float32)
+
+    packed_ckpt, ckpt_stats = convert_hf_transformer_layer_to_sub2bit(hf_layer, cal_x, bridge=bridge)
+    blob = save_safetensors_bytes(packed_ckpt, metadata={&quot;format&quot;: &quot;uha_sub2bit_v1&quot;})
+    reloaded_ckpt, reloaded_meta = load_safetensors_bytes(blob)
+
+    assert reloaded_meta.get(&quot;format&quot;) == &quot;uha_sub2bit_v1&quot;
+    for k, v in packed_ckpt.items():
+        assert k in reloaded_ckpt, f&quot;Missing tensor {k} after SafeTensors round-trip&quot;
+        assert torch.equal(
+            v.view(torch.uint8), reloaded_ckpt[k].view(torch.uint8)
+        ), f&quot;Byte mismatch on {k} after SafeTensors round-trip&quot;
+
+    print(
+        f&quot;[4] SafeTensors Sub-2-Bit HF Layer Converter    : Kurtosis {ckpt_stats[&#x27;kurtosis_init&#x27;]:.2f} -&gt; &quot;
+        f&quot;{ckpt_stats[&#x27;kurtosis_kron&#x27;]:.2f} | Compression = {ckpt_stats[&#x27;mlp_compression_vs_fp32&#x27;]:.2f}x | &quot;
+        f&quot;SafeTensors Bytes = {len(blob)} (0 bit errors) | PASS&quot;
+    )
+    print(&quot;\n[+] ALL SUITE F2 NATIVE C++20 BRIDGE &amp; SAFETENSORS CHECKS PASSED.&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_kinesis_bridge_verification()
+```
+
+## File: `kinesis_unified/bench_cpu_roofline.cpp`
+```cpp
+/**
+ * @file bench_cpu_roofline.cpp
+ * @brief Suite F3: Empirical Host CPU GFLOPS, Cache Residency &amp; Bandwidth Benchmark Suite.
+ *
+ * Measures real wall-clock latency (ms), compute throughput (GFLOPS), physical bytes read bandwidth (GB/s),
+ * and FP32-equivalent effective weight bandwidth (GB/s) on the host CPU across:
+ *   1. FP32 4x8 Register-Blocked GotoBLAS GEMM (gemm_fp32_register_blocked_4x8)
+ *   2. W1 (1.125 bpw) 4x8 AVX2 FMA Unpacker Exact (SmartTieredCache::execute_smart_w1_gemm, tau=0)
+ *   3. W1 (1.125 bpw) 4x8 AVX2 FMA + Holder Sieve (SmartTieredCache::execute_smart_w1_gemm, 50% cold groups)
+ *   4. W2 (2.125 bpw Ternary) 4x8 AVX2 FMA Unpacker (SmartTieredCache::execute_smart_w2_gemm)
+ *   5. W1 T-MAC 256-Bit 32-Lane vpshufb 4-Panel LUT (execute_tmac_lut_w1_gemm)
+ *
+ * Evaluated across two LLM regimes:
+ *   - Regime A (Small-Batch Decode / Speculative Verify): M = 4,  K = 1024, N = 1024
+ *   - Regime B (Batched Prefill / QAT Forward):           M = 64, K = 1024, N = 1024
+ */
+
+#include &lt;algorithm&gt;
+#include &lt;chrono&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdint&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+#include &quot;hardware_and_sandbox.hpp&quot;
+#include &quot;memory_primitives.hpp&quot;
+#include &quot;sub2bit_gemm_and_smart_cache.hpp&quot;
+
+using namespace kinesis::unified;
+
+#define UHA_BENCH_VERIFY(cond)                                                            \
+    do {                                                                                  \
+        if (!(cond)) {                                                                    \
+            std::fprintf(stderr, &quot;[FAIL] %s:%d: %s\n&quot;, __FILE__, __LINE__, #cond);        \
+            std::exit(1);                                                                 \
+        }                                                                                 \
+    } while (0)
+
+struct BenchResult {
+    const char* name;
+    size_t weight_bytes;
+    double best_ms;
+    double gflops;
+    double phys_gbps;
+    double eff_fp32_gbps;
+    double speedup_vs_fp32;
+};
+
+template &lt;typename Fn&gt;
+static double measure_best_ms(Fn&amp;&amp; fn, int warmup_iters, int timed_iters) {
+    for (int i = 0; i &lt; warmup_iters; ++i) {
+        fn();
+    }
+    double best_ms = 1e30;
+    for (int i = 0; i &lt; timed_iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration&lt;double, std::milli&gt;(t1 - t0).count();
+        if (ms &lt; best_ms) {
+            best_ms = ms;
+        }
+    }
+    return best_ms;
+}
+
+static void run_regime_benchmark(
+    const char* regime_label,
+    size_t M,
+    size_t K,
+    size_t N,
+    int warmup_iters,
+    int timed_iters,
+    const BlisCacheBlocks&amp; blis
+) {
+    std::printf(&quot;--------------------------------------------------------------------------------\n&quot;);
+    std::printf(&quot;  %s (M = %zu, K = %zu, N = %zu | FLOPs = %.3f MFLOPs)\n&quot;,
+                regime_label, M, K, N, (2.0 * static_cast&lt;double&gt;(M) * static_cast&lt;double&gt;(N) * static_cast&lt;double&gt;(K)) / 1e6);
+    std::printf(&quot;--------------------------------------------------------------------------------\n&quot;);
+    std::printf(&quot;  %-26s | %9s | %8s | %8s | %9s | %10s | %7s\n&quot;,
+                &quot;Kernel / Precision Path&quot;, &quot;W Size KB&quot;, &quot;Best ms&quot;, &quot;GFLOPS&quot;, &quot;Phys GB/s&quot;, &quot;EffFP32 GB&quot;, &quot;Speedup&quot;);
+    std::printf(&quot;  ---------------------------+-----------+----------+----------+-----------+------------+--------\n&quot;);
+
+    const size_t scratch_bytes = std::max&lt;size_t&gt;(
+        (blis.mc * blis.kc + blis.kc * ((blis.nc + kNr8 - 1) / kNr8) * kNr8) * sizeof(float) + 65536,
+        512 * 1024
+    );
+    ArenaAllocator arena(
+        (M * K * 2 + K * N + M * N * 5) * sizeof(float) + scratch_bytes + 1024 * 1024,
+        true,
+        MemorySpace::HostPinnedLocked
+    );
+    ArenaAllocator scratch(scratch_bytes, true, MemorySpace::HostPinnedLocked);
+
+    float* a_ptr = static_cast&lt;float*&gt;(arena.allocate(M * K * sizeof(float)));
+    float* a_sparse_ptr = static_cast&lt;float*&gt;(arena.allocate(M * K * sizeof(float)));
+    float* b_ptr = static_cast&lt;float*&gt;(arena.allocate(K * N * sizeof(float)));
+    float* c_fp32_ptr = static_cast&lt;float*&gt;(arena.allocate(M * N * sizeof(float)));
+    float* c_w1_ptr = static_cast&lt;float*&gt;(arena.allocate(M * N * sizeof(float)));
+    float* c_w1_sieve_ptr = static_cast&lt;float*&gt;(arena.allocate(M * N * sizeof(float)));
+    float* c_w2_ptr = static_cast&lt;float*&gt;(arena.allocate(M * N * sizeof(float)));
+    float* c_tmac_ptr = static_cast&lt;float*&gt;(arena.allocate(M * N * sizeof(float)));
+
+    for (size_t m = 0; m &lt; M; ++m) {
+        for (size_t k = 0; k &lt; K; ++k) {
+            const float val = 0.05f * std::sin(static_cast&lt;float&gt;(m * 13 + k * 7));
+            a_ptr[m * K + k] = val;
+            const size_t g = k / kGroupSizeG128;
+            a_sparse_ptr[m * K + k] = (g % 2 == 1) ? (val * 1e-4f) : val;
+        }
+    }
+    for (size_t k = 0; k &lt; K; ++k) {
+        for (size_t n = 0; n &lt; N; ++n) {
+            b_ptr[k * N + n] = 0.04f * std::cos(static_cast&lt;float&gt;(k * 11 + n * 5));
+        }
+    }
+
+    TensorView&lt;const float&gt; A(a_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+    TensorView&lt;const float&gt; A_sparse(a_sparse_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(K)});
+    TensorView&lt;const float&gt; B(b_ptr, Shape{static_cast&lt;int64_t&gt;(K), static_cast&lt;int64_t&gt;(N)});
+    TensorView&lt;float&gt; C_fp32(c_fp32_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+    TensorView&lt;float&gt; C_w1(c_w1_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+    TensorView&lt;float&gt; C_w1_sieve(c_w1_sieve_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+    TensorView&lt;float&gt; C_w2(c_w2_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+    TensorView&lt;float&gt; C_tmac(c_tmac_ptr, Shape{static_cast&lt;int64_t&gt;(M), static_cast&lt;int64_t&gt;(N)});
+
+    const W1GotoBlasPanelSet w1_panels = pack_w1_gotoblas_panels(B);
+    const W2GotoBlasPanelSet w2_panels = pack_w2_gotoblas_panels(B);
+    const W1TmacLutPanelSet tmac_panels = pack_w1_tmac_lut_panels(w1_panels);
+
+    const double flops = 2.0 * static_cast&lt;double&gt;(M) * static_cast&lt;double&gt;(N) * static_cast&lt;double&gt;(K);
+    const double fp32_io_bytes = static_cast&lt;double&gt;((M * K + K * N + M * N) * sizeof(float));
+    const double act_out_bytes = static_cast&lt;double&gt;((M * K + M * N) * sizeof(float));
+
+    // 1. FP32 4x8 Register-Blocked GotoBLAS
+    const double ms_fp32 = measure_best_ms([&amp;]() {
+        gemm_fp32_register_blocked_4x8(A, B, C_fp32, scratch);
+    }, warmup_iters, timed_iters);
+
+    // 2. W1 (1.125 bpw) AVX2 FMA Exact
+    SmartTieredCache cache_w1_exact(w1_panels.num_panels, w1_panels.num_panels / 2, 0.0f, 2);
+    const double ms_w1_exact = measure_best_ms([&amp;]() {
+        cache_w1_exact.execute_smart_w1_gemm(A, w1_panels, C_w1, true);
+    }, warmup_iters, timed_iters);
+
+    // 3. W1 (1.125 bpw) AVX2 FMA + Guaranteed Holder Sieve (50% cold groups)
+    SmartTieredCache cache_w1_sieve(w1_panels.num_panels, w1_panels.num_panels / 2, 0.0f, 2);
+    cache_w1_sieve.set_error_budget(0.05f);
+    const double ms_w1_sieve = measure_best_ms([&amp;]() {
+        cache_w1_sieve.execute_smart_w1_gemm(A_sparse, w1_panels, C_w1_sieve, false);
+    }, warmup_iters, timed_iters);
+
+    // 4. W2 (2.125 bpw Ternary) AVX2 FMA Exact
+    SmartTieredCache cache_w2_exact(w2_panels.num_panels, w2_panels.num_panels / 2, 0.0f, 2);
+    const double ms_w2_exact = measure_best_ms([&amp;]() {
+        cache_w2_exact.execute_smart_w2_gemm(A, w2_panels, C_w2, true);
+    }, warmup_iters, timed_iters);
+
+    // 5. W1 T-MAC 256-bit 32-lane vpshufb 4-Panel LUT
+    const double ms_tmac = measure_best_ms([&amp;]() {
+        (void)execute_tmac_lut_w1_gemm(A, tmac_panels, C_tmac, 0.0f, false);
+    }, warmup_iters, timed_iters);
+
+    // Verify numerical sanity across all 5 benchmarked outputs
+    UHA_BENCH_VERIFY(std::isfinite(C_fp32(0, 0)) &amp;&amp; std::isfinite(C_w1(0, 0)));
+    UHA_BENCH_VERIFY(std::isfinite(C_w1_sieve(0, 0)) &amp;&amp; std::isfinite(C_w2(0, 0)) &amp;&amp; std::isfinite(C_tmac(0, 0)));
+    UHA_BENCH_VERIFY(cache_w1_sieve.telemetry().pruning_ratio_percent() &gt;= 49.0);
+
+    const BenchResult rows[5] = {
+        {
+            &quot;1. FP32 4x8 GotoBLAS&quot;,
+            K * N * sizeof(float),
+            ms_fp32,
+            (flops / (ms_fp32 * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_fp32 * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_fp32 * 1e-3)) / 1e9,
+            1.00,
+        },
+        {
+            &quot;2. W1 AVX2 FMA (Exact)&quot;,
+            w1_panels.compressed_bytes(),
+            ms_w1_exact,
+            (flops / (ms_w1_exact * 1e-3)) / 1e9,
+            ((act_out_bytes + static_cast&lt;double&gt;(w1_panels.compressed_bytes())) / (ms_w1_exact * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_w1_exact * 1e-3)) / 1e9,
+            ms_fp32 / ms_w1_exact,
+        },
+        {
+            &quot;3. W1 AVX2 FMA + Holder&quot;,
+            w1_panels.compressed_bytes() / 2,
+            ms_w1_sieve,
+            (flops / (ms_w1_sieve * 1e-3)) / 1e9,
+            ((act_out_bytes + 0.5 * static_cast&lt;double&gt;(w1_panels.compressed_bytes())) / (ms_w1_sieve * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_w1_sieve * 1e-3)) / 1e9,
+            ms_fp32 / ms_w1_sieve,
+        },
+        {
+            &quot;4. W2 Ternary AVX2 FMA&quot;,
+            w2_panels.compressed_bytes(),
+            ms_w2_exact,
+            (flops / (ms_w2_exact * 1e-3)) / 1e9,
+            ((act_out_bytes + static_cast&lt;double&gt;(w2_panels.compressed_bytes())) / (ms_w2_exact * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_w2_exact * 1e-3)) / 1e9,
+            ms_fp32 / ms_w2_exact,
+        },
+        {
+            &quot;5. W1 T-MAC 256b vpshufb&quot;,
+            tmac_panels.compressed_bytes(),
+            ms_tmac,
+            (flops / (ms_tmac * 1e-3)) / 1e9,
+            ((act_out_bytes + static_cast&lt;double&gt;(tmac_panels.compressed_bytes())) / (ms_tmac * 1e-3)) / 1e9,
+            (fp32_io_bytes / (ms_tmac * 1e-3)) / 1e9,
+            ms_fp32 / ms_tmac,
+        },
+    };
+
+    for (const auto&amp; r : rows) {
+        std::printf(&quot;  %-26s | %7.1f K | %6.3f ms | %6.2f GF | %6.2f GB | %7.2f GB | %6.2fx\n&quot;,
+                    r.name,
+                    static_cast&lt;double&gt;(r.weight_bytes) / 1024.0,
+                    r.best_ms,
+                    r.gflops,
+                    r.phys_gbps,
+                    r.eff_fp32_gbps,
+                    r.speedup_vs_fp32);
+    }
+    std::printf(&quot;\n&quot;);
+}
+
+int main() {
+    std::printf(&quot;================================================================================\n&quot;);
+    std::printf(&quot;  SUITE F3: EMPIRICAL HOST CPU GFLOPS, CACHE RESIDENCY &amp; BANDWIDTH BENCHMARK\n&quot;);
+    std::printf(&quot;================================================================================\n\n&quot;);
+
+    const CpuFeatures cpu = HardwareInfo::query_cpu_features();
+    const BlisCacheBlocks blis = HardwareInfo::compute_blis_blocks(cpu);
+    std::printf(&quot;[CPU Topology] Vendor: %s | Logical Cores: %u\n&quot;, cpu.vendor.c_str(), cpu.logical_cores);
+    std::printf(&quot;[CPU Caches]   L1D = %zu KB | L2 = %zu KB | L3 = %zu KB | AVX2=%d FMA=%d AVX512BW=%d AMX=%d\n&quot;,
+                cpu.l1d_cache_bytes / 1024,
+                cpu.l2_cache_bytes / 1024,
+                cpu.l3_cache_bytes / 1024,
+                cpu.has_avx2 ? 1 : 0,
+                cpu.has_fma ? 1 : 0,
+                cpu.has_avx512bw ? 1 : 0,
+                cpu.has_amx_tile ? 1 : 0);
+    std::printf(&quot;[BLIS Blocks]  KC = %zu | MC = %zu | NC = %zu (Mr = %zu, Nr = %zu)\n\n&quot;,
+                blis.kc, blis.mc, blis.nc, blis.mr, blis.nr);
+
+    run_regime_benchmark(&quot;Regime A: Small-Batch Decode (M=4)&quot;, 4, 1024, 1024, 2, 5, blis);
+    run_regime_benchmark(&quot;Regime B: Batched Prefill (M=64)&quot;, 64, 1024, 1024, 1, 3, blis);
+
+    std::printf(&quot;[+] PASS: Empirical Host CPU GFLOPS &amp; Bandwidth Benchmark Suite completed.\n&quot;);
     return 0;
 }
 ```
@@ -11530,10 +12777,12 @@ for subdir in (
     &quot;qat_galore_engine&quot;,
     &quot;structural_filters&quot;,
     &quot;hetero_runtime&quot;,
+    &quot;kinesis_unified&quot;,
 ):
     sys.path.insert(0, str(ROOT / subdir))
 
 from unlocked_gemm import unlocked_bf16_gemm  # noqa: E402
+from kinesis_bridge import KinesisNativeBridge  # noqa: E402
 from spinquant_packer import (  # noqa: E402
     build_kernel_online_rotation,
     optimize_kronecker_stiefel_rotation,
@@ -11659,6 +12908,21 @@ def run_e2e_transformer_pipeline() -&gt; None:
     assert w1_gt_cos &gt; 0.75, f&quot;1-bit W1A16 vs FP32 ground-truth cosine similarity too low: {w1_gt_cos}&quot;
     assert w2_gt_cos &gt; 0.85, f&quot;1.58-bit W2A16 vs FP32 ground-truth cosine similarity too low: {w2_gt_cos}&quot;
 
+    # Also execute the compiled C++20 AVX2 W1 &amp; 256-bit T-MAC LUT kernels via KinesisNativeBridge
+    native_bridge = KinesisNativeBridge()
+    w_hot_rot_kn = (w_hot_fp32 @ r_kron).T.contiguous()
+    w1_bits_cpp, w1_scales_cpp = native_bridge.pack_w1_panels(w_hot_rot_kn)
+    gpu_u32_bridged, gpu_scales_bridged = native_bridge.convert_w1_to_gpu_interleaved(
+        w1_bits_cpp, w1_scales_cpp, D_model, N_ffn
+    )
+    w1_dequant_bridged = unpack_w1_g128_lop3_reference(gpu_u32_bridged, gpu_scales_bridged)
+    y_hot_cpp_w1, _ = native_bridge.smart_w1_gemm(
+        h_online_rot.float(), w1_bits_cpp, w1_scales_cpp, N=N_ffn, error_budget_eps=0.0
+    )
+    y_hot_fp32_lop3_ref = h_online_rot.float() @ w1_dequant_bridged.float().T
+    cpp_vs_py_w1_err = float((y_hot_cpp_w1 - y_hot_fp32_lop3_ref).abs().max().item())
+    assert cpp_vs_py_w1_err &lt; 1e-5, f&quot;Native C++20 W1 vs Python lop3 reference error too high: {cpp_vs_py_w1_err}&quot;
+
     # -------------------------------------------------------------------------
     # Stage 3 (Pillar 4 + Pillar 5B): Closed-Loop Chorus MoE Routing &amp; Row-Max Tiled-CBC Sieve
     # -------------------------------------------------------------------------
@@ -11734,7 +12998,7 @@ def run_e2e_transformer_pipeline() -&gt; None:
     )
     print(
         f&quot;[2] Pillar 1+2 Kronecker R_P(x)H_16 &amp; lop3.b32  : Kurtosis {k_init:.2f} -&gt; {k_h16:.2f} -&gt; {k_kron:.2f} | &quot;
-        f&quot;Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f}&quot;
+        f&quot;Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f} | CppW1Err={cpp_vs_py_w1_err:.2e}&quot;
     )
     print(
         f&quot;[3] Pillar 4+5B Chorus Governor &amp; RowMax Sieve  : Route={gov_decision[&#x27;execution_target&#x27;]} | &quot;
@@ -11932,6 +13196,24 @@ SUITES: List[VerificationSuite] = [
         run_cmd=[&quot;./kinesis_unified/test_kinesis_unified.exe&quot;],
     ),
     VerificationSuite(
+        suite_id=&quot;F2&quot;,
+        workstream=&quot;WS-F (Kinesis Bridge)&quot;,
+        name=&quot;Native C++20 ctypes ABI Bridge &amp; SafeTensors Sub-2-Bit Converter&quot;,
+        build_cmd=None,
+        run_cmd=[sys.executable, &quot;kinesis_unified/kinesis_bridge.py&quot;],
+    ),
+    VerificationSuite(
+        suite_id=&quot;F3&quot;,
+        workstream=&quot;WS-F (CPU Roofline)&quot;,
+        name=&quot;Empirical Host CPU GFLOPS, Cache Residency &amp; Bandwidth Benchmark&quot;,
+        build_cmd=[
+            &quot;g++&quot;, &quot;-std=c++20&quot;, &quot;-O3&quot;, &quot;-mavx2&quot;, &quot;-mfma&quot;, &quot;-Wall&quot;, &quot;-Wextra&quot;, &quot;-I.&quot;,
+            &quot;kinesis_unified/bench_cpu_roofline.cpp&quot;,
+            &quot;-o&quot;, &quot;kinesis_unified/bench_cpu_roofline.exe&quot;,
+        ],
+        run_cmd=[&quot;./kinesis_unified/bench_cpu_roofline.exe&quot;],
+    ),
+    VerificationSuite(
         suite_id=&quot;G1&quot;,
         workstream=&quot;WS-G (E2E 5-Pillar)&quot;,
         name=&quot;End-to-End 5-Pillar Transformer Block &amp; QAT Verification Pipeline&quot;,
@@ -12022,6 +13304,9 @@ def main() -&gt; int:
     print(&quot;================================================================================&quot;)
 
     total_start = time.perf_counter()
+    # Pre-build the shared C++20 ABI library once so F2 and G1 do not race on DLL creation
+    from kinesis_unified.kinesis_bridge import build_or_locate_kinesis_shared_lib
+    build_or_locate_kinesis_shared_lib()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         results = list(pool.map(run_single_suite, SUITES))
 
@@ -12085,6 +13370,7 @@ hetero:
 
 kinesis_unified:
 	$(CXX) $(CXXFLAGS) -o kinesis_unified/test_kinesis_unified kinesis_unified/test_kinesis_unified.cpp
+	$(CXX) $(CXXFLAGS) -o kinesis_unified/bench_cpu_roofline kinesis_unified/bench_cpu_roofline.cpp
 
 cuda_host_verify:
 	$(CXX) -O2 -std=c++20 -Wall -Wextra -DSTANDALONE_VERIFY -x c++ fused_w1_hadacore/w1a16_hadacore_kernel.cu -o fused_w1_hadacore/test_w1a16_kernel
@@ -12111,12 +13397,14 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	./hetero_runtime/test_governor_c
 	$(PYTHON) hetero_runtime/closed_loop_governor.py
 	./kinesis_unified/test_kinesis_unified
+	$(PYTHON) kinesis_unified/kinesis_bridge.py
+	./kinesis_unified/bench_cpu_roofline
 	$(PYTHON) e2e_transformer_pipeline.py
 
 clean:
 	rm -f sim_harness/ptx_bf162_emu* compiler_unlock/test_cublas_shim* compiler_unlock/*.so
 	rm -f kernel_driver_patch/test_kernel_patch* hetero_runtime/test_chorus_amx* hetero_runtime/test_governor_c*
-	rm -f kinesis_unified/test_kinesis_unified* fused_w1_hadacore/*.o structural_filters/*.o
+	rm -f kinesis_unified/test_kinesis_unified* kinesis_unified/bench_cpu_roofline* kinesis_unified/libkinesis_unified* fused_w1_hadacore/*.o structural_filters/*.o
 ```
 
 ## File: `verify_bare_metal.sh`
@@ -12132,8 +13420,8 @@ echo &quot;=====================================================================
 echo &quot;  BARE-METAL GPU CO-DESIGN STACK VERIFICATION PROTOCOL&quot;
 echo &quot;================================================================================&quot;
 
-# 1. Build and run all 18 deterministic C, C++20, CUDA-host, and Python verification suites
-echo &quot;[Step 1/6] Running master 18-suite build, lockstep hardware emulators &amp; hygiene audit...&quot;
+# 1. Build and run all 20 deterministic C, C++20, CUDA-host, and Python verification suites
+echo &quot;[Step 1/6] Running master 20-suite build, lockstep hardware emulators &amp; hygiene audit...&quot;
 python3 run_all_tests.py || python run_all_tests.py
 
 # 2. Build shared LD_PRELOAD cuBLAS/cuDNN heuristic spoofing library on Linux

@@ -581,7 +581,7 @@ class TensorView {
 public:
     constexpr TensorView() noexcept = default;
 
-    constexpr TensorView(T* data, Shape shape,
+    constexpr TensorView(T* data, const Shape& shape,
                          MemorySpace space = MemorySpace::HostPinnedLocked) noexcept
         : data_(data),
           offset_(0),
@@ -590,7 +590,7 @@ public:
         shape_.set_memory_space(space);
     }
 
-    constexpr TensorView(T* data, Shape shape, Strides strides, int64_t offset = 0,
+    constexpr TensorView(T* data, const Shape& shape, const Strides& strides, int64_t offset = 0,
                          MemorySpace space = MemorySpace::HostPinnedLocked) noexcept
         : data_(data), offset_(offset), shape_(shape), strides_(strides) {
         shape_.set_memory_space(space);

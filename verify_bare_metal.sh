@@ -9,8 +9,8 @@ echo "==========================================================================
 echo "  BARE-METAL GPU CO-DESIGN STACK VERIFICATION PROTOCOL"
 echo "================================================================================"
 
-# 1. Build and run all 18 deterministic C, C++20, CUDA-host, and Python verification suites
-echo "[Step 1/6] Running master 18-suite build, lockstep hardware emulators & hygiene audit..."
+# 1. Build and run all 20 deterministic C, C++20, CUDA-host, and Python verification suites
+echo "[Step 1/6] Running master 20-suite build, lockstep hardware emulators & hygiene audit..."
 python3 run_all_tests.py || python run_all_tests.py
 
 # 2. Build shared LD_PRELOAD cuBLAS/cuDNN heuristic spoofing library on Linux
