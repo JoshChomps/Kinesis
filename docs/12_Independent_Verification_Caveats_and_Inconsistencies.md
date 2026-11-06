@@ -25,6 +25,7 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | Tiled-CBC row-max Holder sieve (O9) | `structural_filters/tiled_cbc_sieve.py` | `e_k = max_m mean_k(|X[m,tile]|)` is worst-case over rows; by Holder `|sum X W| <= ||X[m,tile]||_1 * max_k|W|`; single loud row keeps its tile | Correct (see observation 3.6) |
 | H_2 butterfly constant (F18) | `sim_harness/ptx_bf162_emu.c`, `fused_w1_hadacore/w1a16_hadacore_kernel.cu` | `0x3F353F35` = +0.70703125 ~= +1/sqrt(2); `0.25*(1/sqrt(2)) = 1/sqrt(32)` orthonormal H_32 scale | Consistent across both files (see inconsistency 4.2) |
 | Fused STE QAT forward/backward | `qat_galore_engine/fused_qat_ste.py` | `Y = X W_hat^T`, `dX = dY W_hat`, STE `dW = dY^T X`, and the clipped-STE gate `1(|W| <= c*alpha_g)` | Math correct (see caveat 2.4 and observation 3.4) |
+| SPSC ring memory ordering (O10) | `hetero_runtime/chorus_amx_moe.c` | Per-slot sequence handshake: producer release-stores `gpu_ready_seq`, consumer acquire-loads it then release-stores `cpu_done_seq`; slot reuse waits `cpu_done_seq >= seq - num_slots` | Ordering correct; two latent defects on untested paths (see 4.3, 4.4) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -122,7 +123,17 @@ of the row-max (worst-case-over-rows) versus mean-L1 distinction, and it measure
 the already-rotated activations directly (so it does not fall into the L1-invariance trap of
 3.3), but its `tau` should not be quoted as an error budget.
 
-## 4. Inconsistencies found in this pass
+### 3.7 SPSC ring dispatch metadata shares the consumer cache line
+The slot struct places `gpu_ready_seq` alone on cache line 0 (producer) and `cpu_done_seq`
+plus `num_tokens` / `hidden_dim` / `alloc_via_mmap` on cache line 1 (consumer). The test
+asserts the two sequence counters sit on separate 64 B lines, which is true. But the
+producer writes the metadata fields on line 1 every dispatch, so the clean "producer line /
+consumer line" split only holds for the two counters, not for the whole slot header. It is
+not harmful false sharing because the handshake serializes all access to a given slot (the
+producer and consumer never touch one slot's header concurrently), so this is a framing note,
+not a correctness or measurable-contention issue.
+
+## 4. Inconsistencies and latent defects found in this pass
 
 ### 4.1 Lazy-SVD calibration: doc 11 describes an older function and older numbers
 Doc 11 section 0.3 (Wave 3C) describes a function `calibrate_lazy_svd_threshold`
@@ -148,11 +159,37 @@ The fix itself is correct where it lives; the claim that it also touched
 `smsp_roofline_sim.py` is stale (the file either never held the constant or was later
 refactored). Recommend dropping `smsp_roofline_sim.py` from the F18 and section 0.2 text.
 
+### 4.3 Latent defect: single-threaded fallback deadlocks the bounded ring
+In `chorus_amx_moe.c`, on `_WIN32` and `__linux__` a worker thread is spawned (line ~509 /
+~513) before the producer loop, so producer and consumer run concurrently and suite E1 passes.
+On any other platform (for example macOS or BSD) no thread is created, and the inline
+`chorus_amx_worker_loop(&ctx)` is called only after the producer loop (line ~556). With
+`num_slots < total_dispatches` (the test uses `num_slots = 2`, `total_dispatches = 8`), the
+producer blocks at `seq = num_slots + 1` waiting for `cpu_done_seq >= seq - num_slots`, which
+never advances because the consumer has not run yet. Result: a hard deadlock on non-Win and
+non-Linux hosts. The Win/Linux CI never exercises this path, so it is latent. Severity is low
+(the project targets Win/Linux hosts), but the fallback's placement is simply wrong for a
+bounded ring: on a single-threaded platform the consumer must be interleaved with the producer,
+or `num_slots` must be at least `total_dispatches`.
+
+### 4.4 Latent defect: ring slot count truncated to 16 bits on free
+`allocate_pinned_1gb_ring` packs the slot count into `alloc_via_mmap` bits [31:16]
+(`(num_slots & 0xFFFF) << 16`), and `free_pinned_ring` recovers it with `>> 16`. The alloc
+guard rejects only `num_slots > SIZE_MAX / sizeof(slot)`, not `num_slots > 0xFFFF`. A caller
+passing more than 65535 slots allocates the full buffer but stores a truncated count, so the
+free path computes a smaller byte size and unmaps or unlocks the wrong length (partial unmap
+or leak). The intended 1 GB regime holds roughly 7700 slots, well under the limit, so this is
+latent, but the allocator should reject `num_slots > 0xFFFF` explicitly or widen the tag.
+
 ## 5. Open cross-check items (pending a second independent reviewer)
 
 The areas in section 1 were reviewed by a single pass. A second independent reviewer
 should attempt to break, not confirm, each conclusion: in particular (a) whether the
 Cayley step is Riemannian or only embedded-Euclidean descent, (b) whether any bf16
 scale defeats the W2 zero-preserving unpack, (c) whether any map/unmap sequence aliases
-two live BAR1 mappings, and (d) whether the GaLore V transport bias from uint8 round-up
-storage is bounded. Prompts for this second pass are maintained outside the repository.
+two live BAR1 mappings, (d) whether the GaLore V transport bias from uint8 round-up
+storage is bounded, and (e) whether the SPSC ring has any reordering the acquire/release
+pairs miss under a weak memory model (the current pass reasoned on x86 TSO plus the explicit
+C11 orderings). The second reviewer should read both the code and this document and confirm
+or dispute each finding here, including the two latent defects in section 4. Prompts for this
+second pass are maintained outside the repository.
