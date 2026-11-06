@@ -37,15 +37,15 @@ This document evaluates the legacy **`AI_Library` (Kinesis)** C++20 engine, deta
 When running on a CPU-only machine or a desktop/laptop with **1 GPU**, [`SmartTieredCache`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kinesis_unified/sub2bit_gemm_and_smart_cache.hpp#L320-L469) combines three mechanisms to eliminate memory bottlenecks:
 
 1. **28.44x Smaller GotoBLAS Weight Panels (`W1GotoBlasPanelSet`):**
-   * Each `Nr = 8` GotoBLAS micro-panel packs 8 binary signs (`{-1, +1}`) into **1 byte** per K-step plus one `g = 128` FP32 group scale (`1.125 bits/weight`).
+   * Each `Nr = 8` GotoBLAS micro-panel packs 8 binary signs (`{-1, +1}`) into **1 byte** per K-step plus one `g = 128` BF16 group scale (`1.125 bits/weight`).
    * A $256 \times 64$ weight matrix drops from **65,536 bytes (FP32)** down to **2,304 bytes** (`28.44x` compression vs FP32, `14.22x` vs FP16). Entire model layers stay locked inside the CPU's **L2/L3 cache** (`CpuL3CacheLocked`) instead of stalling on DDR4/DDR5 RAM.
 2. **Branchless In-Register AVX2 Unpacking (`avx2_unpack_w1_nr8_byte`):**
    * Inside the `4x8` register-blocked FMA inner loop, a single `uint8_t` byte is broadcast into a 256-bit `YMM` register, masked against bit positions `(1, 2, 4, 8, 16, 32, 64, 128)`, and XOR-ed into the IEEE-754 sign bit of the `v_scale` vector (`_mm256_xor_ps(v_scale, sign_flip)`).
    * Zero lookup tables and zero branches are used, and the unpacked vector immediately feeds 4 parallel `_mm256_fmadd_ps` accumulators.
 3. **Predictive Energy Sieve (`Tiled-CBC`) + Hot-Tile Promotion:**
-   * Before fetching a weight panel from CPU L3 or GPU VRAM, `SmartTieredCache` computes the L1 energy of the incoming 128-element activation group.
-   * Cold groups below $\tau \cdot \bar{E}$ are **skipped before any weight memory is read** (`50.0%` pruned in verification, multiplying with the `28.44x` bit compression to deliver **`56.89x` effective weight bandwidth vs FP32** or **`28.44x` vs FP16**).
-   * Panels that are accessed repeatedly in Tier 2 (CPU L3 / Pinned Arena) are automatically promoted into Tier 1 (Single-GPU VRAM) via [`convert_w1_gotoblas_to_gpu_interleaved_u32()`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kinesis_unified/sub2bit_gemm_and_smart_cache.hpp#L406-L443), while KV-cache pages are recycled in $O(1)$ time (`0.64 ns`) via the prefaulted `SlabAllocator<UHA_KV_PAGE_INT4_BYTES>`.
+   * `SmartTieredCache` defaults to **exact evaluation** ($\tau = 0$, `O8`), and supports an opt-in worst-case row-maximum Holder error budget `set_error_budget(eps)` (`O9`) or relative energy threshold `set_energy_sieve_threshold(tau)`.
+   * When opt-in pruning is enabled, cold groups within the error budget are **skipped before any weight memory is read** (`50.0%` pruned in verification, multiplying with the `28.44x` bit compression to yield a **`56.89x` modelled weight-traffic reduction ratio vs FP32** or **`28.44x` vs FP16**).
+   * Panels that are accessed repeatedly in Tier 2 (CPU L3 / Pinned Arena) are promoted into the modelled Tier 1 (Single-GPU VRAM) resident cache via [`convert_w1_gotoblas_to_gpu_interleaved_u32()`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kinesis_unified/sub2bit_gemm_and_smart_cache.hpp#L406-L443) (counting once per GEMM call, `O11`), while KV-cache pages are recycled in $O(1)$ time (`0.64 ns`) via the prefaulted `SlabAllocator<UHA_KV_PAGE_INT4_BYTES>`.
 
 ---
 

@@ -142,7 +142,7 @@ def simulate_smsp_cycle_accurate(
         sram_Crossbar_free_cycle = ldm_done
 
         # 3. Warps assigned to the 4 SMSPs execute HMMA.16816.F32 instructions
-        #    In fused W1A16_F32, ALU unpack (shl.b32 + lop3.b32 + mul.rn.bf162) dual-issues
+        #    In fused W1A16_F32, ALU unpack (shl.b32 + lop3.b32 + fma.rn.bf16x2) dual-issues
         #    on the INT32/FP16 pipes concurrently with HMMA on the Tensor Core pipe.
         mma_cycles_per_smsp = t_mma_step
         for s in range(gpu.smsp_per_sm):

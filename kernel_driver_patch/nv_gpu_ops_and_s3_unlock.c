@@ -91,6 +91,11 @@ typedef struct OBJGPU {
     NvU32     gpuId;
     NvU64     fbTotalSize;
     KernelBus kbus;
+    // O5 PCIe Topology, ACS, and IOMMU Peer Validation Fields
+    NvU32     pcieDomain;
+    NvU32     rootComplexId;
+    uint16_t  upstreamAcsCtrl;
+    NvBool    iommuStrictBlocking;
 } OBJGPU;
 
 typedef struct {
@@ -114,6 +119,7 @@ struct pci_dev {
     uint32_t fuse_hard_lock_mask;
     int      has_acs_cap;                // upstream bridge exposes PCI_EXT_CAP_ID_ACS
     uint16_t acs_ctrl;                   // bridge ACS control register (PCI_ACS_CTRL)
+    int      flr_resets_ss_latches;      // 1 if hardware FLR resets SS0/SS1 override latches (O4)
 };
 
 struct device {
@@ -169,59 +175,83 @@ static inline NV_STATUS kbusMapFbAperture_HAL(
         pMemDesc->pGpu = pGpu;
     }
     const NvU64 reqSize = *pSize;
-    if (reqSize == 0 || reqSize > pKernelBus->bar1ApertureSize) {
+    if (reqSize == 0 || reqSize > pKernelBus->bar1ApertureSize ||
+        offset > (UINT64_MAX - pMemDesc->fbPhysBaseOffset)) {
         return NV_ERR_INSUFFICIENT_RESOURCES;
     }
 
     const NvU64 physTarget = memdescGetPhysAddr(pMemDesc, AT_GPU, offset);
+    if (reqSize > (UINT64_MAX - physTarget)) {
+        return NV_ERR_INVALID_ARGUMENT;
+    }
     pKernelBus->accessTick++;
 
-    // 1. Check existing Dynamic BAR1 LRU tile table for an active mapping and take a reference on it
+    // 1. Check existing Dynamic BAR1 LRU tile table for an active mapping and take a reference on it.
+    //    Reject conflicting partial/larger overlaps against an active (refCount > 0) slot.
     for (NvU32 i = 0; i < NV_DYN_BAR1_LRU_SLOTS; ++i) {
-        if (pKernelBus->lruSlots[i].valid &&
-            pKernelBus->lruSlots[i].fbPhysOffset == physTarget &&
-            pKernelBus->lruSlots[i].size >= reqSize) {
-            pKernelBus->lruSlots[i].lastUseTick = pKernelBus->accessTick;
-            pKernelBus->lruSlots[i].refCount++;
-            *pBar1VirtOffset = pKernelBus->lruSlots[i].bar1VirtOffset;
-            return NV_OK;
+        if (pKernelBus->lruSlots[i].valid) {
+            const NvU64 slotStart = pKernelBus->lruSlots[i].fbPhysOffset;
+            const NvU64 slotSize  = pKernelBus->lruSlots[i].size;
+            if (slotStart == physTarget && slotSize == reqSize) {
+                pKernelBus->lruSlots[i].lastUseTick = pKernelBus->accessTick;
+                pKernelBus->lruSlots[i].refCount++;
+                *pBar1VirtOffset = pKernelBus->lruSlots[i].bar1VirtOffset;
+                return NV_OK;
+            }
+            const NvBool overlaps = (physTarget < (slotStart + slotSize)) && ((physTarget + reqSize) > slotStart);
+            if (overlaps && pKernelBus->lruSlots[i].refCount > 0) {
+                return NV_ERR_INVALID_ARGUMENT;
+            }
         }
     }
 
     // 2. Pick a slot and a BAR1 VA range. A slot that still has live users is NEVER reclaimed: handing its
     //    VA range to a new allocation would silently alias two P2P buffers onto the same BAR1 window.
-    NvU32 slotIdx = NV_DYN_BAR1_LRU_SLOTS;
+    //    First look for an exact-size unreferenced slot so its existing BAR1 VA window can be reused directly.
+    NvU64 oldestExactTick = ~0ULL;
+    NvU32 exactVictim = NV_DYN_BAR1_LRU_SLOTS;
+    NvU64 oldestAnyTick = ~0ULL;
+    NvU32 anyVictim = NV_DYN_BAR1_LRU_SLOTS;
+    NvU32 freeSlot = NV_DYN_BAR1_LRU_SLOTS;
+
     for (NvU32 i = 0; i < NV_DYN_BAR1_LRU_SLOTS; ++i) {
         if (!pKernelBus->lruSlots[i].valid) {
-            slotIdx = i;
-            break;
+            if (freeSlot == NV_DYN_BAR1_LRU_SLOTS) {
+                freeSlot = i;
+            }
+        } else if (pKernelBus->lruSlots[i].refCount == 0) {
+            if (pKernelBus->lruSlots[i].lastUseTick < oldestAnyTick) {
+                oldestAnyTick = pKernelBus->lruSlots[i].lastUseTick;
+                anyVictim = i;
+            }
+            if (pKernelBus->lruSlots[i].size == reqSize &&
+                pKernelBus->lruSlots[i].lastUseTick < oldestExactTick) {
+                oldestExactTick = pKernelBus->lruSlots[i].lastUseTick;
+                exactVictim = i;
+            }
         }
     }
+
+    NvU32 slotIdx = NV_DYN_BAR1_LRU_SLOTS;
     NvU64 chosenVirtOffset = 0;
-    if (slotIdx != NV_DYN_BAR1_LRU_SLOTS &&
+    if (freeSlot != NV_DYN_BAR1_LRU_SLOTS &&
         pKernelBus->nextDynBar1Offset <= (pKernelBus->bar1ApertureSize - reqSize)) {
-        // Overflow-safe bump allocation from fresh VA
+        // Fresh unused slot + available bump VA
+        slotIdx = freeSlot;
+        chosenVirtOffset = pKernelBus->nextDynBar1Offset;
+        pKernelBus->nextDynBar1Offset += reqSize;
+    } else if (exactVictim != NV_DYN_BAR1_LRU_SLOTS) {
+        // Reuse the BAR1 VA range of the coldest unreferenced slot of the exact same size
+        slotIdx = exactVictim;
+        chosenVirtOffset = pKernelBus->lruSlots[exactVictim].bar1VirtOffset;
+    } else if (anyVictim != NV_DYN_BAR1_LRU_SLOTS &&
+               pKernelBus->nextDynBar1Offset <= (pKernelBus->bar1ApertureSize - reqSize)) {
+        // Evict the oldest unreferenced slot of a different size and bump-allocate fresh BAR1 VA
+        slotIdx = anyVictim;
         chosenVirtOffset = pKernelBus->nextDynBar1Offset;
         pKernelBus->nextDynBar1Offset += reqSize;
     } else {
-        // Reuse the VA range of the coldest UNREFERENCED slot of exactly the same size (an exact fit avoids
-        // both leaking the tail of a larger range and under-mapping a smaller one)
-        NvU64 oldestTick = ~0ULL;
-        NvU32 victim = NV_DYN_BAR1_LRU_SLOTS;
-        for (NvU32 i = 0; i < NV_DYN_BAR1_LRU_SLOTS; ++i) {
-            if (pKernelBus->lruSlots[i].valid &&
-                pKernelBus->lruSlots[i].refCount == 0 &&
-                pKernelBus->lruSlots[i].size == reqSize &&
-                pKernelBus->lruSlots[i].lastUseTick < oldestTick) {
-                oldestTick = pKernelBus->lruSlots[i].lastUseTick;
-                victim = i;
-            }
-        }
-        if (victim == NV_DYN_BAR1_LRU_SLOTS) {
-            return NV_ERR_INSUFFICIENT_RESOURCES;
-        }
-        slotIdx = victim;
-        chosenVirtOffset = pKernelBus->lruSlots[victim].bar1VirtOffset;
+        return NV_ERR_INSUFFICIENT_RESOURCES;
     }
 
     pKernelBus->lruSlots[slotIdx].valid = NV_TRUE;
@@ -293,6 +323,43 @@ static NV_STATUS _nvGpuOpsDynBar1GetOrCreate(
 // 1. Unified Static (24GB/32GB) + Dynamic (48GB Modded Card) BAR1 P2P PTE Builder
 // ==============================================================================
 
+#define PCI_ACS_SV 0x0001U
+#define PCI_ACS_TB 0x0002U
+#define PCI_ACS_RR 0x0004U
+#define PCI_ACS_CR 0x0008U
+#define PCI_ACS_UF 0x0010U
+
+// O5 Topology, Root-Complex, ACS & IOMMU Gate:
+// Verifies that both GPUs share a compatible PCIe root complex, have at least 64 MB BAR1 aperture
+// (1 GB+ on production Resizable BAR cards; 64 MB minimum to support synthetic LRU aperture tests),
+// do not have upstream bridge ACS Request/Completion Redirect (RR/CR) forcing peer TLPs into
+// an unmapped IOMMU fault, and are not blocked by strict unmapped IOMMU isolation.
+static inline NvBool kbusIsPcieBar1P2PMappingSupported_Unified(
+    OBJGPU *pGpu0,
+    KernelBus *pKernelBus0,
+    OBJGPU *pGpu1,
+    KernelBus *pKernelBus1
+) {
+    if (!pGpu0 || !pGpu1 || !pKernelBus0 || !pKernelBus1) {
+        return NV_FALSE;
+    }
+    if (pKernelBus1->bar1ApertureSize < (64ULL << 20)) {
+        return NV_FALSE;
+    }
+    if (pGpu0->pcieDomain != pGpu1->pcieDomain ||
+        pGpu0->rootComplexId != pGpu1->rootComplexId) {
+        return NV_FALSE;
+    }
+    if (pGpu0->iommuStrictBlocking || pGpu1->iommuStrictBlocking) {
+        return NV_FALSE;
+    }
+    if ((pGpu0->upstreamAcsCtrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_TB)) != 0U ||
+        (pGpu1->upstreamAcsCtrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_TB)) != 0U) {
+        return NV_FALSE;
+    }
+    return NV_TRUE;
+}
+
 NV_STATUS nvGpuOpsBuildExternalAllocPtes_Unified(
     OBJGPU *pMappingGpu,
     OBJGPU *pRemoteGpu,
@@ -303,11 +370,23 @@ NV_STATUS nvGpuOpsBuildExternalAllocPtes_Unified(
     NvU64 *physicalAddresses,
     NvU32 *pAperture
 ) {
-    NvU64 pteCount = size / mappingPageSize;
     NvU64 dmaBaseAddress = 0, dmaSize = 0;
 
+    if (!pMappingGpu || !pRemoteGpu || !pMemDesc || !physicalAddresses || !pAperture ||
+        mappingPageSize == 0 || size == 0 || (size % mappingPageSize) != 0)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    NvU64 pteCount = size / mappingPageSize;
+
+    if (!kbusIsPcieBar1P2PMappingSupported_Unified(
+            pMappingGpu, GPU_GET_KERNEL_BUS(pMappingGpu),
+            pRemoteGpu, GPU_GET_KERNEL_BUS(pRemoteGpu))) {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
     NvU64 totalMemSize = memdescGetSize(pMemDesc);
-    if (offset > totalMemSize || size > (totalMemSize - offset))
+    if (offset > totalMemSize || size > (totalMemSize - offset) ||
+        offset > (UINT64_MAX - pMemDesc->fbPhysBaseOffset))
         return NV_ERR_INVALID_ARGUMENT;
 
     // Remap peer PTE aperture to GMMU_APERTURE_SYS_NONCOH so Consumer CE engines do not MMU-fault
@@ -318,6 +397,8 @@ NV_STATUS nvGpuOpsBuildExternalAllocPtes_Unified(
         kbusGetBar1P2PDmaInfo_HAL(pMappingGpu, pRemoteGpu, GPU_GET_KERNEL_BUS(pRemoteGpu),
                                   &dmaBaseAddress, &dmaSize);
         NvU64 fbPhysOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, offset);
+        if (fbPhysOffset > dmaSize || size > (dmaSize - fbPhysOffset))
+            return NV_ERR_INSUFFICIENT_RESOURCES;
         for (NvU64 i = 0; i < pteCount; i++)
             physicalAddresses[i] = dmaBaseAddress + fbPhysOffset + (i * (NvU64)mappingPageSize);
     } else {
@@ -387,6 +468,11 @@ static inline void pcie_flr(struct pci_dev* pdev) {
     // FLR resets PCI_COMMAND (clears Bus Master Enable) while sticky SS0/SS1 latches persist
     pdev->bus_master_enabled = 0;
     pdev->flr_count++;
+    if (pdev->flr_resets_ss_latches) {
+        pdev->ss0_reg = GU_SS0_LOCKED_DEFAULT;
+        pdev->ss1_reg = 0x00000009U;
+        pdev->feat_readout1_reg = 0x11111111U;
+    }
 }
 
 static inline void nv_bar0_flush_posted_writes(struct pci_dev* pdev) {
@@ -433,8 +519,13 @@ static int nv_pci_resume_early_unlock(struct device *dev) {
         pci_save_state(pdev);
         pcie_flr(pdev);
         pci_restore_state(pdev);
+        // Post-FLR verification (fixes O4): if PCIe FLR reset SS0/SS1 override latches back to
+        // GU_SS0_LOCKED_DEFAULT on this GPU stepping, immediately re-execute the SEC2 Falcon payload post-FLR.
+        if (pdev->ss0_reg != GU_SS0_FULL_RATE_UNLOCK) {
+            ret = gpu_unlock_execute_falcon_payload(pdev, GU_SS0_FULL_RATE_UNLOCK, GU_SS1_FULL_RATE_UNLOCK);
+        }
     }
-    return 0;
+    return ret;
 }
 
 // ==============================================================================
@@ -499,11 +590,6 @@ static NV_STATUS nv_iommu_verify_isolated_peer_access(
 //   - it requires an explicit opt-in flag from the administrator,
 //   - Source Validation (SV) and Translation Blocking (TB) are left untouched.
 // On a real kernel prefer the supported boot parameter (pci=config_acs=...) over poking config space.
-#define PCI_ACS_SV 0x0001U
-#define PCI_ACS_TB 0x0002U
-#define PCI_ACS_RR 0x0004U
-#define PCI_ACS_CR 0x0008U
-#define PCI_ACS_UF 0x0010U
 #define EPERM_    1
 #define ENODEV_   19
 
@@ -550,8 +636,8 @@ int main(void) {
     NvU32 aperture = GMMU_APERTURE_PEER;
 
     // 1. Test Standard 24GB Card (BAR1 = 32GB >= FB = 24GB -> Static BAR1 Identity Mapping)
-    OBJGPU gpu0 = {0, 24 * GB, {NV_TRUE, 0x4000000000ULL, 32 * GB, 0}};
-    OBJGPU gpu1_24g = {1, 24 * GB, {NV_TRUE, 0x6000000000ULL, 32 * GB, 0}};
+    OBJGPU gpu0 = {0, 24 * GB, {NV_TRUE, 0x4000000000ULL, 32 * GB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
+    OBJGPU gpu1_24g = {1, 24 * GB, {NV_TRUE, 0x6000000000ULL, 32 * GB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
     MEMORY_DESCRIPTOR alloc_24g = {&gpu1_24g, 24 * GB, 18 * GB}; // Allocation at +18GB in FB
 
     NV_STATUS st1 = nvGpuOpsBuildExternalAllocPtes_Unified(
@@ -564,8 +650,31 @@ int main(void) {
     printf("    Aperture = GMMU_APERTURE_SYS_NONCOH (0x%X), PTE[0] = 0x%llX -> PASS\n\n",
            aperture, (unsigned long long)ptes[0]);
 
+    // 1b. O5 PCIe Topology, Root Complex, ACS & IOMMU Negative-Control Gate
+    {
+        OBJGPU gpu_diff_rc = gpu1_24g;
+        gpu_diff_rc.rootComplexId = 1; // Different CPU socket / root complex
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(
+                   &gpu0, &gpu_diff_rc, &alloc_24g, 0, 16 * 1024 * 1024, PAGE_2MB, ptes, &aperture)
+               == NV_ERR_NOT_SUPPORTED);
+
+        OBJGPU gpu_acs_rr = gpu1_24g;
+        gpu_acs_rr.upstreamAcsCtrl = PCI_ACS_RR; // Upstream bridge Request Redirect active
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(
+                   &gpu0, &gpu_acs_rr, &alloc_24g, 0, 16 * 1024 * 1024, PAGE_2MB, ptes, &aperture)
+               == NV_ERR_NOT_SUPPORTED);
+
+        OBJGPU gpu_iommu_block = gpu1_24g;
+        gpu_iommu_block.iommuStrictBlocking = NV_TRUE; // Unmapped strict IOMMU blocking
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(
+                   &gpu0, &gpu_iommu_block, &alloc_24g, 0, 16 * 1024 * 1024, PAGE_2MB, ptes, &aperture)
+               == NV_ERR_NOT_SUPPORTED);
+
+        printf("[1b] O5 P2P Topology/ACS/IOMMU Gate (refuses cross-RC, ACS RR/CR, & unmapped IOMMU) -> PASS\n\n");
+    }
+
     // 2. Test Modded 48GB RTX 4090 (BAR1 = 32GB < FB = 48GB -> Dynamic BAR1 Indirection)
-    OBJGPU gpu1_48g = {2, 48 * GB, {NV_FALSE, 0x8000000000ULL, 32 * GB, 0x10000000ULL}};
+    OBJGPU gpu1_48g = {2, 48 * GB, {NV_FALSE, 0x8000000000ULL, 32 * GB, 0x10000000ULL, 0, {{0}}}, 0, 0, 0, NV_FALSE};
     // High-memory allocation at +40GB in FB (above the 32GB static BAR1 ceiling!)
     MEMORY_DESCRIPTOR alloc_48g = {&gpu0, 48 * GB, 40 * GB};
 
@@ -585,7 +694,7 @@ int main(void) {
     // 2b. Dynamic BAR1 lifetime: live mappings are never aliased, VA is reclaimed only after release
     {
         const NvU64 MB = 1ULL << 20;
-        OBJGPU small = {3, 48 * GB, {NV_FALSE, 0x9000000000ULL, 64 * MB, 0}};
+        OBJGPU small = {3, 48 * GB, {NV_FALSE, 0x9000000000ULL, 64 * MB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
         NvU64 live_off[8];
         MEMORY_DESCRIPTOR descs[8];
         NvU64 pte1[1];
@@ -626,7 +735,7 @@ int main(void) {
     }
 
     // 3. Test S3 Suspend/Resume Early Hook (FEAT_PLM=0x00823804 restored, SS0=0x0082381C, SS1=0x00823820)
-    struct pci_dev pdev = {0x10DE, 0x2684, 3, 0, 1, 0, 0, 0x88000000U, 0x11111111U, GU_SS0_LOCKED_DEFAULT, 0x9U, 0x0U};
+    struct pci_dev pdev = {0x10DE, 0x2684, 3, 0, 1, 0, 0, 0x88000000U, 0x11111111U, GU_SS0_LOCKED_DEFAULT, 0x9U, 0x0U, 0, 0, 0};
     struct device dev = {&pdev};
     int s3_ret = nv_pci_resume_early_unlock(&dev);
     assert(s3_ret == 0);
@@ -641,6 +750,20 @@ int main(void) {
     printf("[3] S3 Suspend/Resume Early Falcon Unlock + Post-FLR pci_restore_state (BAR0 0x00823804..0x00823820):\n");
     printf("    FEAT_PLM = 0x%08X (Relocked), SS0 = 0x%08X, SS1 = 0x%X, Post-FLR BME = %d -> PASS\n\n",
            pdev.feat_plm_reg, pdev.ss0_reg, pdev.ss1_reg, pdev.bus_master_enabled);
+
+    // 3b. Test S3 Resume when hardware PCIe FLR resets SS0/SS1 override latches (O4 post-FLR re-apply)
+    {
+        struct pci_dev pdev_flr_reset = {0x10DE, 0x2684, 3, 0, 1, 0, 0, 0x88000000U, 0x11111111U, GU_SS0_LOCKED_DEFAULT, 0x9U, 0x0U, 0, 0, 1};
+        struct device dev_flr_reset = {&pdev_flr_reset};
+        assert(nv_pci_resume_early_unlock(&dev_flr_reset) == 0);
+        assert(pdev_flr_reset.flr_count == 1);
+        assert(pdev_flr_reset.plm_unlock_writes == 2); // Re-executed Falcon payload post-FLR!
+        assert(pdev_flr_reset.ss0_reg == GU_SS0_FULL_RATE_UNLOCK);
+        assert(pdev_flr_reset.ss1_reg == GU_SS1_FULL_RATE_UNLOCK);
+        assert(pdev_flr_reset.feat_plm_reg == 0x88000000U);
+        printf("[3b] Post-FLR Latch Reset Recovery (O4): FLR cleared SS0 -> re-applied Falcon payload (writes=%u, SS0=0x%08X) -> PASS\n\n",
+               pdev_flr_reset.plm_unlock_writes, pdev_flr_reset.ss0_reg);
+    }
 
     // 4. Test On-Demand Relock & Revert to Factory Stock Speed Selectors
     int relock_ret = gpu_relock_and_restore_stock_defaults(&pdev);

@@ -226,14 +226,35 @@ int main(void) {
         uint32_t status;
     } NVOS54_PARAMETERS;
     extern void shim_spoof_nvos54_packet(NVOS54_PARAMETERS* nvos);
+    extern void shim_enter_cublas_context(void);
+    extern void shim_leave_cublas_context(void);
 
     NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS pci_params = {(0x2684U << 16) | 0x10DEU, 0, 0xA1U, 0x2684U};
     NVOS54_PARAMETERS nvos = {1, 2, 0x20801801U, 0, &pci_params, sizeof(pci_params), 0};
+
+    // O2 Negative Control: Non-cuBLAS caller (PyTorch / NCCL) calling ioctl -> must NOT spoof!
+    shim_set_mock_caller_is_cublas(0);
     shim_spoof_nvos54_packet(&nvos);
+    assert((pci_params.pciDeviceId >> 16) == 0x2684U);
+    assert(pci_params.pciExtDeviceId == 0x2684U);
+
+    // O2 Positive Control A: TLS cuBLAS context latch active during nested libcuda -> ioctl call
+    shim_enter_cublas_context();
+    shim_spoof_nvos54_packet(&nvos);
+    shim_leave_cublas_context();
     assert((pci_params.pciDeviceId >> 16) == 0x26B1U);
     assert(pci_params.pciExtDeviceId == 0x26B1U);
 
-    printf("[+] PASS: cuGetProcAddress_v2 & NV2080_CTRL_CMD_BUS_GET_PCI_INFO (0x20801801) verified.\n");
+    // O2 Positive Control B: Multi-frame backtrace identifies libcublas on the call stack
+    pci_params.pciDeviceId = (0x2204U << 16) | 0x10DEU;
+    pci_params.pciExtDeviceId = 0x2204U;
+    shim_set_mock_caller_is_cublas(1);
+    shim_spoof_nvos54_packet(&nvos);
+    assert((pci_params.pciDeviceId >> 16) == 0x2230U);
+    assert(pci_params.pciExtDeviceId == 0x2230U);
+    shim_set_mock_caller_is_cublas(0);
+
+    printf("[+] PASS: cuGetProcAddress_v2 & O2 caller-aware NVOS54 ioctl spoofing verified.\n");
 
     return 0;
 }

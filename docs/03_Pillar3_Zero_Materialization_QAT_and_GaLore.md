@@ -8,22 +8,22 @@ By setting the Triton threadblock reduction tile to `BLOCK_K = 128` in [`qat_gal
 
 - **Forward Pass ($Y = X \widehat{W}^\top$):** Loads the master BF16 weight tile `w_tile` of shape `[BLOCK_N, 128]` inside the `BLOCK_K = 128` loop, computes $\alpha = \texttt{tl.sum(tl.abs(w\_tile), axis=1) / 128.0}$ directly in registers, constructs $\widehat{w}_{\text{tile}} = \texttt{tl.where(w\_tile >= 0, alpha[:, None], -alpha[:, None])}$, and issues `tl.dot(x_tile, tl.trans(w_hat_tile))` on the unlocked BF16 Tensor Cores without ever writing $\widehat{W}$ to global VRAM.
 - **Backward Activation Gradient ($\nabla X = \nabla Y \cdot \widehat{W}$):** Parallelizes `program_id(1)` over `K // 128` and loops over `N` in steps of `BLOCK_N`, so every `w_tile` loaded during the $\nabla X$ reduction has shape `[BLOCK_N, 128]`, spanning an entire g128 group along $K$. The exact group scale $\alpha$ and quantized signs $\widehat{W}$ are recomputed in SRAM during the backward pass without requiring a transposed copy of $W$ or any global memory reads of $\alpha$.
-- **Backward Master Weight Gradient ($\nabla W = (\nabla Y)^\top X$):** Computed directly under the Straight-Through Estimator ($\frac{\partial \widehat{W}}{\partial W} \approx I$) at full unlocked BF16 Tensor Core speed.
+- **Backward Master Weight Gradient ($\nabla W = (\nabla Y)^\top X$):** Computed directly under the Straight-Through Estimator ($\frac{\partial \widehat{W}}{\partial W} \approx I$) or optional Clipped STE gating $\mathbb{I}(|W_{n, 128g+i}| \le c \cdot \alpha_{n, g})$ (`clip_factor > 0`) at full unlocked BF16 Tensor Core speed.
 
 ---
 
-## 2. Layer-Wise 8-Bit GaLore with Per-Layer Post-Accumulate Hooks & Async PCIe DMA
+## 2. Layer-Wise 8-Bit / 4-Bit Q-GaLore with Per-Layer Post-Accumulate Hooks & Async PCIe DMA
 
 For a linear layer weight matrix $W_t \in \mathbb{R}^{m \times n}$ ($m \le n$), [`qat_galore_engine/galore_async_offload.py`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/qat_galore_engine/galore_async_offload.py) executes:
-1. **Periodic Subspace SVD (Every $T = 200$ steps):** Updates the left singular vectors $P_t = U[:, :r] \in \mathbb{R}^{m \times r}$ ($r = 512$ or $1024$) of $G_t = -\nabla_W \mathcal{L}(W_t)$ via truncated SVD on the unlocked Tensor Cores and quantizes $P_t$ to 8-bit dynamic blockwise floats.
-2. **Low-Rank Gradient Projection & 8-Bit Moment Update (Every step $t$):**
+1. **Periodic & Lazy Subspace SVD (Every $T = 200$ steps or Cosine-Similarity Triggered):** Updates the left singular vectors $P_t = U[:, :r] \in \mathbb{R}^{m \times r}$ ($r = 512$ or $1024$) of $G_t = -\nabla_W \mathcal{L}(W_t)$ via truncated SVD on the unlocked Tensor Cores (skipping redundant SVDs when subspace alignment exceeds `lazy_svd_cos_threshold`, `O15`), reprojects low-rank moments $(M_{t-1}, V_{t-1})$ into the new basis via sign-preserving QR orthogonal change-of-basis $T = P_{\text{new}}^\top P_{\text{old,orth}}$ (`O14`), and quantizes $P_t$ to 8-bit (`proj_bits=8`) or 4-bit stochastic (`proj_bits=4`, Q-GaLore) dynamic blockwise representations.
+2. **Low-Rank Gradient Projection & 8-Bit Moment Update (Every step $t$, with ceiling-rounded $\sqrt{V_t}$ uint8 quantization `P1-4`):**
    $$R_t = P_t^\top G_t \in \mathbb{R}^{r \times n}, \qquad M_t = \beta_1 M_{t-1} + (1 - \beta_1) R_t, \qquad V_t = \beta_2 V_{t-1} + (1 - \beta_2)(R_t \odot R_t)$$
    $$N_t = \frac{\widehat{M}_t}{\sqrt{\widehat{V}_t} + \epsilon}, \qquad W_{t+1} = (1 - \eta \lambda) W_t - \eta \cdot \alpha_{\text{scale}} \cdot (P_t N_t)$$
 3. **Per-Layer In-Flight Gradient Freeing (`register_post_accumulate_grad_hook`):** Attaching `_post_grad_hook` to each parameter consumes and frees `p.grad = None` immediately when that layer's backward GEMM finishes, before the preceding layer's backward pass begins.
 4. **Optimizer State Byte Footprint Comparison:**
    - **Standard BF16 Weight + FP32 AdamW:** $2mn\text{ B (weight)} + 2mn\text{ B (grad)} + 8mn\text{ B }(M, V) = 12mn\text{ Bytes}$.
    - **LoRA (rank $r$):** $2mn + 3mr + 3nr$ parameters ($2mn + 6mr + 6nr\text{ Bytes}$ with optimizer states).
-   - **8-Bit GaLore ($P_t, M_t, V_t$ in 8-bit):** $2mn\text{ B (weight)} + (mr + 2nr)\text{ Bytes}$.
+   - **8-Bit GaLore ($P_t, M_t, V_t$ in 8-bit):** $2mn\text{ B (weight)} + (mr + 2nr)\text{ Bytes}$ ($0.5mr + 2nr\text{ Bytes}$ when $P_t$ uses 4-bit Q-GaLore packing).
 
 ---
 
@@ -46,6 +46,6 @@ For a linear layer weight matrix $W_t \in \mathbb{R}^{m \times n}$ ($m \le n$), 
 | **Master Weights ($W$ in BF16)** | $64.00\text{ GB}$ (VRAM) | $64.00\text{ GB}$ (VRAM) | $40.00\text{ GB}$ ($20\text{ GB/GPU}$ VRAM) + $24.00\text{ GB}$ (Host Pinned RAM) |
 | **Quantized Forward Weights ($\widehat{W}$)** | $64.00\text{ GB}$ (Materialized) | $64.00\text{ GB}$ (Materialized) | **$0.00\text{ GB}$** (Fused in SRAM via `fused_qat_g128_fwd_kernel`) |
 | **Weight Gradients ($\nabla W$ in BF16)** | $64.00\text{ GB}$ (Full Model) | $64.00\text{ GB}$ (Full Model) | **$0.45\text{ GB}$** (Single-layer transient buffer freed via post-grad hook) |
-| **Optimizer States ($M_t, V_t, P_t$)** | $256.00\text{ GB}$ (FP32) | $64.00\text{ GB}$ (INT8/FP8) | **$2.42\text{ GB}$** ($mr + 2nr$ in 8-bit, streamed via PCIe DMA) |
-| **Activations (Grad Checkpointing, $B \times S = 2048$)** | $6.80\text{ GB}$ | $6.80\text{ GB}$ | $3.40\text{ GB}$ per GPU |
-| **Total Peak VRAM Required per GPU (2x 24GB Rig)** | **$227.40\text{ GB/GPU}$ (OOM)** | **$131.40\text{ GB/GPU}$ (OOM)** | **$22.15\text{ GB/GPU}$ (Fits natively inside 2x 24GB GPUs)** |
+| **Optimizer States ($M_t, V_t, P_t$)** | $256.00\text{ GB}$ (FP32) | $64.00\text{ GB}$ (INT8/FP8) | **$0.00\text{ GB}$ VRAM** ($2.42\text{ GB}$ in Host Pinned RAM, streamed via PCIe DMA) |
+| **Activations (Grad Checkpointing, $B \times S = 2048$)** | $6.80\text{ GB}$ | $6.80\text{ GB}$ | $6.80\text{ GB}$ ($3.40\text{ GB/GPU}$) |
+| **Total Peak VRAM Required per GPU (2x 24 GiB Rig)** | **$227.40\text{ GB/GPU}$ (OOM)** | **$131.40\text{ GB/GPU}$ (OOM)** | **$23.63\text{ GB/GPU}$ ($22.00\text{ GiB/GPU}$, Fits natively inside 2x 24 GiB GPUs)** |

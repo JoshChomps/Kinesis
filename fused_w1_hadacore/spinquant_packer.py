@@ -4,9 +4,9 @@ File: fused_w1_hadacore/spinquant_packer.py
 Workstream 3: Offline Stiefel Rotation Merger (Cayley SGD SpinQuant) & Interleaved 16-Bit Split Bit-Packer.
 Implements:
   1. Cayley SGD optimization on the Stiefel manifold:
-     R' = (I - (eta/2) * Y)^(-1) (I + (eta/2) * Y) R, where Y = G R^T - R G^T is skew-symmetric.
+     R' = (I + (eta/2) * Y)^(-1) (I - (eta/2) * Y) R, where Y = G R^T - R G^T is skew-symmetric.
   2. Fast Walsh-Hadamard Transform (FWHT) construction for 16x16 HadaCore Tensor Core tiles.
-  3. Offline rotation merge (W_rot = W @ R_1^T), g128 Binary (1.125 bpw) and BitNet b1.58 (2.125 bpw)
+  3. Offline rotation merge (W_rot = W @ R_1), g128 Binary (1.125 bpw) and BitNet b1.58 (2.125 bpw)
      quantization, and Interleaved 16-Bit Split uint32 packing for single-instruction lop3.b32 unpacking.
 """
 
@@ -72,16 +72,16 @@ def cayley_sgd_stiefel_step(
     """
     Executes one exact Cayley transform update step on the Stiefel manifold O(d):
       Y  = G @ R^T - R @ G^T   (skew-symmetric: Y^T = -Y)
-      R' = (I - (lr/2)*Y)^(-1) @ (I + (lr/2)*Y) @ R
+      R' = (I + (lr/2)*Y)^(-1) @ (I - (lr/2)*Y) @ R
     Preserves R' @ R'^T = I to machine precision.
     """
     d = R.shape[0]
     eye = torch.eye(d, dtype=R.dtype, device=R.device)
     Y = G @ R.T - R @ G.T
     half_lr_Y = 0.5 * lr * Y
-    lhs = eye - half_lr_Y
-    rhs = (eye + half_lr_Y) @ R
-    return torch.linalg.solve(lhs, rhs)
+    lhs = eye + half_lr_Y
+    rhs = (eye - half_lr_Y) @ R
+    return torch.linalg.solve(lhs, rhs).contiguous()
 
 
 def optimize_stiefel_rotation(
@@ -94,7 +94,17 @@ def optimize_stiefel_rotation(
     to minimize activation outlier kurtosis prior to 1-bit/ternary quantization.
     """
     d = calib_activations.shape[-1]
-    R = build_hadamard_matrix(d, device=calib_activations.device).detach().clone()
+    if d > 0 and (d & (d - 1)) == 0:
+        R = build_hadamard_matrix(d, device=calib_activations.device).detach().clone()
+    elif d % 16 == 0:
+        h16 = build_hadamard_matrix(16, device=calib_activations.device)
+        R = torch.block_diag(*([h16] * (d // 16))).detach().clone()
+    else:
+        q_orth, _ = torch.linalg.qr(
+            torch.randn(d, d, dtype=torch.float32, device=calib_activations.device)
+        )
+        R = q_orth.detach().clone()
+    R = R.to(calib_activations.dtype)
     init_kurt = float(compute_kurtosis(calib_activations).item())
 
     for _ in range(steps):
@@ -111,12 +121,56 @@ def optimize_stiefel_rotation(
     return R.detach(), init_kurt, final_kurt
 
 
+def optimize_kronecker_stiefel_rotation(
+    calib_activations: torch.Tensor,
+    q_hadamard: int = 16,
+    steps: int = 25,
+    lr: float = 0.25,
+) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
+    """
+    Optimizes a Kronecker-factored orthogonal rotation R_kron = R_P (x) H_16 on the smaller
+    Stiefel manifold O(P) (where P = K // 16) via Cayley SGD:
+      R_kron = (R_P (x) I_16) @ (I_P (x) H_16)
+    Because (R_P (x) I_16) and (I_P (x) H_16) commute:
+      - (R_P (x) I_16) is absorbed offline into the preceding linear layer's output weights;
+      - (I_P (x) H_16) is the EXACT online block-H_16 rotation applied in registers by the
+        GPU kernel's hadacore_rotate_m16k16_in_regs prologue (enable_online_hadacore = 1);
+      - R_kron = R_P (x) H_16 is merged offline into the current layer's quantized weights.
+    This reduces Cayley SGD matrix inversion complexity by 16^3 = 4,096x while strictly improving
+    outlier kurtosis reduction over fixed block-H_16 alone.
+    Returns (R_kron, R_P, init_kurt, fixed_h16_kurt, final_kron_kurt).
+    """
+    d = calib_activations.shape[-1]
+    assert d % q_hadamard == 0, "K must be divisible by q_hadamard"
+    p_dim = d // q_hadamard
+    h_q = build_hadamard_matrix(q_hadamard, device=calib_activations.device)
+    r_p = torch.eye(p_dim, dtype=calib_activations.dtype, device=calib_activations.device)
+
+    init_kurt = float(compute_kurtosis(calib_activations).item())
+    fixed_h16_rot = torch.kron(torch.eye(p_dim, dtype=calib_activations.dtype, device=calib_activations.device), h_q)
+    fixed_h16_kurt = float(compute_kurtosis(calib_activations @ fixed_h16_rot).item())
+
+    for _ in range(steps):
+        r_p.requires_grad_(True)
+        r_kron = torch.kron(r_p, h_q)
+        x_rot = calib_activations @ r_kron
+        loss = compute_kurtosis(x_rot)
+        (grad_rp,) = torch.autograd.grad(loss, r_p)
+        with torch.no_grad():
+            g_norm = torch.norm(grad_rp) + 1e-8
+            r_p = cayley_sgd_stiefel_step(r_p, grad_rp / g_norm, lr=lr)
+
+    r_kron_final = torch.kron(r_p.detach(), h_q)
+    final_kron_kurt = float(compute_kurtosis(calib_activations @ r_kron_final).item())
+    return r_kron_final, r_p.detach(), init_kurt, fixed_h16_kurt, final_kron_kurt
+
+
 def quantize_and_pack_w1_g128_interleaved(
     weight: torch.Tensor,
     R1: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Merges optional orthogonal rotation R1 (W_rot = W @ R1^T), quantizes into Binary g128
+    Merges optional orthogonal rotation R1 (W_rot = W @ R1), quantizes into Binary g128
     (1 bit per weight + 1 BF16 scale per 128 weights = 1.125 bpw), and packs every 32 weights
     along K into a uint32 word in the Interleaved 16-Bit Split Layout:
       - even weights b_{2k}   -> bit k      (k in 0..15)
@@ -152,9 +206,9 @@ def unpack_w1_g128_lop3_reference(
 ) -> torch.Tensor:
     """
     Emulates the exact 3-instruction PTX sequence:
-      shl.b32      %tmp, %w, (15 - k);
-      lop3.b32     %bf162, %tmp, 0x80008000, 0x3F803F80, 0xAE;
-      mul.rn.bf162 %bf162, %bf162, %scale;
+      shl.b32       %tmp, %w, (15 - k);
+      lop3.b32      %bf162, %tmp, 0x80008000, 0x3F803F80, 0xAE;
+      fma.rn.bf16x2 %bf162, %bf162, %scale, 0x80008000;
     and returns the dequantized BF16 weight matrix of shape [N, K].
     """
     N, k_words = packed_w1.shape
@@ -217,8 +271,8 @@ def unpack_w2_ternary_lop3_reference(
     Emulates the exact PTX sequence:
       shr.u32       %tmp, %w, (2 * k);
       lop3.b32      %inj, %tmp, 0x00030003, 0x40004000, 0xEA;
-      fma.rn.bf162  %unit, %inj, 0x42804280 (64.0), 0xC301C301 (-129.0);
-      mul.rn.bf162  %out, %unit, %scale;
+      fma.rn.bf16x2 %unit, %inj, 0x42804280 (64.0), 0xC301C301 (-129.0);
+      fma.rn.bf16x2 %out, %unit, %scale, 0x80008000;
     Guarantees ternary zero (q=1) unpacks to bit-exact 0.0f across all BF16 scales.
     """
     N, k_words = packed_w2.shape
@@ -298,6 +352,18 @@ def main() -> None:
     mismatch = float(torch.max(torch.abs((xs @ Rk1) @ (w @ R1).T - y_ref)).item())
     assert mismatch > 1e-2, "dense R_1 unexpectedly equals the kernel rotation"
     print(f"[5] Negative control (kernel H_16 on x, dense Cayley R_1 on W): error {mismatch:.2f} -> mixing them is WRONG")
+
+    # [6] Factorized Kronecker-Stiefel Cayley-SGD rotation: R_kron = (R_P (x) I_16) @ (I_P (x) H_16)
+    R_kron, R_P, k_init, k_h16, k_kron = optimize_kronecker_stiefel_rotation(x, q_hadamard=16, steps=25, lr=0.25)
+    kron_orth_err = float(torch.max(torch.abs(R_kron.T @ R_kron - torch.eye(K))).item())
+    # Verify exact factorization: (xs @ (R_P (x) I_16) @ Rk1) @ (w @ R_kron).T == xs @ w.T
+    r_prev_absorb = torch.kron(R_P, torch.eye(16, dtype=torch.float32))
+    x_after_prev_and_kernel_h16 = (xs @ r_prev_absorb) @ Rk1
+    y_kron = x_after_prev_and_kernel_h16 @ (w @ R_kron).T
+    kron_match_err = float(torch.max(torch.abs(y_kron - y_ref)).item())
+    print(f"[6] Kronecker-Stiefel (R_P (x) H_16, P={K//16}): kurtosis {k_init:.2f} -> {k_h16:.2f} (fixed H_16) -> {k_kron:.2f} (learned R_P), match err {kron_match_err:.2e}")
+    assert kron_orth_err < 1e-5 and k_kron < k_h16 and kron_match_err < 1e-3
+    print("[+] PASS: Kronecker-Stiefel Cayley-SGD rotation and online H_16 prologue factorization verified.")
 
 
 if __name__ == "__main__":

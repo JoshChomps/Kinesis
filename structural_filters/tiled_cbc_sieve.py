@@ -2,9 +2,9 @@
 """
 File: structural_filters/tiled_cbc_sieve.py
 Workstream 4: Column-Major Subspace Energy Sieve (Tiled-CBC Dynamic Gate) Reference & Verifier.
-Evaluates per-tile L1 activation energy E_k = mean(|X_tilde[:, 128k:128(k+1)]|) along
-BLOCK_K = 128 columns and dynamically skips cp.async GDDR6X weight reads and HMMA waves
-for low-energy subspace tiles.
+Evaluates per-tile row-maximum Holder L1 activation energy E_k = max_m mean_k(|X_tilde[m, 128k:128(k+1)]|)
+along BLOCK_K = 128 columns (or K = 32 sub-slices, O9) and dynamically skips cp.async GDDR6X weight reads
+and HMMA waves for low-energy subspace tiles without dropping single-token outlier activations.
 """
 
 from typing import Tuple, Dict
@@ -17,10 +17,12 @@ def tiled_cbc_sieve_gemm(
     tau_sieve: float,
     block_m: int = 64,
     block_k: int = 128,
+    use_row_max: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Executes Y = X_rot @ W^T in blocks of (BLOCK_M, BLOCK_K = 128) with dynamic
-    Tiled-CBC subspace gating based on per-tile L1 norm E_k > tau_sieve.
+    Tiled-CBC subspace gating based on per-tile row-maximum Holder L1 norm
+    E_k = max_{m in tile} mean_{k in tile} |X[m, k]| > tau_sieve (fixes O9).
     """
     M, K = x_rot_bf16.shape
     N, K_w = w_dequant_bf16.shape
@@ -42,7 +44,10 @@ def tiled_cbc_sieve_gemm(
             k_start = ki * block_k
             k_end = k_start + block_k
             x_tile = x_m[:, k_start:k_end]
-            e_k = float(x_tile.abs().mean().item())
+            if use_row_max:
+                e_k = float(x_tile.abs().mean(dim=-1).amax().item())
+            else:
+                e_k = float(x_tile.abs().mean().item())
             if e_k > tau_sieve:
                 w_tile = w_dequant_bf16[:, k_start:k_end].to(torch.float32)
                 y_out[m_start:m_end, :] += x_tile @ w_tile.T
@@ -82,7 +87,16 @@ def main() -> None:
     print(f"[3] Relative Output Frobenius Error  : {rel_frob_err:.4e}")
     assert 40.0 <= stats["pruned_pct"] <= 65.0
     assert rel_frob_err < 0.025
-    print("[+] PASS: Tiled-CBC dynamic subspace energy sieve verified.")
+
+    # [4] O9 Single-Outlier-Row Holder Bound Verification (1 loud row, 63 silent rows)
+    x_outlier = torch.zeros((64, 128), dtype=torch.bfloat16)
+    x_outlier[13, :] = 1.0
+    y_out_rowmax, stats_rowmax = tiled_cbc_sieve_gemm(x_outlier, w_bf16[:, :128], tau_sieve=0.5, use_row_max=True)
+    _, stats_mean = tiled_cbc_sieve_gemm(x_outlier, w_bf16[:, :128], tau_sieve=0.5, use_row_max=False)
+    print(f"[4] O9 Single-Outlier-Row Gate       : RowMax Executed={int(stats_rowmax['executed_tiles'])}/1 | Mean-L1 Executed={int(stats_mean['executed_tiles'])}/1")
+    assert int(stats_rowmax["executed_tiles"]) == 1 and int(stats_mean["executed_tiles"]) == 0
+    assert float(y_out_rowmax[13].abs().max().item()) > 0.0
+    print("[+] PASS: Tiled-CBC dynamic subspace energy sieve and O9 row-max Holder bound verified.")
 
 
 if __name__ == "__main__":

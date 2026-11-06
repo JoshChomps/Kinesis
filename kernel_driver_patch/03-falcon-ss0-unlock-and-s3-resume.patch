@@ -1,6 +1,7 @@
+NOTE: DESIGN SKETCH, NOT A VERIFIED PATCH. Never applied to or built against an NVIDIA open-gpu-kernel-modules tree; line offsets and some helper signatures are assumptions. See docs/11_Adversarial_Review_Status_and_Known_Limitations.md (O3 to O7).
 --- a/kernel-open/nvidia/nv-pci.c
 +++ b/kernel-open/nvidia/nv-pci.c
-@@ -410,6 +410,25 @@ done:
+@@ -410,6 +410,31 @@ done:
      return rc;
  }
  
@@ -13,12 +14,17 @@
 +        return -EIO;
 +    pci_set_master(pdev);
 +
-+    if (gpu_unlock_execute_falcon_payload(pdev, 0x88888888U, 0x8U) == 0) {
++    int ret = gpu_unlock_execute_falcon_payload(pdev, 0x88888888U, 0x8U);
++    if (ret == 0) {
 +        pci_save_state(pdev);
 +        pcie_flr(pdev);
 +        pci_restore_state(pdev);
++        // Post-FLR verification (O4): if FLR reset SS0/SS1 override latches, re-apply Falcon HS payload
++        if (nv_bar0_read32(pdev, 0x0082381CU) != 0x88888888U) {
++            ret = gpu_unlock_execute_falcon_payload(pdev, 0x88888888U, 0x8U);
++        }
 +    }
-+    return 0;
++    return ret;
 +}
 +
  static const struct dev_pm_ops nv_pm_ops = {

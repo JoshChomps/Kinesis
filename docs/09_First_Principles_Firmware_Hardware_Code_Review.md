@@ -34,8 +34,8 @@ All **7 Critical (P0)** hardware/ISA correctness bugs, **6 High (P1)** architect
 >
 > **Hardware & Driver Principle & Remediation:**
 > 1. In `cuda.h`, `CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID = 34` returns the **5-bit PCIe device/slot number on the bus (`0..31`)**, whereas the 16-bit PCI hardware device ID (`0x2204` / `0x2684`) is queried via NVRM `ioctl` `NV2080_CTRL_CMD_BUS_GET_PCI_INFO` (`cmd == 0x20801801U`). Added `NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS` packet interception in `shim_spoof_nvos54_packet()` and guarded `cuDeviceGetAttribute` / `cudaDeviceGetAttribute` with `*pi >= 0x1000` so 5-bit PCIe slot numbers (`0..31`) are never corrupted.
-> 2. Removed the false `is_caller_cublas(__builtin_return_address(0))` gate inside `ioctl()` (where the immediate caller is always `libcuda.so.1`).
-> 3. Guarded `cuGetProcAddress` and `cuGetProcAddress_v2` with `if (*pfn != (void*)&cuDeviceGetAttribute)` and `if (*pfn != (void*)&cuDeviceGetName)` to prevent self-assignment infinite recursion.
+> 2. Replaced the single-frame `is_caller_cublas(__builtin_return_address(0))` gate inside `ioctl()` (where the immediate frame is `libcuda.so.1`) with thread-local cuBLAS call-depth tracking (`shim_enter_cublas_context` / `shim_leave_cublas_context`) plus multi-frame backtrace `dladdr` inspection (`is_callstack_cublas`, `O2`).
+> 3. Guarded `cuGetProcAddress` and `cuGetProcAddress_v2` with `if (*pfn != (void*)&cuDeviceGetAttribute)` and `if (*pfn != (void*)&cuDeviceGetName)` (and recursive self-symbol interception `F12`) to prevent self-assignment infinite recursion.
 
 ---
 
@@ -65,7 +65,7 @@ All **7 Critical (P0)** hardware/ISA correctness bugs, **6 High (P1)** architect
 >
 > **IEEE-754 BFloat16 Principle & Remediation:**
 > Because $129 = 2^7 + 2^0$ spans all 8 significand bits of a BFloat16 number, pre-multiplying `bf16(-129.0f * alpha_g)` rounded off the lowest mantissa bits of any non-power-of-2 scale `alpha_g`, causing ternary zero (`q = 1`, encoded as `0x4001` = $2.0 + 1/64$) to unpack to `-0.25f` instead of `0.0f` for `alpha_g = 1.75f`.
-> Replaced the pre-multiplied FMA constants with exact unscaled BF162 constants `c_mul = 0x42804280` `(64.0, 64.0)` and `c_sub = 0xC301C301` `(-129.0, -129.0)` in `fma.rn.bf162` to yield exact unit trits `{-1.0, +0.0, +1.0}` (`0xBF80`, `0x0000`, `0x3F80`), followed by `mul.rn.bf162` with `scale_bf162`. Verified across 18,874,368 ternary states in `ptx_bf162_emu.c` against the true mathematical target `{-alpha_g, 0.0f, +alpha_g}` with **0 bit errors**.
+> Replaced the pre-multiplied FMA constants with exact unscaled BF162 constants `c_mul = 0x42804280` `(64.0, 64.0)` and `c_sub = 0xC301C301` `(-129.0, -129.0)` in `fma.rn.bf16x2` to yield exact unit trits `{-1.0, +0.0, +1.0}` (`0xBF80`, `0x0000`, `0x3F80`), followed by `fma.rn.bf16x2` with `scale_bf162` and `-0.0` (`0x80008000`, `F1`). Verified across 18,874,368 ternary states in `ptx_bf162_emu.c` against the true mathematical target `{-alpha_g, 0.0f, +alpha_g}` with **0 bit errors**.
 
 ---
 
@@ -112,7 +112,7 @@ All **7 Critical (P0)** hardware/ISA correctness bugs, **6 High (P1)** architect
 > **Locations:** [`chorus_amx_moe.c`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/hetero_runtime/chorus_amx_moe.c#L29-L48), [`chorus_amx_moe.c`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/hetero_runtime/chorus_amx_moe.c#L75-L248)
 >
 > **Intel AMX ISA Principle & Remediation:**
-> Updated `amx_gemm_1bit_expert_tile` to pack `w_vnni_buf` in hardware VNNI pair-interleaved order `w_vnni_buf[(bit >> 1) * 32 + r * 2 + (bit & 1)]` (`[K/2 = 16, N = 16, 2]`), padded `gpu_ready_seq` (offset `0`) and `cpu_done_seq` (offset `64`) onto separate 64-byte cache lines in `HeteroMoERingSlot`, added `amx_release_tiles()` (`_tile_release()`) and `free_pinned_1gb_ring()` (handling both `mmap` and `calloc` allocations), and verified both uniform and non-uniform column-dependent weight/scale matrices with **0 errors**.
+> Updated `amx_gemm_1bit_expert_tile` to pack `w_vnni_buf` in hardware VNNI pair-interleaved order (`[K/2 = 16, N = 16, 2]`) via vectorized `_mm512_i32scatter_epi32` (AVX-512 path) and strict-aliasing-clean 32-bit VNNI pair packing (emulation path with AMX BF16/FP32 denormal flush-to-zero semantics, `O10`), padded `gpu_ready_seq` (offset `0`) and `cpu_done_seq` (offset `64`) onto separate 64-byte cache lines in `HeteroMoERingSlot`, added `VirtualLock`/`mlock` physical page-locking and a dedicated OS worker thread (`_beginthreadex`/`pthread_create`), and verified both uniform/non-uniform tiles and concurrent SPSC ring execution with **0 errors**.
 
 ---
 
@@ -143,11 +143,11 @@ All **7 Critical (P0)** hardware/ISA correctness bugs, **6 High (P1)** architect
 | **Workstream 1B: Cycle-Accurate SMSP Roofline** | `python sim_harness/smsp_roofline_sim.py` | 32x32 unlocked `SassWait = 50.76%` (`162.2 TF`) -> 64x64 Fused W1A16 `SassWait = 6.40%` (**`309.9 TF`** on AD102) | **PASS** |
 | **Workstream 2A: Userspace cuBLAS / NVRM Shim** | `./compiler_unlock/test_cublas_shim.exe` | `cuGetProcAddress_v2` recursion guard + `NV2080_CTRL_CMD_BUS_GET_PCI_INFO` (`0x20801801`) spoof (`0x2684 -> 0x26B1`) | **PASS** |
 | **Workstream 2B: Unlocked Triton Autotuner** | `python compiler_unlock/unlocked_gemm.py` | All 6 configs $\le 101,376\text{ B}$ (`98,304 B = 97.0%`), $I_{\text{warp}} \in [21.3, 32.0]$, **0 bit mismatches** | **PASS** |
-| **Workstream 3: SpinQuant Cayley-SGD & Packer** | `python fused_w1_hadacore/spinquant_packer.py` | $\|R^T R - I\|_\infty = 1.192 \times 10^{-6}$, kurtosis `25.00 -> 19.35`, W1 & W2 bit errors = **0 / 8,192** | **PASS** |
-| **Workstream 4A: Tiled-CBC Warp Energy Sieve** | `./structural_filters/test_tiled_cbc.exe` & `.py` | Full `[4][2][4][4]` (`8,192` BF16/warp) normalization `E_k = 1.5000`; `50.0%` cold tiles skipped | **PASS** |
-| **Workstream 4B: LServe INT4 Hadamard KV Attn** | `python structural_filters/lserve_sparse_attn.py` | `4,096 B/page` `uint8` unpacker, per-query convex bound, `62.5%` pages skipped (`10.04x` BW), $\cos = \mathbf{0.99313}$ | **PASS** |
-| **Workstream 5A: In-SRAM `BLOCK_K=128` QAT STE** | `python qat_galore_engine/fused_qat_ste.py` | `0 B` global `W_hat` allocation, Forward/dX/dW mismatches = **0** | **PASS** |
-| **Workstream 5B: 8-Bit Root-Moment GaLore** | `python qat_galore_engine/galore_async_offload.py` | Root-moment $\sqrt{v_t}$ `uint8` quantization, loss `0.9575 -> 0.9182`, 32B peak VRAM = **`22.15 GB/GPU`** | **PASS** |
+| **Workstream 3: SpinQuant Cayley-SGD & Packer** | `python fused_w1_hadacore/spinquant_packer.py` | $\|R^T R - I\|_\infty = 1.192 \times 10^{-6}$, kurtosis `25.00 -> 1.82` (Kronecker `25.00 -> 3.65 -> 2.44`), W1 & W2 bit errors = **0 / 8,192** | **PASS** |
+| **Workstream 4A: Tiled-CBC Warp Energy Sieve** | `./structural_filters/test_tiled_cbc.exe` & `.py` | Full `[4][2][4][4]` (`8,192` BF16/warp) normalization `E_k = 1.5000`; row-max Holder bound verified on 32-lane warp | **PASS** |
+| **Workstream 4B: LServe INT4 Hadamard KV Attn** | `python structural_filters/lserve_sparse_attn.py` | `4,096 B/page` `uint8` unpacker, per-query convex bound, `62.5%` pages skipped (`10.04x` BW), $\cos = \mathbf{0.99313}$ (`0.99305` at 50% streaming) | **PASS** |
+| **Workstream 5A: In-SRAM `BLOCK_K=128` QAT STE** | `python qat_galore_engine/fused_qat_ste.py` | `0 B` global `W_hat` allocation, Forward/dX/dW mismatches = **0**, Clipped STE verified | **PASS** |
+| **Workstream 5B: 8-Bit Root-Moment GaLore** | `python qat_galore_engine/galore_async_offload.py` | Root-moment $\sqrt{v_t}$ `uint8` quantization, sign-preserving QR moment reprojection, 32B peak VRAM = **`23.63 GB/GPU` (`22.00 GiB/GPU`)** | **PASS** |
 | **Workstream 6: Kernel BAR1 P2P & S3 Unlock** | `./kernel_driver_patch/test_kernel_patch.exe` | `volatile` MMIO + read-back flush, `pci_save_state` before FLR (`Post-FLR BME = 1`), 8-way LRU BAR1, overflow guard | **PASS** |
 | **Workstream 7: 1GB HugePage Ring & AMX / Governor** | `./hetero_runtime/test_chorus_amx.exe` & `test_governor_c.exe` & `.py` | Producer@`0B` / Consumer@`64B`, AMX VNNI `[K/2, N, 2]` Uniform & Non-Uniform Err = **0**, 1% GPUBoost hysteresis | **PASS** |
 | **Workstream 9: Kinesis C++20 & Smart Cache** | `./kinesis_unified/test_kinesis_unified.exe` | `-DNDEBUG` `UHA_VERIFY`, `XCR0` AMX check, 1-way scalar & `ldmatrix` swizzle, W1 (`28.44x`) & W2 (`15.06x`) AVX2 Err = **`0.00e+00`**, LFU VRAM eviction | **PASS** |

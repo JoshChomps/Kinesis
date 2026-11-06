@@ -24,18 +24,24 @@ kernel_patch:
 	$(CC) $(CFLAGS) -DSTANDALONE_VERIFY -o kernel_driver_patch/test_kernel_patch kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c
 
 hetero:
-	$(CC) $(CFLAGS) -DSTANDALONE_VERIFY -o hetero_runtime/test_chorus_amx hetero_runtime/chorus_amx_moe.c -lm
+	$(CC) $(CFLAGS) -pthread -DSTANDALONE_VERIFY -o hetero_runtime/test_chorus_amx hetero_runtime/chorus_amx_moe.c -lm
 	$(CC) $(CFLAGS) -o hetero_runtime/test_governor_c hetero_runtime/closed_loop_governor.c
 
 kinesis_unified:
 	$(CXX) $(CXXFLAGS) -o kinesis_unified/test_kinesis_unified kinesis_unified/test_kinesis_unified.cpp
 
+cuda_host_verify:
+	$(CXX) -O2 -std=c++20 -Wall -Wextra -DSTANDALONE_VERIFY -x c++ fused_w1_hadacore/w1a16_hadacore_kernel.cu -o fused_w1_hadacore/test_w1a16_kernel
+	$(CXX) $(CXXFLAGS) -DSTANDALONE_VERIFY -x c++ structural_filters/tiled_cbc_sieve.cu -o structural_filters/test_tiled_cbc
+
 cuda_kernels:
 	$(NVCC) -O3 -arch=sm_86 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -c fused_w1_hadacore/w1a16_hadacore_kernel.cu -o fused_w1_hadacore/w1a16_hadacore_kernel.o
 	$(NVCC) -O3 -arch=sm_86 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -c structural_filters/tiled_cbc_sieve.cu -o structural_filters/tiled_cbc_sieve.cu.o
 
-verify: sim shim kernel_patch hetero kinesis_unified
+verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	./sim_harness/ptx_bf162_emu
+	./fused_w1_hadacore/test_w1a16_kernel
+	./structural_filters/test_tiled_cbc
 	$(PYTHON) sim_harness/smsp_roofline_sim.py
 	./compiler_unlock/test_cublas_shim
 	$(PYTHON) compiler_unlock/unlocked_gemm.py
@@ -49,6 +55,7 @@ verify: sim shim kernel_patch hetero kinesis_unified
 	./hetero_runtime/test_governor_c
 	$(PYTHON) hetero_runtime/closed_loop_governor.py
 	./kinesis_unified/test_kinesis_unified
+	$(PYTHON) e2e_transformer_pipeline.py
 
 clean:
 	rm -f sim_harness/ptx_bf162_emu* compiler_unlock/test_cublas_shim* compiler_unlock/*.so

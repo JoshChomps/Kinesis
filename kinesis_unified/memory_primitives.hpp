@@ -27,6 +27,7 @@
 #include <sstream>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32) || defined(_WIN64)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -98,8 +99,9 @@ public:
     }
 
     [[nodiscard]] static void* allocate(size_t bytes) noexcept {
-        if (bytes == 0) return nullptr;
-        const size_t aligned_size = align_up(bytes, page_size());
+        const size_t pg = page_size();
+        if (bytes == 0 || bytes > (std::numeric_limits<size_t>::max() - pg)) return nullptr;
+        const size_t aligned_size = align_up(bytes, pg);
 #if defined(_WIN32) || defined(_WIN64)
         return VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
@@ -114,8 +116,11 @@ public:
      *        frames in RAM (VirtualLock / mlock) so hot inference loops take zero page faults.
      */
     [[nodiscard]] static void* allocate_locked_prefaulted(size_t bytes, bool* out_locked = nullptr) noexcept {
-        if (bytes == 0) return nullptr;
         const size_t pg = page_size();
+        if (bytes == 0 || bytes > (std::numeric_limits<size_t>::max() - pg)) {
+            if (out_locked) *out_locked = false;
+            return nullptr;
+        }
         const size_t aligned_size = align_up(bytes, pg);
         void* ptr = allocate(aligned_size);
         if (!ptr) {
@@ -340,7 +345,12 @@ public:
     explicit SlabAllocator(size_t blockCount, bool lockAndPrefault = true)
         : block_count_(blockCount),
           free_count_(blockCount),
-          slab_bytes_(align_up(blockCount * kActualBlockSize, VirtualMemory::page_size())) {
+          is_free_(blockCount, 1U) {
+        const size_t pg = VirtualMemory::page_size();
+        if (blockCount > (std::numeric_limits<size_t>::max() - pg) / kActualBlockSize) {
+            throw std::bad_alloc();
+        }
+        slab_bytes_ = align_up(blockCount * kActualBlockSize, pg);
         if (slab_bytes_ > 0) {
             if (lockAndPrefault) {
                 slab_memory_ = static_cast<std::byte*>(
@@ -370,6 +380,10 @@ public:
         }
         Node* node = free_list_;
         free_list_ = node->next;
+        const size_t idx = static_cast<size_t>(reinterpret_cast<std::byte*>(node) - slab_memory_) / kActualBlockSize;
+        if (idx < is_free_.size()) {
+            is_free_[idx] = 0U;
+        }
         --free_count_;
         return static_cast<void*>(node);
     }
@@ -378,6 +392,9 @@ public:
         if (!ptr || !owns(ptr)) return;
         const size_t offset = static_cast<size_t>(static_cast<std::byte*>(ptr) - slab_memory_);
         if (offset % kActualBlockSize != 0) return;
+        const size_t idx = offset / kActualBlockSize;
+        if (idx >= is_free_.size() || is_free_[idx] != 0U || free_count_ >= block_count_) return;
+        is_free_[idx] = 1U;
 
         auto* node = static_cast<Node*>(ptr);
         node->next = free_list_;
@@ -399,6 +416,7 @@ public:
 
     void reset() noexcept override {
         free_count_ = block_count_;
+        std::fill(is_free_.begin(), is_free_.end(), static_cast<uint8_t>(1U));
         initialize_free_list();
     }
 
@@ -427,12 +445,13 @@ private:
         current->next = nullptr;
     }
 
-    std::byte* slab_memory_{nullptr};
-    Node*      free_list_{nullptr};
-    size_t     block_count_{0};
-    size_t     free_count_{0};
-    size_t     slab_bytes_{0};
-    bool       is_locked_{false};
+    std::byte*           slab_memory_{nullptr};
+    Node*                free_list_{nullptr};
+    size_t               block_count_{0};
+    size_t               free_count_{0};
+    size_t               slab_bytes_{0};
+    bool                 is_locked_{false};
+    std::vector<uint8_t> is_free_;
 };
 
 // ============================================================================
@@ -522,10 +541,18 @@ public:
         Strides s;
         s.rank_ = static_cast<uint32_t>(shape.rank());
         if (s.rank_ == 0) return s;
-        int64_t acc = 1;
+        constexpr uint64_t kMaxI64 = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+        uint64_t acc = 1;
         for (size_t i = s.rank_; i > 0; --i) {
-            s.strides_[i - 1] = acc;
-            acc *= static_cast<int64_t>(shape[i - 1]);
+            s.strides_[i - 1] = static_cast<int64_t>(acc > kMaxI64 ? kMaxI64 : acc);
+            const uint64_t dim = shape[i - 1];
+            if (dim == 0) {
+                acc = 0;
+            } else if (acc > kMaxI64 / dim) {
+                acc = kMaxI64;
+            } else {
+                acc *= dim;
+            }
         }
         return s;
     }

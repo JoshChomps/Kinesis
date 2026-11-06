@@ -141,12 +141,14 @@ def sram_tiled_qat_bwd_dx_reference(dy: torch.Tensor, w: torch.Tensor) -> torch.
 
 class FusedQATG128Function(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, clip_mult: float = 0.0) -> torch.Tensor:
         # Notice: Only x and master weight w are saved (0 bytes allocated for quantized W_hat!)
+        M, K = x.shape
+        N, Kw = w.shape
+        assert K == Kw and K % 128 == 0, f"Invalid FusedQATG128 shapes: x={x.shape}, w={w.shape}"
         ctx.save_for_backward(x, w)
+        ctx.clip_mult = float(clip_mult)
         if HAS_TRITON and x.is_cuda and w.is_cuda:
-            M, K = x.shape
-            N, _ = w.shape
             y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
             grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
             fused_qat_g128_fwd_kernel[grid](
@@ -176,21 +178,34 @@ class FusedQATG128Function(torch.autograd.Function):
             )
         else:
             dx = sram_tiled_qat_bwd_dx_reference(dy, w)
-        # Straight-Through Estimator (dW_hat / dW = I): dW = dY^T @ X at full unlocked BF16 Tensor Core speed
-        dw = (dy.to(torch.float32).T @ x.to(torch.float32)).to(w.dtype)
-        return dx, dw
+        # Straight-Through Estimator: dW = dY^T @ X, optionally gated by Clipped STE indicator 1(|W| <= c * alpha_g)
+        dw_fp32 = dy.to(torch.float32).T @ x.to(torch.float32)
+        if ctx.clip_mult > 0.0:
+            N_w, K_w = w.shape
+            w_g = w.view(N_w, K_w // 128, 128).to(torch.float32)
+            alpha_g = (w_g.abs().sum(dim=-1, keepdim=True) * (1.0 / 128.0)).to(torch.bfloat16).to(torch.float32)
+            clip_mask = (w_g.abs() <= (ctx.clip_mult * alpha_g)).view(N_w, K_w)
+            dw_fp32.masked_fill_(~clip_mask, 0.0)
+        dw = dw_fp32.to(w.dtype)
+        return dx, dw, None
 
 
 class FusedQATG128Linear(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, device=None) -> None:
+    def __init__(self, in_features: int, out_features: int, clip_mult: float = 0.0, device=None) -> None:
         super().__init__()
         assert in_features % 128 == 0
+        self.in_features = in_features
+        self.out_features = out_features
+        self.clip_mult = float(clip_mult)
         self.weight = torch.nn.Parameter(
             torch.randn((out_features, in_features), device=device, dtype=torch.bfloat16) * 0.02
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FusedQATG128Function.apply(x, self.weight)
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        y_2d = FusedQATG128Function.apply(x_2d, self.weight, self.clip_mult)
+        return y_2d.reshape(*orig_shape[:-1], self.out_features)
 
 
 def main() -> None:
@@ -229,7 +244,20 @@ def main() -> None:
     print(f"[3] Backward dX (dY W_hat) Mismatches         : {dx_diff}")
     print(f"[4] Backward STE dW (dY^T X) Mismatches       : {dw_diff}")
     assert fwd_diff == 0 and dx_diff == 0 and dw_diff == 0
-    print("[+] PASS: In-SRAM BLOCK_K=128 Fused STE QAT forward & backward kernels verified.")
+
+    # [5] Clipped STE indicator 1(|W| <= clip_mult * alpha_g) verification
+    clipped_layer = FusedQATG128Linear(K, N, clip_mult=1.5)
+    with torch.no_grad():
+        clipped_layer.weight.copy_(layer.weight)
+        # Force row 0, col 0 weight to be a 10x outlier outside 1.5 * alpha_g
+        clipped_layer.weight[0, 0] = 10.0
+    x_c = x.detach().clone().requires_grad_(True)
+    y_c = clipped_layer(x_c)
+    y_c.backward(dy)
+    assert float(clipped_layer.weight.grad[0, 0].item()) == 0.0
+    assert int((clipped_layer.weight.grad != 0).sum().item()) > 0
+    print(f"[5] Clipped STE Indicator (|W| <= 1.5*alpha_g): Outlier dW[0,0]={float(clipped_layer.weight.grad[0, 0].item()):.1f} (masked)")
+    print("[+] PASS: In-SRAM BLOCK_K=128 Fused STE QAT forward, backward, and Clipped STE verified.")
 
 
 if __name__ == "__main__":

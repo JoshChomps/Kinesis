@@ -4,12 +4,15 @@
 
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdarg.h>
 
 #if defined(__linux__) || defined(__unix__)
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <sys/ioctl.h>
 #endif
 
@@ -63,18 +66,31 @@ typedef CUresult (*cuGetProcAddress_v2_fn)(const char*, void**, int, uint64_t, v
 typedef cudaError_t (*cudaDeviceGetAttribute_fn)(int*, int, int);
 typedef int (*ioctl_fn)(int, unsigned long, ...);
 
-static cuDeviceGetAttribute_fn real_cuDeviceGetAttribute = NULL;
-static cuDeviceGetName_fn real_cuDeviceGetName = NULL;
-static cuGetProcAddress_fn real_cuGetProcAddress = NULL;
-static cuGetProcAddress_v2_fn real_cuGetProcAddress_v2 = NULL;
-static cudaDeviceGetAttribute_fn real_cudaDeviceGetAttribute = NULL;
-static ioctl_fn real_ioctl = NULL;
+static _Atomic cuDeviceGetAttribute_fn real_cuDeviceGetAttribute = NULL;
+static _Atomic cuDeviceGetName_fn real_cuDeviceGetName = NULL;
+static _Atomic cuGetProcAddress_fn real_cuGetProcAddress = NULL;
+static _Atomic cuGetProcAddress_v2_fn real_cuGetProcAddress_v2 = NULL;
+static _Atomic cudaDeviceGetAttribute_fn real_cudaDeviceGetAttribute = NULL;
+#ifndef _WIN32
+static _Atomic ioctl_fn real_ioctl = NULL;
+#endif
 
 // Optional test-harness override for sandbox caller simulation
-static int g_force_caller_is_cublas = -1;
+static _Atomic int g_force_caller_is_cublas = -1;
+static _Thread_local int g_tls_cublas_depth = 0;
 
 void shim_set_mock_caller_is_cublas(int is_cublas) {
-    g_force_caller_is_cublas = is_cublas;
+    atomic_store_explicit(&g_force_caller_is_cublas, is_cublas, memory_order_release);
+}
+
+void shim_enter_cublas_context(void) {
+    g_tls_cublas_depth++;
+}
+
+void shim_leave_cublas_context(void) {
+    if (g_tls_cublas_depth > 0) {
+        g_tls_cublas_depth--;
+    }
 }
 
 void shim_register_mock_driver_table(
@@ -91,13 +107,11 @@ void shim_register_mock_driver_table(
     real_cuGetProcAddress_v2 = fn_gpa_v2;
 }
 
-static inline int is_caller_cublas(void* return_addr) {
-    if (g_force_caller_is_cublas >= 0) {
-        return g_force_caller_is_cublas;
-    }
+static inline int is_addr_in_cublas_dso(void* addr) {
 #if defined(__linux__) || defined(__unix__)
+    if (!addr) return 0;
     Dl_info info;
-    if (dladdr(return_addr, &info) && info.dli_fname) {
+    if (dladdr(addr, &info) && info.dli_fname) {
         if (strstr(info.dli_fname, "libcublas") != NULL ||
             strstr(info.dli_fname, "libhipblas") != NULL ||
             strstr(info.dli_fname, "libcudnn") != NULL) {
@@ -105,7 +119,51 @@ static inline int is_caller_cublas(void* return_addr) {
         }
     }
 #else
-    (void)return_addr;
+    (void)addr;
+#endif
+    return 0;
+}
+
+static inline int is_caller_cublas(void* return_addr) {
+    if (g_tls_cublas_depth > 0) {
+        return 1;
+    }
+    int forced = atomic_load_explicit(&g_force_caller_is_cublas, memory_order_acquire);
+    if (forced >= 0) {
+        return forced;
+    }
+    return is_addr_in_cublas_dso(return_addr);
+}
+
+// Multi-frame call-stack inspector for ioctl() (O2):
+// Because ioctl() is invoked inside libcuda.so.1 on behalf of a higher-level caller
+// (e.g. libcublasLt.so -> libcuda.so.1 -> libc.so.6:ioctl), frame 0 points to libcuda.so.1.
+// Walking up to 8 stack frames via backtrace() + dladdr() (plus the TLS depth latch) ensures
+// NVOS54_PARAMETERS packets are spoofed ONLY when libcublas/libcudnn is on the active call chain,
+// unless UHA_SPOOF_IOCTL_ON_INIT=1 is set to allow cuInit(0)-time PCI ID caching.
+static inline int is_callstack_cublas(void* immediate_return_addr) {
+    if (g_tls_cublas_depth > 0) {
+        return 1;
+    }
+    int forced = atomic_load_explicit(&g_force_caller_is_cublas, memory_order_acquire);
+    if (forced >= 0) {
+        return forced;
+    }
+    const char* env_init = getenv("UHA_SPOOF_IOCTL_ON_INIT");
+    if (env_init && env_init[0] == '1') {
+        return 1;
+    }
+    if (is_addr_in_cublas_dso(immediate_return_addr)) {
+        return 1;
+    }
+#if defined(__linux__) || defined(__unix__)
+    void* frames[8];
+    int n_frames = backtrace(frames, 8);
+    for (int i = 0; i < n_frames; ++i) {
+        if (is_addr_in_cublas_dso(frames[i])) {
+            return 1;
+        }
+    }
 #endif
     return 0;
 }
@@ -256,9 +314,12 @@ CUresult cuGetProcAddress_v2(
     return res;
 }
 
-// Helper for NVRM NV2080_CTRL_CMD_BUS_GET_PCI_INFO (0x20801801U) packet spoofing
+// Helper for caller-aware NVRM NV2080_CTRL_CMD_BUS_GET_PCI_INFO (0x20801801U) packet spoofing (O2)
 void shim_spoof_nvos54_packet(NVOS54_PARAMETERS* nvos) {
-    if (!nvos || !nvos->params) return;
+    if (!nvos || !nvos->params || nvos->status != 0U) return;
+    if (!is_callstack_cublas(__builtin_return_address(0))) {
+        return;
+    }
     if (nvos->cmd == NV2080_CTRL_CMD_BUS_GET_PCI_INFO &&
         nvos->paramsSize >= sizeof(NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS)) {
         NV2080_CTRL_BUS_GET_PCI_INFO_PARAMS* pci_info =
@@ -270,14 +331,20 @@ void shim_spoof_nvos54_packet(NVOS54_PARAMETERS* nvos) {
             pci_info->pciDeviceId = ((uint32_t)spoofed_dev_id << 16) | (uint32_t)vendor_id;
             pci_info->pciExtDeviceId = (uint32_t)spoofed_dev_id;
         }
-    } else if (nvos->cmd == NV2080_CTRL_CMD_GPU_GET_NAME_STRING) {
-        char* name_str = (char*)nvos->params + 4;
-        if (strstr(name_str, "3090") || strstr(name_str, "3080")) {
-            snprintf(name_str, 64, "NVIDIA RTX A6000");
-        } else if (strstr(name_str, "4090")) {
-            snprintf(name_str, 64, "NVIDIA RTX 6000 Ada Generation");
-        } else if (strstr(name_str, "5090")) {
-            snprintf(name_str, 64, "NVIDIA RTX PRO 6000 Blackwell");
+    } else if (nvos->cmd == NV2080_CTRL_CMD_GPU_GET_NAME_STRING &&
+               nvos->paramsSize >= 68U) {
+        // First 4 bytes are NvU32 gpuNameStringFlags (0 = ASCII, 1 = UNICODE); only mutate ASCII strings
+        uint32_t name_flags = 0U;
+        memcpy(&name_flags, nvos->params, sizeof(uint32_t));
+        if (name_flags == 0U) {
+            char* name_str = (char*)nvos->params + 4;
+            if (strstr(name_str, "3090") || strstr(name_str, "3080")) {
+                snprintf(name_str, 64, "NVIDIA RTX A6000");
+            } else if (strstr(name_str, "4090")) {
+                snprintf(name_str, 64, "NVIDIA RTX 6000 Ada Generation");
+            } else if (strstr(name_str, "5090")) {
+                snprintf(name_str, 64, "NVIDIA RTX PRO 6000 Blackwell");
+            }
         }
     }
 }
@@ -286,6 +353,9 @@ void shim_spoof_nvos54_packet(NVOS54_PARAMETERS* nvos) {
 int ioctl(int fd, unsigned long request, ...) {
     if (!real_ioctl) {
         real_ioctl = (ioctl_fn)dlsym(RTLD_NEXT, "ioctl");
+    }
+    if (!real_ioctl) {
+        return -1;
     }
     va_list args;
     va_start(args, request);

@@ -2,9 +2,9 @@
 
 ## 1. Open Kernel Module Integration (`open-gpu-kernel-modules`)
 
-All three hardware-state and bus-fabric modifications are unified directly inside NVIDIA's GPL-2.0/MIT `open-gpu-kernel-modules` repository (`src/nvidia/` and `kernel-open/nvidia/`) under [`kernel_driver_patch/`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c).
+All three hardware-state and bus-fabric modifications are unified directly as reference patches against NVIDIA's GPL-2.0/MIT `open-gpu-kernel-modules` repository (`src/nvidia/` and `kernel-open/nvidia/`) under [`kernel_driver_patch/`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c), paired with the standalone C11 behavioral verification harness `nv_gpu_ops_and_s3_unlock.c` (`O3`).
 
-### Empirical Inter-GPU PCIe DMA Throughput & Latency (`p2pBandwidthLatencyTest`)
+### Target Inter-GPU PCIe DMA Throughput & Latency Baselines (`p2pBandwidthLatencyTest` Literature / Analytical Reference)
 
 | Inter-GPU PCIe Transfer Regime | Stock Driver (P2P Blocked / Host Bounce Buffer) | Patched BAR1 P2P Unlocked (`GMMU_APERTURE_SYS_NONCOH`) | Measured System Gain |
 | :--- | :--- | :--- | :--- |

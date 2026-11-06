@@ -2,8 +2,8 @@
 """
 File: export_full_stack.py
 Complete Zero-Truncation Co-Design Stack Exporter.
-Assembles all modular architectural documentation (docs/00..06) and all source files
-across Workstreams 1 to 8 into:
+Assembles all modular architectural documentation (docs/00..11) and all source files
+across all workstreams into:
   1. Full_Unlocked_GPU_CoDesign_Stack.md
   2. Full_Unlocked_GPU_CoDesign_Stack.html (Print-ready HTML for 1-click PDF export)
 """
@@ -21,9 +21,18 @@ DOC_FILES = [
     "docs/05_Pillar5_Structural_Filters_and_Chorus_AMX_Runtime.md",
     "docs/06_Reference_Index_and_Bibliography.md",
     "docs/07_Security_Risks_Prior_Art_and_Literature.md",
+    "docs/08_Kinesis_Evaluation_Fixes_and_Smart_Cache.md",
+    "docs/09_First_Principles_Firmware_Hardware_Code_Review.md",
+    "docs/10_Related_Projects_Community_Buzz_and_Wave2_Upgrades.md",
+    "docs/11_Adversarial_Review_Status_and_Known_Limitations.md",
 ]
 
 SOURCE_FILES = [
+    ("kinesis_unified/unified_sizing.h", "c"),
+    ("kinesis_unified/memory_primitives.hpp", "cpp"),
+    ("kinesis_unified/hardware_and_sandbox.hpp", "cpp"),
+    ("kinesis_unified/sub2bit_gemm_and_smart_cache.hpp", "cpp"),
+    ("kinesis_unified/test_kinesis_unified.cpp", "cpp"),
     ("sim_harness/ptx_bf162_emu.c", "c"),
     ("sim_harness/smsp_roofline_sim.py", "python"),
     ("compiler_unlock/libcublas_unlock_shim.c", "c"),
@@ -31,6 +40,8 @@ SOURCE_FILES = [
     ("compiler_unlock/unlocked_gemm.py", "python"),
     ("fused_w1_hadacore/spinquant_packer.py", "python"),
     ("fused_w1_hadacore/w1a16_hadacore_kernel.cu", "cuda"),
+    ("fused_w1_hadacore/w1a16_host_cta_shim.hpp", "cpp"),
+    ("fused_w1_hadacore/w1a16_host_verify_main.hpp", "cpp"),
     ("structural_filters/tiled_cbc_sieve.cu", "cuda"),
     ("structural_filters/tiled_cbc_sieve.py", "python"),
     ("structural_filters/lserve_sparse_attn.py", "python"),
@@ -44,6 +55,8 @@ SOURCE_FILES = [
     ("hetero_runtime/chorus_amx_moe.c", "c"),
     ("hetero_runtime/closed_loop_governor.c", "c"),
     ("hetero_runtime/closed_loop_governor.py", "python"),
+    ("e2e_transformer_pipeline.py", "python"),
+    ("run_all_tests.py", "python"),
     ("Makefile", "makefile"),
     ("verify_bare_metal.sh", "bash"),
 ]
@@ -84,7 +97,7 @@ def export_everything() -> None:
   pre {{ white-space: pre-wrap; word-wrap: break-word; background: #f6f8fa; border: 1px solid #d0d7de; padding: 14px; border-radius: 6px; font-size: 11.5px; line-height: 1.45; }}
   @media print {{ .bar {{ display: none; }} pre {{ font-size: 9.5px; border: none; }} }}
 </style></head><body>
-<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 8 Workstreams Included)</span>
+<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 18 Verification Suites Included)</span>
 <button onclick="window.print()">Save Complete PDF</button></div>
 <pre>{html.escape(full_md)}</pre></body></html>""")
     print(f"[+] Wrote print-ready HTML bundle: {html_out}")

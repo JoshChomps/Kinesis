@@ -1,3 +1,4 @@
+NOTE: DESIGN SKETCH, NOT A VERIFIED PATCH. Never applied to or built against an NVIDIA open-gpu-kernel-modules tree; line offsets and some helper signatures are assumptions. See docs/11_Adversarial_Review_Status_and_Known_Limitations.md (O3 to O7).
 --- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
 +++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
 @@ -1420,7 +1420,9 @@ kbusCalcCpuInvisibleBar1Range_GM107(OBJGPU *pGpu, KernelBus *pKernelBus, NvU32 g
@@ -14,14 +15,21 @@
  }
 --- a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
 +++ b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
-@@ -312,6 +312,11 @@ kbusIsPcieBar1P2PMappingSupported_GH100(OBJGPU *pGpu0, KernelBus *pKernelBus0,
-     if (pGpu0 == NULL || pGpu1 == NULL)
+@@ -312,6 +312,19 @@ kbusIsPcieBar1P2PMappingSupported_GH100(OBJGPU *pGpu0, KernelBus *pKernelBus0,
+     if (pGpu0 == NULL || pGpu1 == NULL || pKernelBus0 == NULL || pKernelBus1 == NULL)
          return NV_FALSE;
  
-+    // Override GeForce PCI ID exclusion so standard 24GB/32GB and modded 48GB cards allow P2P
-+    if (pKernelBus1->bar1[GFID_PF].apertureLength >= (1ULL << 30)) {
-+        return NV_TRUE;
++    // O5 Topology, Root-Complex, ACS (RR/CR/TB), and IOMMU Peer Validation before allowing BAR1 P2P.
++    // Rejects immediately if any topology, BAR1 aperture, IOMMU, or ACS redirect check fails.
++    if (pKernelBus1->bar1[GFID_PF].apertureLength < (64ULL << 20) ||
++        gpuGetDBDF(pGpu0).domain != gpuGetDBDF(pGpu1).domain ||
++        pGpu0->rootComplexId != pGpu1->rootComplexId ||
++        pGpu0->bIommuStrictBlocking || pGpu1->bIommuStrictBlocking ||
++        ((pGpu0->upstreamAcsCtrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_TB)) != 0U) ||
++        ((pGpu1->upstreamAcsCtrl & (PCI_ACS_RR | PCI_ACS_CR | PCI_ACS_TB)) != 0U))
++    {
++        return NV_FALSE;
 +    }
 +
-     return kbusIsStaticBar1Enabled_HAL(pGpu1, pKernelBus1);
++    return NV_TRUE;
  }

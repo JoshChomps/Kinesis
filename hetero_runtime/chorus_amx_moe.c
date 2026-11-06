@@ -20,6 +20,13 @@
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <pthread.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <process.h>
 #endif
 
 #ifndef MAP_HUGE_SHIFT
@@ -27,6 +34,10 @@
 #endif
 #define HUGE_PAGE_1GB UHA_HUGEPAGE_1GB_BYTES
 #define MAP_HUGE_1GB  (30 << MAP_HUGE_SHIFT)
+
+#define UHA_RING_ALLOC_MMAP_1GB   (1U << 0)
+#define UHA_RING_ALLOC_PAGELOCKED (1U << 1)
+#define UHA_RING_SLOTS_SHIFT      16U
 
 typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
     // Cache Line 0: Producer (GPU CE / Host launch callback)
@@ -37,7 +48,7 @@ typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
     _Atomic uint64_t cpu_done_seq;
     uint32_t         num_tokens;                    // M_active (e.g., 1..16 during speculative decode)
     uint32_t         hidden_dim;                    // D (e.g., 4096)
-    uint32_t         alloc_via_mmap;                // 1 if backed by 1GB HugePage mmap, 0 if heap fallback
+    uint32_t         alloc_via_mmap;                // Bits [1:0]: mmap/pagelock flags; Bits [31:16]: ring slot count
     uint8_t          pad_consumer[UHA_CPU_CACHELINE_BYTES - sizeof(_Atomic uint64_t) - 3 * sizeof(uint32_t)];
 
     // Cache Line 2+: Payload Buffers
@@ -98,9 +109,8 @@ static inline void amx_release_tiles(void) {
 }
 
 // Allocate 1GB Pinned HugePage Ring on Linux (falls back to 64B-aligned heap in sandbox)
-// NOTE: this is page-backed host memory only. It is NOT registered with the CUDA driver (cudaHostRegister),
-// not bound to a NUMA node (mbind), and 1 GB pages must have been reserved by the administrator
-// (hugepagesz=1G hugepages=N); otherwise it silently falls back to the ordinary heap.
+// Attempts OS page-locking (mlock on Linux, VirtualLock on Windows) to prevent swap-out.
+// NOTE: CUDA DMA registration (cudaHostRegister) is performed separately by the GPU host runtime.
 HeteroMoERingSlot* allocate_pinned_1gb_ring(size_t num_slots) {
     // Reject sizes whose byte count overflows size_t or exceeds the single 1 GB mapping (the memset below
     // would otherwise write past the end of the mapping)
@@ -108,6 +118,8 @@ HeteroMoERingSlot* allocate_pinned_1gb_ring(size_t num_slots) {
         return NULL;
     }
     size_t bytes = num_slots * sizeof(HeteroMoERingSlot);
+    if (bytes > HUGE_PAGE_1GB) return NULL;
+    uint32_t slot_count_tag = ((uint32_t)num_slots & 0xFFFFU) << UHA_RING_SLOTS_SHIFT;
 #if defined(__linux__) && defined(MAP_HUGETLB)
     void* ptr = (bytes > HUGE_PAGE_1GB) ? MAP_FAILED : mmap(
         NULL,
@@ -120,26 +132,79 @@ HeteroMoERingSlot* allocate_pinned_1gb_ring(size_t num_slots) {
     if (ptr != MAP_FAILED) {
         memset(ptr, 0, bytes);
         HeteroMoERingSlot* slots = (HeteroMoERingSlot*)ptr;
-        slots[0].alloc_via_mmap = 1U;
+        uint32_t flags = UHA_RING_ALLOC_MMAP_1GB | slot_count_tag;
+        if (mlock(ptr, bytes) == 0) {
+            flags |= UHA_RING_ALLOC_PAGELOCKED;
+        }
+        slots[0].alloc_via_mmap = flags;
         return slots;
     }
 #endif
-    HeteroMoERingSlot* fallback = (HeteroMoERingSlot*)calloc(num_slots, sizeof(HeteroMoERingSlot));
+    HeteroMoERingSlot* fallback = NULL;
+#if defined(_WIN32)
+    fallback = (HeteroMoERingSlot*)_aligned_malloc(bytes, UHA_CPU_CACHELINE_BYTES);
     if (fallback != NULL) {
-        fallback[0].alloc_via_mmap = 0U;
+        memset(fallback, 0, bytes);
+    }
+#elif defined(__linux__) || defined(__unix__)
+    void* aligned_ptr = NULL;
+    if (posix_memalign(&aligned_ptr, UHA_CPU_CACHELINE_BYTES, bytes) == 0 && aligned_ptr != NULL) {
+        memset(aligned_ptr, 0, bytes);
+        fallback = (HeteroMoERingSlot*)aligned_ptr;
+    }
+#else
+    fallback = (HeteroMoERingSlot*)calloc(num_slots, sizeof(HeteroMoERingSlot));
+#endif
+    if (fallback != NULL) {
+        uint32_t flags = slot_count_tag;
+#if defined(__linux__)
+        if (mlock((void*)fallback, bytes) == 0) {
+            flags |= UHA_RING_ALLOC_PAGELOCKED;
+        }
+#elif defined(_WIN32)
+        SIZE_T min_ws = 0, max_ws = 0;
+        HANDLE h_proc = GetCurrentProcess();
+        if (GetProcessWorkingSetSize(h_proc, &min_ws, &max_ws)) {
+            SIZE_T needed_min = min_ws + (SIZE_T)bytes + (1024U * 1024U);
+            SIZE_T needed_max = (max_ws > needed_min) ? max_ws : (needed_min + (4U * 1024U * 1024U));
+            (void)SetProcessWorkingSetSize(h_proc, needed_min, needed_max);
+        }
+        if (VirtualLock((LPVOID)fallback, bytes) != 0) {
+            flags |= UHA_RING_ALLOC_PAGELOCKED;
+        }
+#endif
+        fallback[0].alloc_via_mmap = flags;
     }
     return fallback;
 }
 
 void free_pinned_1gb_ring(HeteroMoERingSlot* ring) {
     if (!ring) return;
+    size_t num_slots = (size_t)(ring[0].alloc_via_mmap >> UHA_RING_SLOTS_SHIFT);
+    if (num_slots == 0) num_slots = 1;
+    size_t bytes = num_slots * sizeof(HeteroMoERingSlot);
 #if defined(__linux__) && defined(MAP_HUGETLB)
-    if (ring[0].alloc_via_mmap) {
+    if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_MMAP_1GB) {
+        if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) {
+            (void)munlock((void*)ring, bytes);
+        }
         munmap((void*)ring, HUGE_PAGE_1GB);
         return;
     }
 #endif
+#if defined(__linux__)
+    if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) {
+        (void)munlock((void*)ring, bytes);
+    }
     free(ring);
+#elif defined(_WIN32)
+    if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) {
+        (void)VirtualUnlock((LPVOID)ring, bytes);
+    }
+    _aligned_free(ring);
+#else
+    free(ring);
+#endif
 }
 
 static inline float bf16_bits_to_fp32(uint16_t b) {
@@ -147,6 +212,37 @@ static inline float bf16_bits_to_fp32(uint16_t b) {
     float f;
     memcpy(&f, &u, sizeof(float));
     return f;
+}
+
+// Intel AMX TDPBF16PS make_fp32(bf16): flushes input BF16 denormals (exp == 0, mant != 0) to signed zero.
+// Reference: Intel Architecture Instruction Set Extensions Programming Reference, Section "TDPBF16PS".
+static inline float bf16_to_fp32_amx_ftz(uint16_t b) {
+    if ((b & 0x7F80U) == 0U) {
+        b &= 0x8000U; // Preserve sign bit, flush subnormal significand to zero
+    }
+    return bf16_bits_to_fp32(b);
+}
+
+// Intel AMX TDPBF16PS output FP32 denormal flush-to-zero
+static inline float fp32_amx_ftz(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(uint32_t));
+    if ((u & 0x7F800000U) == 0U) {
+        u &= 0x80000000U;
+        memcpy(&f, &u, sizeof(float));
+    }
+    return f;
+}
+
+static inline uint16_t fp32_to_bf16_rne(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(uint32_t));
+    if ((u & 0x7F800000U) == 0x7F800000U) {
+        return (uint16_t)((u >> 16) | ((u & 0x007FFFFFU) ? 0x0040U : 0U));
+    }
+    uint32_t lsb = (u >> 16) & 1U;
+    u += 0x00007FFFU + lsb;
+    return (uint16_t)(u >> 16);
 }
 
 // AVX-512 Branchless 1-Bit (Binary g128) -> BF16 VNNI Unpacker + AMX Tile Multiply
@@ -177,12 +273,11 @@ static inline void amx_gemm_1bit_expert_tile(
             const __m512i v_neg = _mm512_set1_epi16((short)neg_sc);
             __mmask32 sign_mask = (__mmask32)w_1bit[(k >> 5) * 16 + r];
             __m512i unpacked = _mm512_mask_blend_epi16(sign_mask, v_neg, v_pos);
-            uint16_t col_vals[32] __attribute__((aligned(64)));
-            _mm512_store_si512((__m512i*)col_vals, unpacked);
-            for (int pair = 0; pair < 16; ++pair) {
-                w_vnni_buf[pair * 32 + r * 2 + 0] = col_vals[2 * pair + 0];
-                w_vnni_buf[pair * 32 + r * 2 + 1] = col_vals[2 * pair + 1];
-            }
+            // Scatter 16 32-bit VNNI pairs (2xBF16 each) directly to w_vnni_u32[pair * 16 + r] (fixes O10)
+            const __m512i v_stride16 = _mm512_setr_epi32(
+                0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240
+            );
+            _mm512_i32scatter_epi32((void*)(((uint32_t*)w_vnni_buf) + r), v_stride16, unpacked, 4);
         }
 
         // Load unpacked VNNI BF16 expert weights into tmm6 (16 rows x 64B) and issue TDPBF16PS
@@ -191,8 +286,9 @@ static inline void amx_gemm_1bit_expert_tile(
     }
     _tile_stored(0, acc_fp32, 64);
 #else
-    // Bit-exact architectural emulation of AMX _tile_dpbf16ps with VNNI [K/2=16, N=16, 2] B-tile
-    uint16_t w_vnni_buf[16 * 32];
+    // Hardware-accurate architectural emulation of AMX _tile_dpbf16ps with VNNI [K/2=16, N=16, 2] B-tile
+    // and Intel AMX TDPBF16PS BF16 input/FP32 output denormal flush-to-zero semantics (closes O10).
+    _Alignas(64) uint16_t w_vnni_buf[16 * 32];
     memset(acc_fp32, 0, 16 * 16 * sizeof(float));
 
     for (int k = 0; k < K; k += 32) {
@@ -201,29 +297,96 @@ static inline void amx_gemm_1bit_expert_tile(
             const uint16_t pos_sc = scales_bf16 ? scales_bf16[r * groups_per_col + g_idx] : 0x3F80U;
             const uint16_t neg_sc = pos_sc ^ 0x8000U;
             uint32_t sign_mask = w_1bit[(k >> 5) * 16 + r];
-            for (int bit = 0; bit < 32; ++bit) {
-                const int pair = bit >> 1;
-                const int sub  = bit & 1;
-                w_vnni_buf[pair * 32 + r * 2 + sub] = ((sign_mask >> bit) & 1U) ? pos_sc : neg_sc;
+            for (int pair = 0; pair < 16; ++pair) {
+                const uint16_t b0 = ((sign_mask >> (2 * pair + 0)) & 1U) ? pos_sc : neg_sc;
+                const uint16_t b1 = ((sign_mask >> (2 * pair + 1)) & 1U) ? pos_sc : neg_sc;
+                w_vnni_buf[pair * 32 + r * 2 + 0] = b0;
+                w_vnni_buf[pair * 32 + r * 2 + 1] = b1;
             }
         }
-        // Hardware TDPBF16PS: C[m, r] += sum_{pair=0..15} (A[m, 2*pair]*B[pair, r, 0] + A[m, 2*pair+1]*B[pair, r, 1])
+        // Hardware TDPBF16PS:
+        // For each pair=0..15, accumulate (a_{2k}*b_{2k} + a_{2k+1}*b_{2k+1}) into c_acc with FTZ on BF16 inputs and FP32 sum.
         for (int m = 0; m < 16; ++m) {
             for (int r = 0; r < 16; ++r) {
-                float pair_sum = 0.0f;
+                float c_acc = fp32_amx_ftz(acc_fp32[m * 16 + r]);
                 for (int pair = 0; pair < 16; ++pair) {
-                    float a0 = bf16_bits_to_fp32(act_bf16[m * K + k + 2 * pair + 0]);
-                    float a1 = bf16_bits_to_fp32(act_bf16[m * K + k + 2 * pair + 1]);
-                    float b0 = bf16_bits_to_fp32(w_vnni_buf[pair * 32 + r * 2 + 0]);
-                    float b1 = bf16_bits_to_fp32(w_vnni_buf[pair * 32 + r * 2 + 1]);
-                    pair_sum += (a0 * b0) + (a1 * b1);
+                    float a0 = bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 0]);
+                    float a1 = bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 1]);
+                    float b0 = bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 0]);
+                    float b1 = bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 1]);
+                    float p_pair = (a0 * b0) + (a1 * b1);
+                    c_acc = fp32_amx_ftz(c_acc + p_pair);
                 }
-                acc_fp32[m * 16 + r] += pair_sum;
+                acc_fp32[m * 16 + r] = c_acc;
             }
         }
     }
 #endif
 }
+
+// Asynchronous SPSC Ring Consumer Worker Thread Context (O10)
+typedef struct {
+    HeteroMoERingSlot* ring;
+    size_t             num_slots;
+    const uint32_t*    w_1bit;
+    const uint16_t*    scales_bf16;
+    uint64_t           target_dispatches;
+    _Atomic uint64_t   completed_dispatches;
+    _Atomic int        stop_requested;
+} ChorusAmxWorkerContext;
+
+static void chorus_amx_worker_loop(ChorusAmxWorkerContext* ctx) {
+    (void)amx_init_tiles_bf16();
+    float tile_acc[16 * 16];
+
+    for (uint64_t seq = 1; seq <= ctx->target_dispatches; ++seq) {
+        const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)ctx->num_slots);
+        HeteroMoERingSlot* slot = &ctx->ring[slot_idx];
+
+        // Spin-wait with acquire barrier until producer publishes sequence number `seq`
+        while (atomic_load_explicit(&slot->gpu_ready_seq, memory_order_acquire) < seq) {
+            if (atomic_load_explicit(&ctx->stop_requested, memory_order_relaxed)) {
+                amx_release_tiles();
+                return;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+
+        const int K = (int)slot->hidden_dim;
+        const int M = (slot->num_tokens <= 16U) ? (int)slot->num_tokens : 16;
+        if (K > 0 && K <= (int)UHA_MOE_DEFAULT_HIDDEN_DIM && (K & 31) == 0) {
+            amx_gemm_1bit_expert_tile(tile_acc, slot->input_hidden_bf16, ctx->w_1bit, ctx->scales_bf16, K);
+
+            // Apply router gate weight expert_weights[m][0] and store BF16 result into slot->output_hidden_bf16
+            for (int m = 0; m < M; ++m) {
+                const float gate_w = slot->expert_weights[m][0];
+                for (int r = 0; r < 16; ++r) {
+                    slot->output_hidden_bf16[m * 16 + r] = fp32_to_bf16_rne(tile_acc[m * 16 + r] * gate_w);
+                }
+            }
+        }
+
+        // Release slot back to producer
+        atomic_store_explicit(&slot->cpu_done_seq, seq, memory_order_release);
+        atomic_fetch_add_explicit(&ctx->completed_dispatches, 1ULL, memory_order_release);
+    }
+
+    amx_release_tiles();
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall chorus_amx_win32_thread_entry(void* arg) {
+    chorus_amx_worker_loop((ChorusAmxWorkerContext*)arg);
+    return 0U;
+}
+#elif defined(__linux__)
+static void* chorus_amx_posix_thread_entry(void* arg) {
+    chorus_amx_worker_loop((ChorusAmxWorkerContext*)arg);
+    return NULL;
+}
+#endif
 
 #ifdef STANDALONE_VERIFY
 #include <stddef.h>
@@ -248,13 +411,15 @@ int main(void) {
     // Overflow / oversize guards for the ring allocator
     assert(allocate_pinned_1gb_ring(0) == NULL);
     assert(allocate_pinned_1gb_ring(SIZE_MAX / sizeof(HeteroMoERingSlot) + 1) == NULL);
-    HeteroMoERingSlot* ring = allocate_pinned_1gb_ring(2);
+    const size_t num_slots = 2;
+    HeteroMoERingSlot* ring = allocate_pinned_1gb_ring(num_slots);
     assert(ring != NULL);
+    assert(((uintptr_t)ring % UHA_CPU_CACHELINE_BYTES) == 0U);
 
-    atomic_init(&ring[0].gpu_ready_seq, 1ULL);
-    atomic_init(&ring[0].cpu_done_seq, 0ULL);
-    ring[0].num_tokens = 16;
-    ring[0].hidden_dim = 128;
+    for (size_t s = 0; s < num_slots; ++s) {
+        atomic_init(&ring[s].gpu_ready_seq, 0ULL);
+        atomic_init(&ring[s].cpu_done_seq, 0ULL);
+    }
 
     const int K = 128;
     uint16_t act_bf16[16 * 128];
@@ -301,11 +466,11 @@ int main(void) {
     for (int m = 0; m < 16; ++m) {
         for (int r = 0; r < 16; ++r) {
             float ref = 0.0f;
-            float sc = bf16_bits_to_fp32(scales_bf16[r]);
+            float sc = bf16_to_fp32_amx_ftz(scales_bf16[r]);
             for (int k = 0; k < K; ++k) {
                 uint32_t mask = w_1bit[(k >> 5) * 16 + r];
                 float w_val = ((mask >> (k & 31)) & 1U) ? sc : -sc;
-                float a_val = bf16_bits_to_fp32(act_bf16[m * K + k]);
+                float a_val = bf16_to_fp32_amx_ftz(act_bf16[m * K + k]);
                 ref += a_val * w_val;
             }
             if (fabsf(acc_fp32[m * 16 + r] - ref) > 1e-4f) {
@@ -314,20 +479,132 @@ int main(void) {
         }
     }
 
-    atomic_store_explicit(&ring[0].cpu_done_seq, 1ULL, memory_order_release);
-    uint64_t delta_q = atomic_load(&ring[0].gpu_ready_seq) - atomic_load(&ring[0].cpu_done_seq);
-    printf("[1] HeteroMoERingSlot Size & Alignment : %zu Bytes (Producer@%zu, Consumer@%zu)\n",
+    // Test 3 (O10): Intel AMX TDPBF16PS BF16 subnormal input flush-to-zero verification
+    uint16_t subnormal_act[16 * 128];
+    float subnormal_acc[16 * 16];
+    for (int i = 0; i < 16 * K; ++i) {
+        // 0x0001 and 0x807F are non-zero BF16 subnormals (exponent == 0, mantissa != 0)
+        subnormal_act[i] = (i & 1) ? 0x807FU : 0x0001U;
+    }
+    amx_gemm_1bit_expert_tile(subnormal_acc, subnormal_act, w_1bit, scales_bf16, K);
+    int ftz_errors = 0;
+    for (int i = 0; i < 16 * 16; ++i) {
+        if (subnormal_acc[i] != 0.0f) {
+            ftz_errors++;
+        }
+    }
+
+    // Test 4 (O10): Concurrent OS Worker Thread SPSC Ring Producer-Consumer Verification (8 dispatches over 2 slots)
+    const uint64_t total_dispatches = 8ULL;
+    ChorusAmxWorkerContext ctx;
+    ctx.ring = ring;
+    ctx.num_slots = num_slots;
+    ctx.w_1bit = w_1bit;
+    ctx.scales_bf16 = scales_bf16;
+    ctx.target_dispatches = total_dispatches;
+    atomic_init(&ctx.completed_dispatches, 0ULL);
+    atomic_init(&ctx.stop_requested, 0);
+
+#if defined(_WIN32)
+    uintptr_t th = _beginthreadex(NULL, 0, chorus_amx_win32_thread_entry, &ctx, 0, NULL);
+    assert(th != 0);
+#elif defined(__linux__)
+    pthread_t th;
+    int rc = pthread_create(&th, NULL, chorus_amx_posix_thread_entry, &ctx);
+    assert(rc == 0);
+#endif
+
+    // Pipelined producer loop: keeps up to `num_slots` dispatches in flight concurrently with the OS consumer thread.
+    // Before reusing a slot at `seq > num_slots`, waits for `cpu_done_seq >= prev_seq` and verifies `prev_seq`'s output.
+    int ring_thread_errors = 0;
+    for (uint64_t seq = 1; seq <= total_dispatches; ++seq) {
+        const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)num_slots);
+        HeteroMoERingSlot* slot = &ring[slot_idx];
+
+        if (seq > (uint64_t)num_slots) {
+            const uint64_t prev_seq = seq - (uint64_t)num_slots;
+            while (atomic_load_explicit(&slot->cpu_done_seq, memory_order_acquire) < prev_seq) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+            const float prev_gate_scale = 0.125f * (float)prev_seq;
+            for (int m = 0; m < 16; ++m) {
+                for (int r = 0; r < 16; ++r) {
+                    uint16_t expected_bf16 = fp32_to_bf16_rne(acc_fp32[m * 16 + r] * prev_gate_scale);
+                    if (slot->output_hidden_bf16[m * 16 + r] != expected_bf16) {
+                        ring_thread_errors++;
+                    }
+                }
+            }
+        }
+
+        slot->num_tokens = 16U;
+        slot->hidden_dim = (uint32_t)K;
+        const float gate_scale = 0.125f * (float)seq;
+        for (int m = 0; m < 16; ++m) {
+            slot->expert_ids[m][0] = (uint32_t)(seq & 7ULL);
+            slot->expert_weights[m][0] = gate_scale;
+        }
+        memcpy(slot->input_hidden_bf16, act_bf16, sizeof(act_bf16));
+
+        // Publish slot to consumer worker thread
+        atomic_store_explicit(&slot->gpu_ready_seq, seq, memory_order_release);
+    }
+
+#if !defined(_WIN32) && !defined(__linux__)
+    chorus_amx_worker_loop(&ctx);
+#endif
+
+    // Drain and verify the final `num_slots` in-flight dispatches
+    for (uint64_t seq = total_dispatches - (uint64_t)num_slots + 1ULL; seq <= total_dispatches; ++seq) {
+        const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)num_slots);
+        HeteroMoERingSlot* slot = &ring[slot_idx];
+        while (atomic_load_explicit(&slot->cpu_done_seq, memory_order_acquire) < seq) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        const float gate_scale = 0.125f * (float)seq;
+        for (int m = 0; m < 16; ++m) {
+            for (int r = 0; r < 16; ++r) {
+                uint16_t expected_bf16 = fp32_to_bf16_rne(acc_fp32[m * 16 + r] * gate_scale);
+                if (slot->output_hidden_bf16[m * 16 + r] != expected_bf16) {
+                    ring_thread_errors++;
+                }
+            }
+        }
+    }
+
+#if defined(_WIN32)
+    WaitForSingleObject((HANDLE)th, INFINITE);
+    CloseHandle((HANDLE)th);
+#elif defined(__linux__)
+    pthread_join(th, NULL);
+#endif
+
+    uint64_t final_completed = atomic_load_explicit(&ctx.completed_dispatches, memory_order_acquire);
+    uint64_t last_slot_idx = (total_dispatches - 1ULL) % (uint64_t)num_slots;
+    uint64_t delta_q = atomic_load(&ring[last_slot_idx].gpu_ready_seq) - atomic_load(&ring[last_slot_idx].cpu_done_seq);
+
+    printf("[1] HeteroMoERingSlot Size & Alignment : %zu Bytes (Producer@%zu, Consumer@%zu, PageLocked=%u)\n",
            sizeof(HeteroMoERingSlot),
            offsetof(HeteroMoERingSlot, gpu_ready_seq),
-           offsetof(HeteroMoERingSlot, cpu_done_seq));
-    printf("[2] AMX 16x16x32 Uniform & VNNI Tests  : Uniform Err=%d | Non-Uniform VNNI Err=%d\n",
-           errors, vnni_errors);
-    printf("[3] Post-Execution Ring Queue Delta_Q  : %llu\n", (unsigned long long)delta_q);
-    assert(errors == 0 && vnni_errors == 0 && delta_q == 0ULL);
+           offsetof(HeteroMoERingSlot, cpu_done_seq),
+           (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) ? 1U : 0U);
+    printf("[2] AMX 16x16x32 VNNI & TDPBF16PS FTZ  : Uniform Err=%d | VNNI Err=%d | Denormal FTZ Err=%d\n",
+           errors, vnni_errors, ftz_errors);
+    printf("[3] Multi-Threaded SPSC Ring Worker    : Completed=%llu/%llu | Payload Err=%d | Final Delta_Q=%llu\n",
+           (unsigned long long)final_completed,
+           (unsigned long long)total_dispatches,
+           ring_thread_errors,
+           (unsigned long long)delta_q);
+    assert(errors == 0 && vnni_errors == 0 && ftz_errors == 0);
+    assert(final_completed == total_dispatches && ring_thread_errors == 0 && delta_q == 0ULL);
 
     amx_release_tiles();
     free_pinned_1gb_ring(ring);
-    printf("[+] PASS: Zero-Copy HugePage Ring and AVX-512/AMX VNNI [K/2, N, 2] MoE worker verified.\n");
+    printf("[+] PASS: Zero-Copy HugePage Ring, TDPBF16PS FTZ, and Async Multi-Threaded AMX MoE worker verified.\n");
     return 0;
 }
 #endif

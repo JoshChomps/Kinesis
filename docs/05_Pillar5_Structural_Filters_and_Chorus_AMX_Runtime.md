@@ -5,11 +5,12 @@
 Linear layers satisfy rotational invariance $Y = X W^\top = (X R)(W R)^\top$ for any orthogonal matrix $R \in \mathcal{O}(d)$ ($R^\top R = I$). By inserting four orthogonal rotations across the Transformer block, channel outliers ($\text{Kurtosis }\kappa \gg 3$) are flattened into a near-Gaussian distribution ($\kappa \approx 3$) prior to 1-bit (Binary g128) or ternary (BitNet b1.58) quantization:
 
 1. **$R_1 \in \mathcal{O}(d_{\text{model}})$ (Residual Stream Rotation, Offline Merged, Zero Runtime Cost):**
-   - Optimized on the Stiefel manifold via Cayley SGD in [`fused_w1_hadacore/spinquant_packer.py`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/fused_w1_hadacore/spinquant_packer.py):
-     $$Y_t = G_t R_t^\top - R_t G_t^\top, \qquad R_{t+1} = \left(I - \frac{\eta}{2} Y_t\right)^{-1}\left(I + \frac{\eta}{2} Y_t\right) R_t$$
-   - Absorbed offline into $W_{\text{emb}}' = W_{\text{emb}} R_1$, $W_{Q,K,V}' = W_{Q,K,V} R_1^\top$, $W_{\text{gate, up}}' = W_{\text{gate, up}} R_1^\top$, $W_O' = R_1^\top W_O$, and $W_{\text{down}}' = R_1^\top W_{\text{down}}$.
+   - Optimized on the Stiefel manifold via Riemannian Cayley SGD (`F13`) in [`fused_w1_hadacore/spinquant_packer.py`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/fused_w1_hadacore/spinquant_packer.py):
+     $$Y_t = G_t R_t^\top - R_t G_t^\top, \qquad R_{t+1} = \left(I + \frac{\eta}{2} Y_t\right)^{-1}\left(I - \frac{\eta}{2} Y_t\right) R_t$$
+   - Or factorized as a Kronecker-Stiefel rotation $R_{\text{kron}} = R_P \otimes H_{16} = (R_P \otimes I_{16})(I_P \otimes H_{16})$, where $(R_P^\top \otimes I_{16})$ is absorbed offline into the preceding projection ($W_O' = (R_P^\top \otimes I_{16}) W_O$) and $(I_P \otimes H_{16})$ executes online in the kernel's `mode=1` HadaCore register prologue.
+   - Absorbed offline into $W_{\text{emb}}' = W_{\text{emb}} R_1$, $W_{Q,K,V}' = W_{Q,K,V} R_1$, $W_{\text{gate, up}}' = W_{\text{gate, up}} R_1$, $W_O' = R_1^\top W_O$, and $W_{\text{down}}' = R_1^\top W_{\text{down}}$.
 2. **$R_2 \in \mathcal{O}(d_{\text{head}})$ (Per-Head Value-Output Rotation, Offline Merged, Zero Runtime Cost):**
-   - Absorbed offline across attention heads via $W_V^{(h)\prime} = R_2^\top W_V^{(h)} R_1^\top$ and $W_O^{(h)\prime} = R_1^\top W_O^{(h)} (I_H \otimes R_2)$.
+   - Absorbed offline across attention heads via $W_V^{(h)\prime} = R_2^\top W_V^{(h)} R_1$ and $W_O^{(h)\prime} = R_1^\top W_O^{(h)} (I_H \otimes R_2)$.
 3. **$R_3 \in \mathcal{O}(d_{\text{head}})$ (Online Post-RoPE Query/Key Hadamard Rotation):**
    - Applied online via block-diagonal $H_{16}$ to Queries and Keys after RoPE ($\widetilde{Q} = \text{RoPE}(Q)\mathcal{H}, \; \widetilde{K} = \text{RoPE}(K)\mathcal{H}$) to smooth KV-cache outliers before INT4 quantization.
 4. **$R_4 \in \mathcal{O}(d_{\text{ffn}})$ (Online MLP Down-Projection Input Hadamard Rotation):**
@@ -17,19 +18,19 @@ Linear layers satisfy rotational invariance $Y = X W^\top = (X R)(W R)^\top$ for
 
 ---
 
-## 2. Column-Major Subspace Energy Sieve (`Tiled-CBC`) & LServe Sparse KV Attention
+## 2. Row-Max Holder Subspace Energy Sieve (`Tiled-CBC`) & LServe Sparse KV Attention
 
 ### A. Tiled-CBC Dynamic Subspace Gate ([`structural_filters/tiled_cbc_sieve.cu`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/structural_filters/tiled_cbc_sieve.cu))
 - During the HadaCore register prologue, each warp holds the rotated activation slice $\widetilde{X}_{M_{\text{tile}}, 128}$ in `bf162` registers.
-- Each thread strips the sign bits via bitwise AND with `0x7FFF7FFFU` (`bf162_abs_sum_f32`) and executes a 5-step butterfly reduction (`__shfl_xor_sync(0xFFFFFFFFU, thread_l1, offset)` for `offset = 16, 8, 4, 2, 1`) to compute the normalized tile L1 energy $E_k$.
-- A single hardware warp vote `__ballot_sync(0xFFFFFFFFU, E_k > tau_sieve)` predicates the `BLOCK_K = 128` step, skipping both the `cp.async.cg.shared.global` GDDR6X weight fetch and all eight `mma.sync.aligned.m16n8k16` instructions when the ballot returns zero (pruning $40\%$ to $65\%$ of DRAM weight reads dynamically).
+- Each thread strips the sign bits via bitwise AND with `0x7FFF7FFFU` (`bf162_abs_sum_f32`) and executes a 2-phase butterfly reduction (`warp_reduce_rowmax_l1_k32`: `__shfl_xor_sync` sums across the 4 lanes of each row `offset = 1, 2` followed by `__shfl_xor_sync` maxima across the 8 row groups `offset = 4, 8, 16`) to compute the exact worst-case row-maximum L1 energy (`O9`).
+- A single hardware warp vote `__ballot_sync(0xFFFFFFFFU, E_k > tau_sieve)` (or per-$K=32$ sub-tile Holder bound $\max_m \|A_{m, k32}\|_1 \cdot \alpha_{\max} > \tau_{\text{sub}}$) predicates the `BLOCK_K = 128` step, skipping both the `cp.async.cg.shared.global` GDDR6X weight fetch and the `mma.sync.aligned.m16n8k16` instructions when the ballot returns zero (defaulting to exact $\tau = 0$, `O8`).
 
 ### B. LServe Unified Static + Dynamic Sparse 4-Bit Hadamard KV Attention ([`structural_filters/lserve_sparse_attn.py`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/structural_filters/lserve_sparse_attn.py))
-- Partitions attention heads into **Static Streaming Heads** (attending to $\Lambda$ initial sink pages + $W_{\text{local}}$ local sliding window pages in $O(1)$ time) and **Dynamic Retrieval Heads**.
+- Partitions attention heads into **Static Streaming Heads** (attending to $\Lambda$ initial sink pages + $W_{\text{local}}$ local sliding window pages in $O(1)$ time, selected by offline out-of-window vs. in-window salience profiling `profile_streaming_head_mask`, `F15`) and **Dynamic Retrieval Heads**.
 - Groups KV tokens into 64-token pages, rotates $K, V$ via block-diagonal $H_{16}$, stores per-page channel-wise bounding vectors $(k^{\min}_p, k^{\max}_p) \in \mathbb{R}^D$, and quantizes $K, V$ to symmetric INT4 ($4.25\text{ bits/element}$ including per-token BF16 scale).
-- **Q-Muxing Centroid Scoring:** Multiplexes query blocks into a centroid $\bar{q} = \frac{1}{S_q}\sum_{i=1}^{S_q} \widetilde{Q}_i$ and evaluates the upper-bound inner product against page $p$:
-  $$\text{Score}(\bar{q}, p) = \sum_{d=1}^{D} \max\left( \bar{q}_d \cdot k^{\min}_{p, d}, \; \bar{q}_d \cdot k^{\max}_{p, d} \right)$$
-  Selecting only the top-$K_{\text{dyn}}$ retrieval pages plus static sink/local pages yields a $10.04\times$ effective KV bandwidth gain and eliminates the $32.9\%$ prefill throughput drop at 90K context.
+- **Per-Query Convex Upper-Bound Page Scoring (`P1-5`):** Evaluates the worst-case convex upper-bound inner product across all queries $s \in \{1, \dots, S_q\}$ in the query block against page $p$ so opposing-sign queries never cancel out:
+  $$\text{Score}(Q, p) = \max_{1 \le s \le S_q} \sum_{d=1}^{D} \max\left( \widetilde{Q}_{s, d} \cdot k^{\min}_{p, d}, \; \widetilde{Q}_{s, d} \cdot k^{\max}_{p, d} \right)$$
+  Selecting only the top-$K_{\text{dyn}}$ retrieval pages plus static sink/local pages yields a $10.04\times$ modelled KV bandwidth reduction while preserving `0.99313` (`0.99305` at 50% salience-profiled streaming heads) cosine similarity against dense FP32 attention.
 
 ---
 

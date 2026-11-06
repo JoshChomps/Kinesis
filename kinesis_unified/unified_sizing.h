@@ -68,10 +68,10 @@
 #define UHA_CTA_THREADS                  256U        // 8 warps x 32 threads
 #define UHA_CTA_BLOCK_M                  128U
 #define UHA_CTA_BLOCK_N                  256U
-#define UHA_CTA_BLOCK_K                  32U         // 4 stages x (128+256)*32*2B = 98,304 B <= 99,328 B
+#define UHA_CTA_BLOCK_K                  32U         // 4 stages x (128+256)*32*2B = 98,304 B <= 101,376 B (99 KB)
 #define UHA_CTA_PIPELINE_STAGES          4U
 #define UHA_CTA_SMEM_STAGE_BYTES         24576U      // (128 + 256) * 32 * 2 bytes = 24 KB per stage
-#define UHA_CTA_SMEM_4STAGE_BYTES        98304U      // 4 * 24,576 B = 96 KB <= 99,328 B
+#define UHA_CTA_SMEM_4STAGE_BYTES        98304U      // 4 * 24,576 B = 96 KB <= 101,376 B (99 KB)
 
 #define UHA_WARP_TILE_M                  64U         // 4 x m16 slices
 #define UHA_WARP_TILE_N                  64U         // 8 x n8 slices

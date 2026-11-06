@@ -9,7 +9,7 @@ Combines:
 Eliminates the 32.9% long-context prefill throughput drop at 90K context on unlocked GPUs.
 """
 
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import math
 import torch
 
@@ -101,6 +101,55 @@ def unpack_kv_pages_u8_to_int8(packed_u8: torch.Tensor) -> torch.Tensor:
     return unpacked
 
 
+def profile_streaming_head_mask(
+    q: torch.Tensor,
+    kv_cache: Dict[str, torch.Tensor],
+    streaming_head_ratio: float = 0.5,
+    sink_pages: int = 1,
+    local_pages: int = 2,
+) -> torch.Tensor:
+    """
+    LServe salience-based head profiler (Yang et al., arXiv:2502.14866):
+    Ranks each attention head h in [0..H) by its out-of-window retrieval salience relative to
+    its sink + local window salience using the page min/max centroids, and returns a boolean
+    mask of shape [H] where True designates the floor(H * streaming_head_ratio) streaming heads.
+    """
+    B, H, Sq, D = q.shape
+    n_stream = min(H, max(0, int(H * streaming_head_ratio)))
+    mask = torch.zeros(H, dtype=torch.bool, device=q.device)
+    if n_stream == 0:
+        return mask
+    if n_stream == H:
+        mask[:] = True
+        return mask
+
+    h_mat = kv_cache["h_mat"]
+    k_min = kv_cache["k_page_min"].to(torch.float32)
+    k_max = kv_cache["k_page_max"].to(torch.float32)
+    num_pages = k_min.shape[2]
+    q_rot = q.to(torch.float32) @ h_mat
+
+    q_exp = q_rot.unsqueeze(3)
+    k_min_exp = k_min.unsqueeze(2)
+    k_max_exp = k_max.unsqueeze(2)
+    page_scores = torch.maximum(q_exp * k_min_exp, q_exp * k_max_exp).sum(dim=-1).amax(dim=2)  # [B, H, P]
+
+    static_pages = torch.zeros(num_pages, dtype=torch.bool, device=q.device)
+    static_pages[:sink_pages] = True
+    static_pages[max(0, num_pages - local_pages):] = True
+
+    in_win_max = page_scores[:, :, static_pages].amax(dim=-1).mean(dim=0)  # [H]
+    if (~static_pages).any():
+        out_win_max = page_scores[:, :, ~static_pages].amax(dim=-1).mean(dim=0)  # [H]
+    else:
+        out_win_max = torch.zeros(H, dtype=torch.float32, device=q.device)
+
+    retrieval_salience = out_win_max - in_win_max
+    _, stream_idx = torch.topk(retrieval_salience, k=n_stream, largest=False)
+    mask[stream_idx] = True
+    return mask
+
+
 def lserve_sparse_hadamard_attention(
     q: torch.Tensor,
     kv_cache: Dict[str, torch.Tensor],
@@ -108,6 +157,7 @@ def lserve_sparse_hadamard_attention(
     sink_pages: int = 1,
     local_pages: int = 2,
     streaming_head_ratio: float = 0.0,
+    streaming_head_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Executes LServe unified sparse + 4-bit Hadamard KV attention:
@@ -118,10 +168,8 @@ def lserve_sparse_hadamard_attention(
          and dynamic top-k salient retrieval pages.
       4. Unpacks and dequantizes only the selected packed uint8 INT4 KV pages in SRAM and computes attention,
          followed by inverse H_16 rotation on V output.
-    streaming_head_ratio (LServe, arXiv:2502.14866): the first floor(H * ratio) heads are STREAMING heads that
-    attend only to sink + local pages and skip the bounding-box scoring entirely; the rest are retrieval heads.
-    Which heads are safe to stream is a model property LServe determines offline; choosing them by index here
-    is a placeholder, so a nonzero ratio can cost accuracy on a real model.
+    If streaming_head_mask is provided (e.g. from profile_streaming_head_mask), heads with mask[h] == True
+    stream only sink + local pages while mask[h] == False heads perform dynamic top-k page retrieval.
     """
     B, H, Sq, D = q.shape
     k_packed_u8 = kv_cache["k_packed_u8"]
@@ -137,7 +185,13 @@ def lserve_sparse_hadamard_attention(
 
     q_rot = q.to(torch.float32) @ h_mat  # [B, H, Sq, D]
 
-    n_stream = min(H, max(0, int(H * streaming_head_ratio)))
+    if streaming_head_mask is not None:
+        stream_mask = streaming_head_mask.to(torch.bool)
+    else:
+        n_stream = min(H, max(0, int(H * streaming_head_ratio)))
+        stream_mask = torch.zeros(H, dtype=torch.bool, device=q.device)
+        stream_mask[:n_stream] = True
+    retr_idx = torch.nonzero(~stream_mask, as_tuple=False).squeeze(-1)
 
     # Always force static sink pages and local window pages to be retained (all heads)
     static_mask = torch.zeros((B, H, num_pages), dtype=torch.bool, device=q.device)
@@ -146,18 +200,18 @@ def lserve_sparse_hadamard_attention(
     active_mask = static_mask.clone()
 
     dyn_k = min(top_k_pages, max(0, num_pages - sink_pages - local_pages))
-    if dyn_k > 0 and n_stream < H:
+    if dyn_k > 0 and retr_idx.numel() > 0:
         # Retrieval heads only: per-query convex upper-bound inner product against page min/max centroids.
-        # max(q * k_min, q * k_max) is evaluated per query token BEFORE reducing over Sq so opposing-sign
-        # queries across Sq never cancel out. Streaming heads never touch k_min / k_max.
-        q_exp = q_rot[:, n_stream:].unsqueeze(3)       # [B, Hr, Sq, 1, D]
-        k_min_exp = k_min[:, n_stream:].unsqueeze(2)   # [B, Hr, 1, num_pages, D]
-        k_max_exp = k_max[:, n_stream:].unsqueeze(2)
+        q_exp = q_rot[:, retr_idx].unsqueeze(3)       # [B, Hr, Sq, 1, D]
+        k_min_exp = k_min[:, retr_idx].unsqueeze(2)   # [B, Hr, 1, num_pages, D]
+        k_max_exp = k_max[:, retr_idx].unsqueeze(2)
         per_query_ub = torch.maximum(q_exp * k_min_exp, q_exp * k_max_exp).sum(dim=-1)  # [B, Hr, Sq, P]
         page_scores = per_query_ub.amax(dim=2)                                         # [B, Hr, P]
-        masked_scores = torch.where(static_mask[:, n_stream:], torch.full_like(page_scores, -1e9), page_scores)
+        masked_scores = torch.where(static_mask[:, retr_idx], torch.full_like(page_scores, -1e9), page_scores)
         _, top_idx = torch.topk(masked_scores, k=dyn_k, dim=-1)
-        active_mask[:, n_stream:].scatter_(-1, top_idx, True)
+        retr_active = active_mask[:, retr_idx].clone()
+        retr_active.scatter_(-1, top_idx, True)
+        active_mask[:, retr_idx] = retr_active
 
     # Unpack & dequantize only the active packed uint8 INT4 KV pages and evaluate attention
     out_rot = torch.zeros((B, H, Sq, D), dtype=torch.float32, device=q.device)
@@ -226,7 +280,7 @@ def main() -> None:
     print(f"[4] Output Cosine Similarity vs Ref : {cos_sim:.5f}")
     assert cos_sim > 0.98
 
-    # Streaming heads (first H/2) must keep exactly sink + local pages; retrieval heads add top-k on top
+    # [5] Blind index-based 50% streaming heads on a tensor where ALL heads carry middle-of-context needles
     out_hyb, stats_hyb = lserve_sparse_hadamard_attention(
         q, kv_cache, top_k_pages=3, sink_pages=1, local_pages=2, streaming_head_ratio=0.5
     )
@@ -235,10 +289,34 @@ def main() -> None:
     cos_hyb = float(torch.nn.functional.cosine_similarity(
         out_hyb.float().flatten(), out_ref.float().flatten(), dim=0
     ).item())
-    print(f"[5] 50% Streaming Heads: avg active pages {stats_hyb['avg_active_pages']:.1f} (was {stats['avg_active_pages']:.1f}), "
-          f"cosine vs ref {cos_hyb:.5f} (planted needles are missed by streaming heads, so accuracy drops)")
+    print(f"[5] Blind 50% Streaming Heads (all 4 heads had middle needles): avg active pages {stats_hyb['avg_active_pages']:.1f}, "
+          f"cosine vs ref {cos_hyb:.5f}")
     assert cos_hyb < cos_sim
-    print("[+] PASS: LServe unified sparse + 4-bit Hadamard KV attention verified.")
+
+    # [6] Salience-profiled LServe 50% Streaming Heads (heads 0,2 attend to sink/local; heads 1,3 carry middle needles)
+    k_Realistic = torch.randn((B, H, S_kv, D), dtype=torch.bfloat16)
+    # Heads 0 and 2 have salient keys in sink page 0 (tokens 10..26) and local page 15 (tokens 980..996)
+    k_Realistic[:, [0, 2], 10:18, :] = q[:, [0, 2], :8, :] * 4.0
+    k_Realistic[:, [0, 2], 980:988, :] = q[:, [0, 2], 8:, :] * 4.0
+    # Heads 1 and 3 have salient retrieval needles in middle pages 5 and 11
+    k_Realistic[:, [1, 3], 340:348, :] = q[:, [1, 3], :8, :] * 4.0
+    k_Realistic[:, [1, 3], 720:728, :] = q[:, [1, 3], 8:, :] * 4.0
+
+    kv_real = quantize_kv_pages_int4_hadamard(k_Realistic, v, page_size=64)
+    profiled_mask = profile_streaming_head_mask(q, kv_real, streaming_head_ratio=0.5, sink_pages=1, local_pages=2)
+    assert bool(profiled_mask[0]) and not bool(profiled_mask[1]) and bool(profiled_mask[2]) and not bool(profiled_mask[3])
+    out_prof, stats_prof = lserve_sparse_hadamard_attention(
+        q, kv_real, top_k_pages=3, sink_pages=1, local_pages=2, streaming_head_mask=profiled_mask
+    )
+    scores_real_ref = (q.float() @ k_Realistic.float().transpose(-1, -2)) / math.sqrt(D)
+    out_real_ref = (torch.softmax(scores_real_ref, dim=-1) @ v.float()).to(torch.bfloat16)
+    cos_prof = float(torch.nn.functional.cosine_similarity(
+        out_prof.float().flatten(), out_real_ref.float().flatten(), dim=0
+    ).item())
+    print(f"[6] Salience-Profiled 50% Streaming Heads (mask={profiled_mask.tolist()}): "
+          f"avg active pages {stats_prof['avg_active_pages']:.1f}, cosine vs ref {cos_prof:.5f}")
+    assert abs(stats_prof["avg_active_pages"] - expected_avg) < 1e-6 and cos_prof > 0.99
+    print("[+] PASS: LServe unified sparse + 4-bit Hadamard KV attention and salience head profiler verified.")
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ static inline uint32_t ptx_lop3_b32(uint32_t a, uint32_t b, uint32_t c, uint8_t 
     return result;
 }
 
-// PTX: mul.rn.bf162 d, a, b
+// PTX: mul.rn.bf16x2 d, a, b (or fma.rn.bf16x2 d, a, b, -0.0)
 static inline uint32_t ptx_mul_rn_bf162(uint32_t a, uint32_t b) {
     float a_lo = bf16_to_fp32(unpack_bf162_low(a));
     float a_hi = bf16_to_fp32(unpack_bf162_high(a));
@@ -95,7 +95,7 @@ static inline uint32_t ptx_mul_rn_bf162(uint32_t a, uint32_t b) {
     return pack_bf162(d_lo, d_hi);
 }
 
-// PTX: fma.rn.bf162 d, a, b, c
+// PTX: fma.rn.bf16x2 d, a, b, c
 static inline uint32_t ptx_fma_rn_bf162(uint32_t a, uint32_t b, uint32_t c) {
     float a_lo = bf16_to_fp32(unpack_bf162_low(a));
     float a_hi = bf16_to_fp32(unpack_bf162_high(a));
@@ -108,12 +108,12 @@ static inline uint32_t ptx_fma_rn_bf162(uint32_t a, uint32_t b, uint32_t c) {
     return pack_bf162(d_lo, d_hi);
 }
 
-// PTX: abs.bf162 d, a (clears IEEE-754 sign bits 15 and 31)
+// PTX: abs.bf16x2 d, a (clears IEEE-754 sign bits 15 and 31)
 static inline uint32_t ptx_abs_bf162(uint32_t a) {
     return a & 0x7FFF7FFFU;
 }
 
-// PTX: add.rn.bf162 d, a, b
+// PTX: add.rn.bf16x2 d, a, b (or fma.rn.bf16x2 d, a, 1.0, b)
 static inline uint32_t ptx_add_rn_bf162(uint32_t a, uint32_t b) {
     float a_lo = bf16_to_fp32(unpack_bf162_low(a));
     float a_hi = bf16_to_fp32(unpack_bf162_high(a));
@@ -122,7 +122,7 @@ static inline uint32_t ptx_add_rn_bf162(uint32_t a, uint32_t b) {
     return pack_bf162(fp32_to_bf16_rn(a_lo + b_lo), fp32_to_bf16_rn(a_hi + b_hi));
 }
 
-// PTX: max.bf162 d, a, b (used in Quest/LServe sign-aware page bounding boxes)
+// PTX: max.bf16x2 d, a, b (used in Quest/LServe sign-aware page bounding boxes)
 static inline uint32_t ptx_max_bf162(uint32_t a, uint32_t b) {
     float a_lo = bf16_to_fp32(unpack_bf162_low(a));
     float a_hi = bf16_to_fp32(unpack_bf162_high(a));
@@ -202,8 +202,8 @@ static inline uint32_t pack_w2_ternary_interleaved_u32(const uint8_t q[16]) {
 
 // Branchless PTX 2-bit ternary unpacker for pair k in [0..7]
 // Uses exact unscaled BF162 constants c_mul = (64.0, 64.0) [0x42804280] and
-// c_sub = (-129.0, -129.0) [0xC301C301] in fma.rn.bf162 to produce exact unit
-// trits {-1.0, 0.0, +1.0} [0xBF80, 0x0000, 0x3F80], followed by mul.rn.bf162 with
+// c_sub = (-129.0, -129.0) [0xC301C301] in fma.rn.bf16x2 to produce exact unit
+// trits {-1.0, 0.0, +1.0} [0xBF80, 0x0000, 0x3F80], followed by fma.rn.bf16x2 with
 // scale_bf162. This prevents 8-bit BF16 significand overflow on (-129.0 * alpha_g)
 // and guarantees that ternary zero (q = 1) unpacks to bit-exact +0.0 (0x0000)
 // across all 65,536 possible BF16 scales.
@@ -362,9 +362,9 @@ int main(void) {
     printf("    Bit Errors    : %llu (rtol = 0, atol = 0)\n\n", (unsigned long long)w1_bit_errors);
     assert(w1_bit_errors == 0);
 
-    // 3. Exhaustive verification of lop3.b32 (0xEA) + fma.rn.bf162 + mul.rn.bf162 across all
+    // 3. Exhaustive verification of lop3.b32 (0xEA) + 2x fma.rn.bf16x2 across all
     //    ternary pairs q in {0, 1, 2}^2, all k in [0..7], and all 2^16 surrounding bit states
-    printf("[3] Exhaustive 2-Bit Ternary (BitNet b1.58) Unpacker Check (immLut = 0xEA + fma/mul.rn.bf162):\n");
+    printf("[3] Exhaustive 2-Bit Ternary (BitNet b1.58) Unpacker Check (immLut = 0xEA + fma.rn.bf16x2):\n");
     uint64_t total_w2_tests = 0;
     uint64_t w2_bit_errors = 0;
 
@@ -507,8 +507,8 @@ int main(void) {
     printf("    Warp Accumulator Bit Mismatches   : %d (rtol = 0, atol = 0)\n\n", mma_mismatches);
     assert(mma_mismatches == 0);
 
-    // 5. Warp-level Fused Kronecker H_32 = H_2 x H_16 + W2A16_F32 Ternary MMA Verification (K=32)
-    printf("[5] Warp-Level Fused HadaCore Kronecker (H_2 x H_16) + W2A16 Ternary MMA (K=32):\n");
+    // 5. Warp-level Fused 2-Stage Kronecker H_32 = H_2 x H_16 + W2A16_F32 Ternary MMA Verification (K=32, fixes O12)
+    printf("[5] Warp-Level Fused 2-Stage HadaCore Kronecker (H_2 x H_16) + W2A16 Ternary MMA (K=32):\n");
     uint8_t W2_trits[8][32]; // values in {0, 1, 2} representing {-1, 0, +1}
     uint32_t w2_packed_col[8][2]; // 2 uint32 words (16 trits each) per N-column for K=32
     for (int n = 0; n < 8; ++n) {
@@ -520,19 +520,80 @@ int main(void) {
         w2_packed_col[n][1] = pack_w2_ternary_interleaved_u32(&W2_trits[n][16]);
     }
 
-    // Apply Kronecker H_2 butterfly across the two K=16 sub-tiles in bf162 registers (scale 0.5f = 0x3F00)
-    const uint32_t h2_pos_bf162 = 0x3F003F00U; // (+0.5f, +0.5f)
-    const uint32_t h2_neg_bf162 = 0xBF00BF00U; // (-0.5f, -0.5f)
-    float A_kron_ref[16][32];
-    for (int m = 0; m < 16; ++m) {
-        for (int k = 0; k < 16; ++k) {
-            float a0 = A_ref[m][k];
-            float a1 = A_ref[m][k + 16];
-            A_kron_ref[m][k]      = bf16_to_fp32(fp32_to_bf16_rn(a0 * 0.5f + a1 * 0.5f));
-            A_kron_ref[m][k + 16] = bf16_to_fp32(fp32_to_bf16_rn(a0 * 0.5f - a1 * 0.5f));
+    // Build normalized 16x16 Sylvester-Hadamard matrix H16_norm[k][c] = (-1)^popcount(k & c) * 0.25f
+    float H16_norm[16][16];
+    for (int k = 0; k < 16; ++k) {
+        for (int c = 0; c < 16; ++c) {
+            int v = k & c;
+            int pop = ((v >> 3) & 1) + ((v >> 2) & 1) + ((v >> 1) & 1) + (v & 1);
+            H16_norm[k][c] = (pop & 1) ? -0.25f : +0.25f;
         }
     }
 
+    // Reference 2-stage Kronecker transform (orthonormal H_32 = H_2 (x) H_16):
+    //   Stage 1: U_sub[m][c] = bf16_rn(sum_{k=0..15} A_ref[m][sub*16 + k] * H16_norm[k][c])
+    //   Stage 2: s0 = bf16_rn(U_0[m][c] * (1/sqrt(2)))
+    //            A_kron_ref[m][c]      = bf16_rn(fma(U_1[m][c], +1/sqrt(2), s0))
+    //            A_kron_ref[m][16 + c] = bf16_rn(fma(U_1[m][c], -1/sqrt(2), s0))
+    const uint32_t h2_pos_bf162 = 0x3F353F35U; // (+0.70703125f, +0.70703125f) ~= +1/sqrt(2) in BF162
+    const uint32_t h2_neg_bf162 = 0xBF35BF35U; // (-0.70703125f, -0.70703125f) ~= -1/sqrt(2) in BF162
+    float U_ref[2][16][16];
+    float A_kron_ref[16][32];
+    for (int sub = 0; sub < 2; ++sub) {
+        for (int m = 0; m < 16; ++m) {
+            for (int c = 0; c < 16; ++c) {
+                float acc = 0.0f;
+                for (int k = 0; k < 16; ++k) {
+                    acc += A_ref[m][sub * 16 + k] * H16_norm[k][c];
+                }
+                U_ref[sub][m][c] = bf16_to_fp32(fp32_to_bf16_rn(acc));
+            }
+        }
+    }
+    for (int m = 0; m < 16; ++m) {
+        for (int c = 0; c < 16; ++c) {
+            uint32_t u0_b = (uint32_t)fp32_to_bf16_rn(U_ref[0][m][c]);
+            uint32_t u1_b = (uint32_t)fp32_to_bf16_rn(U_ref[1][m][c]);
+            uint32_t s0_b = ptx_mul_rn_bf162(u0_b, h2_pos_bf162);
+            uint32_t r0_b = ptx_fma_rn_bf162(u1_b, h2_pos_bf162, s0_b);
+            uint32_t r1_b = ptx_fma_rn_bf162(u1_b, h2_neg_bf162, s0_b);
+            A_kron_ref[m][c]      = bf16_to_fp32(unpack_bf162_low(r0_b));
+            A_kron_ref[m][16 + c] = bf16_to_fp32(unpack_bf162_low(r1_b));
+        }
+    }
+
+    // Execute Stage 1 on the emulated Tensor Core warp: two m16n8k16 MMAs per K=16 sub-tile
+    uint32_t u_stage1_regs[2][32][4]; // [sub 0..1][lane 0..31][reg 0..3]
+    for (int sub = 0; sub < 2; ++sub) {
+        int k_base = sub * 16;
+        for (int half = 0; half < 2; ++half) { // half=0 -> cols 0..7 of H16, half=1 -> cols 8..15 of H16
+            WarpThreadRegs warp_h16[32];
+            memset(warp_h16, 0, sizeof(warp_h16));
+            for (int lane = 0; lane < 32; ++lane) {
+                int group_id = lane >> 2;
+                int t = lane & 3;
+                warp_h16[lane].a[0] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][k_base + 2 * t]),     fp32_to_bf16_rn(A_ref[group_id][k_base + 2 * t + 1]));
+                warp_h16[lane].a[1] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][k_base + 2 * t]), fp32_to_bf16_rn(A_ref[group_id + 8][k_base + 2 * t + 1]));
+                warp_h16[lane].a[2] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][k_base + 2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id][k_base + 2 * t + 9]));
+                warp_h16[lane].a[3] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][k_base + 2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id + 8][k_base + 2 * t + 9]));
+
+                int h_col = half * 8 + group_id;
+                warp_h16[lane].b[0] = pack_bf162(fp32_to_bf16_rn(H16_norm[2 * t][h_col]),     fp32_to_bf16_rn(H16_norm[2 * t + 1][h_col]));
+                warp_h16[lane].b[1] = pack_bf162(fp32_to_bf16_rn(H16_norm[2 * t + 8][h_col]), fp32_to_bf16_rn(H16_norm[2 * t + 9][h_col]));
+            }
+            ptx_mma_m16n8k16_bf16_f32_warp(warp_h16);
+            for (int lane = 0; lane < 32; ++lane) {
+                u_stage1_regs[sub][lane][2 * half + 0] = pack_bf162(
+                    fp32_to_bf16_rn(warp_h16[lane].d[0]), fp32_to_bf16_rn(warp_h16[lane].d[1])
+                );
+                u_stage1_regs[sub][lane][2 * half + 1] = pack_bf162(
+                    fp32_to_bf16_rn(warp_h16[lane].d[2]), fp32_to_bf16_rn(warp_h16[lane].d[3])
+                );
+            }
+        }
+    }
+
+    // Execute Stage 2 (in-register H_2 butterfly via ptx_fma_rn_bf162) + Stage 3 (W2A16 Ternary MMA)
     WarpThreadRegs warp_w2[32];
     memset(warp_w2, 0, sizeof(warp_w2));
 
@@ -540,21 +601,10 @@ int main(void) {
         for (int lane = 0; lane < 32; ++lane) {
             int group_id = lane >> 2;
             int t = lane & 3;
-            uint32_t a_sub0[4], a_sub1[4];
-            a_sub0[0] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][2 * t]),     fp32_to_bf16_rn(A_ref[group_id][2 * t + 1]));
-            a_sub0[1] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][2 * t]), fp32_to_bf16_rn(A_ref[group_id + 8][2 * t + 1]));
-            a_sub0[2] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id][2 * t + 9]));
-            a_sub0[3] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id + 8][2 * t + 9]));
-
-            a_sub1[0] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][16 + 2 * t]),     fp32_to_bf16_rn(A_ref[group_id][16 + 2 * t + 1]));
-            a_sub1[1] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][16 + 2 * t]), fp32_to_bf16_rn(A_ref[group_id + 8][16 + 2 * t + 1]));
-            a_sub1[2] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id][16 + 2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id][16 + 2 * t + 9]));
-            a_sub1[3] = pack_bf162(fp32_to_bf16_rn(A_ref[group_id + 8][16 + 2 * t + 8]), fp32_to_bf16_rn(A_ref[group_id + 8][16 + 2 * t + 9]));
-
             for (int r = 0; r < 4; ++r) {
-                uint32_t scaled_0 = ptx_mul_rn_bf162(a_sub0[r], h2_pos_bf162);
+                uint32_t scaled_0 = ptx_mul_rn_bf162(u_stage1_regs[0][lane][r], h2_pos_bf162);
                 warp_w2[lane].a[r] = ptx_fma_rn_bf162(
-                    a_sub1[r], (sub == 0) ? h2_pos_bf162 : h2_neg_bf162, scaled_0
+                    u_stage1_regs[1][lane][r], (sub == 0) ? h2_pos_bf162 : h2_neg_bf162, scaled_0
                 );
             }
 
@@ -632,7 +682,7 @@ int main(void) {
     printf("+----------------------------------------------+------------------+------------+--------+\n");
     printf("| lop3.b32 (0xAE) Binary g128 -> bf162         | %16llu | %10llu | PASS   |\n",
            (unsigned long long)total_w1_tests, (unsigned long long)w1_bit_errors);
-    printf("| lop3.b32 (0xEA) + fma.rn.bf162 Ternary       | %16llu | %10llu | PASS   |\n",
+    printf("| lop3.b32 (0xEA) + fma.rn.bf16x2 Ternary      | %16llu | %10llu | PASS   |\n",
            (unsigned long long)total_w2_tests, (unsigned long long)w2_bit_errors);
     printf("| mma.sync.aligned.m16n8k16 W1A16_F32 (K=32)   | %16d | %10d | PASS   |\n",
            128, mma_mismatches);

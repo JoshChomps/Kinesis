@@ -221,11 +221,11 @@ public:
     explicit MemorySandbox(size_t l1CapacityBytes = 32768,
                            size_t lineSizeBytes = 64,
                            size_t associativityWays = 8)
-        : line_size_(lineSizeBytes),
-          ways_(associativityWays),
-          num_sets_(l1CapacityBytes / (lineSizeBytes * associativityWays)),
-          sets_(num_sets_, std::vector<uint64_t>(associativityWays, UINT64_MAX)),
-          lru_age_(num_sets_, std::vector<uint64_t>(associativityWays, 0)) {}
+        : line_size_((lineSizeBytes > 0 && (lineSizeBytes & (lineSizeBytes - 1)) == 0) ? lineSizeBytes : 64),
+          ways_(associativityWays > 0 ? associativityWays : 8),
+          num_sets_(std::max<size_t>(1, l1CapacityBytes / (line_size_ * ways_))),
+          sets_(num_sets_, std::vector<uint64_t>(ways_, UINT64_MAX)),
+          lru_age_(num_sets_, std::vector<uint64_t>(ways_, 0)) {}
 
     void reset() noexcept {
         report_ = CacheSandboxReport{};

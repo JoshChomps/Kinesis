@@ -33,7 +33,7 @@ class HardwareTelemetrySample:
 
     @property
     def delta_q(self) -> int:
-        return self.gpu_ready_seq - self.cpu_done_seq
+        return max(0, self.gpu_ready_seq - self.cpu_done_seq)
 
     @property
     def vram_pressure(self) -> float:
@@ -41,6 +41,8 @@ class HardwareTelemetrySample:
 
     @property
     def clock_sag_fraction(self) -> float:
+        if self.locked_clock_floor_mhz <= 0.0:
+            return 0.0
         return max(0.0, (self.locked_clock_floor_mhz - self.effective_sm_clock_mhz) / self.locked_clock_floor_mhz)
 
 
@@ -87,16 +89,18 @@ class ClosedLoopHardwareGovernor:
 
         # 2. Active Clock-Floor & Power-Brake Governor (polls every 16 layers)
         governor_action = "HOLD"
-        if sample.layer_idx % self.clock_poll_interval_layers == 0:
+        floor_mhz = sample.locked_clock_floor_mhz if sample.locked_clock_floor_mhz > 0.0 else self.locked_clock_floor_mhz
+        sag_frac = max(0.0, (floor_mhz - sample.effective_sm_clock_mhz) / floor_mhz) if floor_mhz > 0.0 else 0.0
+        if sample.layer_idx % self.clock_poll_interval_layers == 0 and floor_mhz > 0.0 and sample.power_cap_watts > 0.0:
             if (
-                sample.clock_sag_fraction > self.clock_sag_threshold
+                sag_frac > self.clock_sag_threshold
                 and sample.board_power_watts >= 0.90 * sample.power_cap_watts
             ):
                 # Power-cap arbitration drooped SM clock by > 2% near TDP: raise tau_sieve by +5%
                 self.tau_sieve = min(self.tau_max, self.tau_sieve * 1.05)
                 governor_action = "RAISE_SIEVE_+5%_SHED_POWER"
             elif (
-                sample.clock_sag_fraction <= 0.01
+                sag_frac <= 0.01
                 and sample.board_power_watts < 0.88 * sample.power_cap_watts
             ):
                 # Ample thermal/power headroom and clock within 1% GPUBoost bin: relax tau_sieve by -2%
@@ -106,7 +110,7 @@ class ClosedLoopHardwareGovernor:
         return {
             "layer_idx": sample.layer_idx,
             "delta_q": sample.delta_q,
-            "clock_sag_pct": sample.clock_sag_fraction * 100.0,
+            "clock_sag_pct": sag_frac * 100.0,
             "execution_target": execution_target,
             "governor_action": governor_action,
             "tau_sieve": self.tau_sieve,

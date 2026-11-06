@@ -1,7 +1,14 @@
+NOTE: DESIGN SKETCH, NOT A VERIFIED PATCH. Never applied to or built against an NVIDIA open-gpu-kernel-modules tree; line offsets and some helper signatures are assumptions. See docs/11_Adversarial_Review_Status_and_Known_Limitations.md (O3 to O7).
 --- a/src/nvidia/src/kernel/gpu/uvm/nv_gpu_ops.c
 +++ b/src/nvidia/src/kernel/gpu/uvm/nv_gpu_ops.c
-@@ -2645,19 +2645,35 @@ nvGpuOpsBuildExternalAllocPtes
-     if ((offset + size) > memdescGetSize(pMemDesc))
+@@ -2645,19 +2645,55 @@ nvGpuOpsBuildExternalAllocPtes
+-    if ((offset + size) > memdescGetSize(pMemDesc))
++    if (!pMappingGpu || !pRemoteGpu || !pMemDesc || !physicalAddresses || !pAperture ||
++        mappingPageSize == 0 || size == 0 || (size % mappingPageSize) != 0)
++        return NV_ERR_INVALID_ARGUMENT;
++
++    NvU64 totalMemSize = memdescGetSize(pMemDesc);
++    if (offset > totalMemSize || size > (totalMemSize - offset))
          return NV_ERR_INVALID_ARGUMENT;
  
 -    *pAperture = GMMU_APERTURE_PEER;
@@ -13,6 +20,8 @@
          kbusGetBar1P2PDmaInfo_HAL(pMappingGpu, pRemoteGpu, GPU_GET_KERNEL_BUS(pRemoteGpu),
                                    &dmaBaseAddress, &dmaSize);
          NvU64 fbPhysOffset = memdescGetPhysAddr(pMemDesc, AT_GPU, offset);
++        if (fbPhysOffset > dmaSize || size > (dmaSize - fbPhysOffset))
++            return NV_ERR_INSUFFICIENT_RESOURCES;
          for (NvU64 i = 0; i < pteCount; i++)
          {
              physicalAddresses[i] = dmaBaseAddress + fbPhysOffset + (i * (NvU64)mappingPageSize);
@@ -21,10 +30,11 @@
      else
      {
 +        // Modded 48GB RTX 4090 path where BAR1 (32GB) < FB (48GB):
-+        // Dynamically map only the active P2P allocation into a free 32GB BAR1 VA slot
++        // Dynamically map only the active P2P allocation into a ref-counted 32GB BAR1 VA slot (F7/O3)
 +        NvU64 dynBar1VirtOffset = 0;
 +        NvU64 mapLen = size;
 +        KernelBus *pRemoteBus = GPU_GET_KERNEL_BUS(pRemoteGpu);
++        pMemDesc->pGpu = pRemoteGpu;
 +        NV_STATUS status = kbusMapFbAperture_HAL(
 +            pRemoteGpu, pRemoteBus, pMemDesc, offset, &dynBar1VirtOffset, &mapLen,
 +            BUS_MAP_FB_FLAGS_MAP_UNICAST | BUS_MAP_FB_FLAGS_PREFER_CONTIGUOUS, NULL
@@ -37,3 +47,15 @@
      }
      return NV_OK;
  }
++
++NV_STATUS nvGpuOpsDestroyExternalAllocPtes(
++    OBJGPU *pRemoteGpu,
++    MEMORY_DESCRIPTOR *pMemDesc,
++    NvU64 offset
++)
++{
++    KernelBus *pRemoteBus = GPU_GET_KERNEL_BUS(pRemoteGpu);
++    if (kbusIsStaticBar1Enabled_HAL(pRemoteGpu, pRemoteBus))
++        return NV_OK;
++    return kbusUnmapFbAperture_HAL(pRemoteGpu, pRemoteBus, pMemDesc, offset);
++}
