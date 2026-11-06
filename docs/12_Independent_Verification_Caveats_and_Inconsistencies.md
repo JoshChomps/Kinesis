@@ -26,6 +26,8 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | H_2 butterfly constant (F18) | `sim_harness/ptx_bf162_emu.c`, `fused_w1_hadacore/w1a16_hadacore_kernel.cu` | `0x3F353F35` = +0.70703125 ~= +1/sqrt(2); `0.25*(1/sqrt(2)) = 1/sqrt(32)` orthonormal H_32 scale | Consistent across both files (see inconsistency 4.2) |
 | Fused STE QAT forward/backward | `qat_galore_engine/fused_qat_ste.py` | `Y = X W_hat^T`, `dX = dY W_hat`, STE `dW = dY^T X`, and the clipped-STE gate `1(|W| <= c*alpha_g)` | Math correct (see caveat 2.4 and observation 3.4) |
 | SPSC ring memory ordering (O10) | `hetero_runtime/chorus_amx_moe.c` | Per-slot sequence handshake: producer release-stores `gpu_ready_seq`, consumer acquire-loads it then release-stores `cpu_done_seq`; slot reuse waits `cpu_done_seq >= seq - num_slots` | Ordering correct; two latent defects on untested paths (see 4.3, 4.4) |
+| LServe sparse + INT4 Hadamard attention (F15) | `structural_filters/lserve_sparse_attn.py` | H_16 cancels in `q_rot k_rot^T = q k^T`; V output un-rotated by `H^T`; per-dim `max(q*k_min, q*k_max)` is the exact box-corner upper bound (admissible page prune); salience = out-window minus in-window | Correct; verified blind 0.70 vs profiled 0.993 (see observation 3.8) |
+| SafeTensors serializer + round-trip (F2) | `kinesis_unified/kinesis_bridge.py` | `[8-byte LE u64 len][space-padded JSON header][contiguous data]`, offsets from data start, 8-byte header alignment | Spec-compliant; independently bit-exact across 5 dtypes + empty (see observation 3.9) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -132,6 +134,26 @@ consumer line" split only holds for the two counters, not for the whole slot hea
 not harmful false sharing because the handshake serializes all access to a given slot (the
 producer and consumer never touch one slot's header concurrently), so this is a framing note,
 not a correctness or measurable-contention issue.
+
+### 3.8 LServe page bound is admissible; its bandwidth stat is modelled
+Two notes on `lserve_sparse_attn.py`. First, the page selection upper bound (per-dim
+`max(q*k_min, q*k_max)`) is computed from the full-precision rotated keys, while the actual
+attention scores the INT4-dequantized keys. The bound is therefore exact for the full-precision
+box but only approximate for the quantized keys, so page selection is a heuristic; it cannot
+corrupt the result because sink and local pages are always retained and the final attention is
+computed on whatever pages are selected. Second, `effective_kv_bw_amplification` is a modelled
+ratio (`(16/4.25) * num_pages / avg_active_pages`), i.e. compression times page sparsity, not a
+measured bandwidth. This is the same class as the O8 relabelling and the stat name should not be
+read as a measurement.
+
+### 3.9 SafeTensors serializer is little-endian only and trusts the header on load
+`save_safetensors_bytes` / `load_safetensors_bytes` copy native byte order with no endianness
+swap, so they are correct only on little-endian hosts (all x86 and ARM-LE targets here). On load,
+tensor slices are taken at the offsets the header states, with no check that the offsets are
+contiguous, non-overlapping, or within bounds beyond the final-size assertion. Both are fine for
+round-tripping the project's own checkpoints (independently verified bit-exact across bf16, int8,
+uint8, int32, fp32, and an empty tensor), but a hardened loader for untrusted files would validate
+offsets and handle endianness.
 
 ## 4. Inconsistencies and latent defects found in this pass
 
