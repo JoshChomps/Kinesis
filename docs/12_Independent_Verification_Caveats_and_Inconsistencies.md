@@ -28,6 +28,7 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | SPSC ring memory ordering (O10) | `hetero_runtime/chorus_amx_moe.c` | Per-slot sequence handshake: producer release-stores `gpu_ready_seq`, consumer acquire-loads it then release-stores `cpu_done_seq`; slot reuse waits `cpu_done_seq >= seq - num_slots` | Ordering correct; two latent defects on untested paths (see 4.3, 4.4) |
 | LServe sparse + INT4 Hadamard attention (F15) | `structural_filters/lserve_sparse_attn.py` | H_16 cancels in `q_rot k_rot^T = q k^T`; V output un-rotated by `H^T`; per-dim `max(q*k_min, q*k_max)` is the exact box-corner upper bound (admissible page prune); salience = out-window minus in-window | Correct; verified blind 0.70 vs profiled 0.993 (see observation 3.8) |
 | SafeTensors serializer + round-trip (F2) | `kinesis_unified/kinesis_bridge.py` | `[8-byte LE u64 len][space-padded JSON header][contiguous data]`, offsets from data start, 8-byte header alignment | Spec-compliant; independently bit-exact across 5 dtypes + empty (see observation 3.9) |
+| C ABI ctypes marshalling (F2/F21) | `kinesis_unified/kinesis_c_abi.cpp` + `kinesis_bridge.py` | every entry point is `try/catch(...)`-guarded (no exception crosses `extern "C"`); correct `argtypes`/`restype`; `.contiguous()` inputs; buffers kept alive across the synchronous call | Correct and verified end-to-end; implicit unbounded size contract (see 4.5) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -202,6 +203,22 @@ passing more than 65535 slots allocates the full buffer but stores a truncated c
 free path computes a smaller byte size and unmaps or unlocks the wrong length (partial unmap
 or leak). The intended 1 GB regime holds roughly 7700 slots, well under the limit, so this is
 latent, but the allocator should reject `num_slots > 0xFFFF` explicitly or widen the tag.
+
+### 4.5 Latent defect: C ABI size contract is implicit and the copies are unbounded
+The `kinesis_c_abi.cpp` entry points take raw output pointers (`out_bits`, `out_scales_bf16`,
+`out_gpu_u32`, ...) with no capacity argument, and `memcpy` into them a length the C++ side
+computes from the panel set (for example `panels.packed_bits.size()`). The reconstruction
+entry points do the mirror image: they `.assign(ptr, ptr + num_panels * K)` from the input
+pointer with no length check. Safety rests entirely on the Python caller in `kinesis_bridge.py`
+allocating buffers whose size formula (`num_panels * K`, `num_panels * groups_per_col * 8`, ...)
+matches the C++ layout exactly. For every tested shape the two formulas agree and suite F2
+round-trips with zero bit errors, so there is no bug today. But the contract is unchecked: a
+caller under-allocation, or any future shape where the Python and C++ size formulas diverge,
+is a silent heap overflow (on output) or out-of-bounds read (on reconstruction) with no guard
+and no diagnostic. Recommend passing output and input capacities across the ABI and bounding
+every `memcpy` / `.assign`, or a two-call size-query pattern (ask for required length, then fill).
+Severity is low for the current in-repo caller, but this is the most dangerous failure mode in
+the bridge because it corrupts memory rather than returning an error code.
 
 ## 5. Open cross-check items (pending a second independent reviewer)
 
