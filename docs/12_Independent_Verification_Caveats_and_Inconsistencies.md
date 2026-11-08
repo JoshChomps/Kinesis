@@ -35,6 +35,7 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | Hardware discovery + swizzle (L5/§2.2) | `kinesis_unified/hardware_and_sandbox.hpp` | CPUID gated by XGETBV OS-save bits (YMM/ZMM/AMX); leaf-4 cache size `ways*partitions*line*sets`; BLIS KC/MC/NC from live cache; `offset ^ ((offset>>3)&0x70)` yields `chunk ^ (r&7)` | Correct; one trivial imprecision (observation 3.12) |
 | 4x8 GotoBLAS FP32 GEMM + W1/W2 packers | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | standard BLIS 5-loop (jc/pc/ic/jr/ir) with 4-accumulator micro-kernel, FP32 accumulation, F21-safe `storeu`; branchless AVX2 sign unpack; zero-group scale 0 (F5/F14); W2 threshold conditional-mean ternary scale; RNE `fp32_to_bf16_bits` with NaN preservation | Correct; no defects |
 | SmartTieredCache error budget (O8/O9/O11) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | exact by default (O8); O9 worst-case bound `bound[g] = max_col|scale| * max_m row-L1`, greedy skip while `sum bound <= eps` guarantees per-output abs error `<= eps`; non-finite rows never skipped; promotion counted once per GEMM, saturating (O11); LFU+LRU eviction only when strictly hotter | Correct and rigorous; no defects (confirms observation 3.6) |
+| Host CTA shim PTX primitives (F17/F18/F19) | `fused_w1_hadacore/w1a16_host_cta_shim.hpp` | `lop3_b32` fast-paths 0xAE/0xEA and the generic bit-LUT, all agreeing; W1/W2 unpack use 64.0=0x4280, -129.0=0xC301, H_2=0x3F35 matching the kernel; `__shfl_xor_sync`/`__ballot_sync` assert on intra-warp divergence | Correct; one theoretical double-rounding note (observation 3.13) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -191,6 +192,15 @@ as unified (type 3), so this never mis-sizes in practice (the F3 bench reads L1D
 L3=24576KB correctly on the dev host). But an instruction-only L2 would be accepted as the data-path
 L2 budget. Harmless today; strictly the L2/L3 branches should accept only type 3 (unified) or type 1
 (data), as the L1D branch already does. No functional impact observed.
+
+### 3.13 Host bf16x2 FMA rounds twice; exact in practice for these operands
+`host_ptx_fma_rn_bf16x2` converts each bf16 lane to f32, calls `fmaf`, then rounds the f32 result
+back to bf16. That is two roundings (into f32, then into bf16), whereas real `fma.rn.bf16x2` rounds
+once directly to bf16. Double rounding can differ from single rounding in adversarial cases. It does
+not here: both operands are bf16 (8-bit significand), so each product is exactly representable in
+f32 (24-bit) and the `fmaf` step introduces no rounding, leaving only the final f32-to-bf16 rounding.
+So the host shim matches hardware `fma.rn.bf16x2` for every value the unpack path produces. Worth
+knowing if the shim is ever reused for general bf16x2 FMAs with wider-significand intermediates.
 
 ## 4. Inconsistencies and latent defects found in this pass
 
