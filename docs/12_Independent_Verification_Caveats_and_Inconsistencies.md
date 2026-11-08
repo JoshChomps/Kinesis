@@ -17,30 +17,30 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 
 | Area | File | What was re-derived | Result |
 | :--- | :--- | :--- | :--- |
-| Cayley-SGD Stiefel step | `fused_w1_hadacore/spinquant_packer.py` | Skew-symmetry of `Y = G R^T - R G^T`; orthogonality of the Cayley transform; the descent identity `<G, Y R> = 0.5*||Y||_F^2 >= 0` expanded via `P = G R^T` | Descent confirmed; the F13 fix is correct |
+| Cayley-SGD Stiefel step | `fused_w1_hadacore/spinquant_packer.py` | Skew-symmetry of `Y = G R^T - R G^T`; orthogonality of the Cayley transform; the descent identity `<G, Y R> = 0.5*||Y||_F^2 >= 0` expanded via `P = G R^T` | Descent confirmed; the F13 fix is correct. Second pass: confirmed, and it is true Riemannian GD with a Cayley retraction (5(a)); test credits Cayley with the Hadamard-init drop (4.16) |
 | W1 binary unpacker (`lop3.b32` 0xAE) | `fused_w1_hadacore/spinquant_packer.py` | `(~a & 0x80008000) | 0x3F803F80` maps sign bit to bf16 +1.0 / -1.0, then `fma(+/-1, scale, -0.0)` | Bit-exact; 0 mismatches on run |
-| W2 ternary unpacker (`lop3.b32` 0xEA) | `fused_w1_hadacore/spinquant_packer.py` | `bf16(0x4000+q)` then `inj*64 - 129` gives -1 / 0 / +1 with a single exact fma rounding; q=1 yields exactly 0.0 for any scale | Zero-preserving property holds; 0 mismatches |
-| Driver BAR1 lifetime (F7 class) | `kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c` | No two live (refCount>0) mappings can share a BAR1 VA window; VA reclaimed only at refCount 0; double-unmap rejected | Invariant holds (see caveat 2.1) |
-| GaLore moment reprojection (F20/O14) | `qat_galore_engine/galore_async_offload.py` | `M_new = (P_new^T P_old) M_old`; `V_new = (rot*rot) @ V_old` from `E[(rot@g)_i^2]`; QR sign fix `q * sign(diag(R))` | Correct (see caveat 3.1 on V) |
-| Tiled-CBC row-max Holder sieve (O9) | `structural_filters/tiled_cbc_sieve.py` | `e_k = max_m mean_k(|X[m,tile]|)` is worst-case over rows; by Holder `|sum X W| <= ||X[m,tile]||_1 * max_k|W|`; single loud row keeps its tile | Correct (see observation 3.6) |
+| W2 ternary unpacker (`lop3.b32` 0xEA) | `fused_w1_hadacore/spinquant_packer.py` | `bf16(0x4000+q)` then `inj*64 - 129` gives -1 / 0 / +1 with a single exact fma rounding; q=1 yields exactly 0.0 for any non-negative finite scale | Zero-preserving property holds; 0 mismatches. Second pass: negative scales give -0.0 and Inf/NaN give NaN (absmean never yields these) |
+| Driver BAR1 lifetime (F7 class) | `kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c` | No two live (refCount>0) mappings can share a BAR1 VA window; VA reclaimed only at refCount 0; double-unmap rejected | Invariant holds (see caveat 2.1). Not re-checked by the second pass |
+| GaLore moment reprojection (F20/O14) | `qat_galore_engine/galore_async_offload.py` | `M_new = (P_new^T P_old) M_old`; `V_new = (rot*rot) @ V_old` from `E[(rot@g)_i^2]`; QR sign fix `q * sign(diag(R))` | Reprojection algebra correct (see caveat 3.1 on V). **Disputed by second pass:** uint8 round-up `sqrt(V)` storage ratchets (4.6) |
+| Tiled-CBC row-max Holder sieve (O9) | `structural_filters/tiled_cbc_sieve.py` | `e_k = max_m mean_k(|X[m,tile]|)` is worst-case over rows; by Holder `|sum X W| <= ||X[m,tile]||_1 * max_k|W|`; single loud row keeps its tile | Bound correct (see observation 3.6). **Second pass:** NaN tiles skipped (4.12); `.cu` tau is per sub-tile, not a budget (4.13) |
 | H_2 butterfly constant (F18) | `sim_harness/ptx_bf162_emu.c`, `fused_w1_hadacore/w1a16_hadacore_kernel.cu` | `0x3F353F35` = +0.70703125 ~= +1/sqrt(2); `0.25*(1/sqrt(2)) = 1/sqrt(32)` orthonormal H_32 scale | Consistent across both files (see inconsistency 4.2) |
-| Fused STE QAT forward/backward | `qat_galore_engine/fused_qat_ste.py` | `Y = X W_hat^T`, `dX = dY W_hat`, STE `dW = dY^T X`, and the clipped-STE gate `1(|W| <= c*alpha_g)` | Math correct (see caveat 2.4 and observation 3.4) |
-| SPSC ring memory ordering (O10) | `hetero_runtime/chorus_amx_moe.c` | Per-slot sequence handshake: producer release-stores `gpu_ready_seq`, consumer acquire-loads it then release-stores `cpu_done_seq`; slot reuse waits `cpu_done_seq >= seq - num_slots` | Ordering correct; two latent defects on untested paths (see 4.3, 4.4) |
-| LServe sparse + INT4 Hadamard attention (F15) | `structural_filters/lserve_sparse_attn.py` | H_16 cancels in `q_rot k_rot^T = q k^T`; V output un-rotated by `H^T`; per-dim `max(q*k_min, q*k_max)` is the exact box-corner upper bound (admissible page prune); salience = out-window minus in-window | Correct; verified blind 0.70 vs profiled 0.993 (see observation 3.8) |
+| Fused STE QAT forward/backward | `qat_galore_engine/fused_qat_ste.py` | `Y = X W_hat^T`, `dX = dY W_hat`, STE `dW = dY^T X`, and the clipped-STE gate `1(|W| <= c*alpha_g)` | STE algebra correct (see caveat 2.4 and observation 3.4). **Second pass:** clip c=1.5 freezes ~23% of weights (4.8), bf16 master stall (4.9), unrotated basis and no ternary path (4.10) |
+| SPSC ring memory ordering (O10) | `hetero_runtime/chorus_amx_moe.c` | Per-slot sequence handshake: producer release-stores `gpu_ready_seq`, consumer acquire-loads it then release-stores `cpu_done_seq`; slot reuse waits `cpu_done_seq >= seq - num_slots` | Ordering correct (second pass agrees). Latent defects on untested paths: 4.3 (confirmed), 4.4 (unreachable today), 4.15 (new) |
+| LServe sparse + INT4 Hadamard attention (F15) | `structural_filters/lserve_sparse_attn.py` | H_16 cancels in `q_rot k_rot^T = q k^T`; V output un-rotated by `H^T`; per-dim `max(q*k_min, q*k_max)` is the exact box-corner upper bound (admissible page prune); salience = out-window minus in-window | Correct (see observation 3.8). **Second pass:** 0.70 and 0.993 come from different datasets; same-data gap is blind 0.85 to 0.86 vs profiled 0.993 (4.16) |
 | SafeTensors serializer + round-trip (F2) | `kinesis_unified/kinesis_bridge.py` | `[8-byte LE u64 len][space-padded JSON header][contiguous data]`, offsets from data start, 8-byte header alignment | Spec-compliant; independently bit-exact across 5 dtypes + empty (see observation 3.9) |
-| C ABI ctypes marshalling (F2/F21) | `kinesis_unified/kinesis_c_abi.cpp` + `kinesis_bridge.py` | every entry point is `try/catch(...)`-guarded (no exception crosses `extern "C"`); correct `argtypes`/`restype`; `.contiguous()` inputs; buffers kept alive across the synchronous call | Correct and verified end-to-end; implicit unbounded size contract (see 4.5) |
-| cuBLAS device-ID shim logic (F12/O2/F6) | `compiler_unlock/libcublas_unlock_shim.c` | resolver self-hook returns the hook pointer (self-assignment guarded against recursion); caller gating spoofs only when a blas/dnn DSO is on the call chain; ioctl requires both NR 0x2A and TYPE 'F' | Logic correct and mock-verified: blas caller sees workstation ID, PyTorch/NCCL see true ID and SM count (see observation 3.10) |
-| SMSP roofline model (Pillar 1) | `sim_harness/smsp_roofline_sim.py` | `I_warp = W_M W_N/(W_M+W_N)`, peak `= sm_count * (2048/tau) * 4 * clock`, DRAM ridge `= peak/BW` in units of batch M | Arithmetic self-consistent; it is a model, not a measurement (see observation 3.11) |
+| C ABI ctypes marshalling (F2/F21) | `kinesis_unified/kinesis_c_abi.cpp` + `kinesis_bridge.py` | every entry point is `try/catch(...)`-guarded (no exception crosses `extern "C"`); correct `argtypes`/`restype`; `.contiguous()` inputs; buffers kept alive across the synchronous call | Correct for tested shapes. **Second pass:** size contract diverges for `K % 128 != 0`, reachable heap overflow (4.5) |
+| cuBLAS device-ID shim logic (F12/O2/F6) | `compiler_unlock/libcublas_unlock_shim.c` | resolver self-hook returns the hook pointer (self-assignment guarded against recursion); caller gating spoofs only when a blas/dnn DSO is on the call chain; ioctl requires both NR 0x2A and TYPE 'F' | Logic correct by review (see observation 3.10). **Second pass:** the mock exercises only the forced override, never the `dladdr`/backtrace classification (4.16) |
+| SMSP roofline model (Pillar 1) | `sim_harness/smsp_roofline_sim.py` | `I_warp = W_M W_N/(W_M+W_N)`, peak `= sm_count * (2048/tau) * 4 * clock`, DRAM ridge `= peak/BW` in units of batch M | It is a model, not a measurement (see observation 3.11). **Disputed by second pass:** 2x FLOP-per-HMMA inconsistency between `peak_tflops` and `t_mma` (4.7) |
 | Memory primitives (F20/F21 hardening) | `kinesis_unified/memory_primitives.hpp` | arena bump math uses `capacity - offset` form (no overflow); slab `deallocate` rejects double-free via `is_free_` bitmap; `total_elements`/`from_shape_row_major` saturate; Shape/Strides/TensorView are exactly 56/56/128 bytes | Correct; no defects |
 | Hardware discovery + swizzle (L5/§2.2) | `kinesis_unified/hardware_and_sandbox.hpp` | CPUID gated by XGETBV OS-save bits (YMM/ZMM/AMX); leaf-4 cache size `ways*partitions*line*sets`; BLIS KC/MC/NC from live cache; `offset ^ ((offset>>3)&0x70)` yields `chunk ^ (r&7)` | Correct; one trivial imprecision (observation 3.12) |
-| 4x8 GotoBLAS FP32 GEMM + W1/W2 packers | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | standard BLIS 5-loop (jc/pc/ic/jr/ir) with 4-accumulator micro-kernel, FP32 accumulation, F21-safe `storeu`; branchless AVX2 sign unpack; zero-group scale 0 (F5/F14); W2 threshold conditional-mean ternary scale; RNE `fp32_to_bf16_bits` with NaN preservation | Correct; no defects |
-| SmartTieredCache error budget (O8/O9/O11) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | exact by default (O8); O9 worst-case bound `bound[g] = max_col|scale| * max_m row-L1`, greedy skip while `sum bound <= eps` guarantees per-output abs error `<= eps`; non-finite rows never skipped; promotion counted once per GEMM, saturating (O11); LFU+LRU eviction only when strictly hotter | Correct and rigorous; no defects (confirms observation 3.6) |
-| Host CTA shim PTX primitives (F17/F18/F19) | `fused_w1_hadacore/w1a16_host_cta_shim.hpp` | `lop3_b32` fast-paths 0xAE/0xEA and the generic bit-LUT, all agreeing; W1/W2 unpack use 64.0=0x4280, -129.0=0xC301, H_2=0x3F35 matching the kernel; `__shfl_xor_sync`/`__ballot_sync` assert on intra-warp divergence | Correct; one theoretical double-rounding note (observation 3.13) |
+| 4x8 GotoBLAS FP32 GEMM + W1/W2 packers | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | standard BLIS 5-loop (jc/pc/ic/jr/ir) with 4-accumulator micro-kernel, FP32 accumulation, F21-safe `storeu`; branchless AVX2 sign unpack; zero-group scale 0 (F5/F14); W2 threshold conditional-mean ternary scale; RNE `fp32_to_bf16_bits` with NaN preservation | GEMM output correct. **Second pass:** `-O0` segfault (4.11), CPU W2 convention differs from GPU W2 (4.14) |
+| SmartTieredCache error budget (O8/O9/O11) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | exact by default (O8); O9 worst-case bound `bound[g] = max_col|scale| * max_m row-L1`, greedy skip while `sum bound <= eps` guarantees per-output abs error `<= eps`; non-finite rows never skipped; promotion counted once per GEMM, saturating (O11); LFU+LRU eviction only when strictly hotter | Correct and rigorous; no defects (confirms observation 3.6; second pass agrees, NaN handled correctly) |
+| Host CTA shim PTX primitives (F17/F18/F19) | `fused_w1_hadacore/w1a16_host_cta_shim.hpp` | `lop3_b32` fast-paths 0xAE/0xEA and the generic bit-LUT, all agreeing; W1/W2 unpack use 64.0=0x4280, -129.0=0xC301, H_2=0x3F35 matching the kernel; `__shfl_xor_sync`/`__ballot_sync` assert on intra-warp divergence | Correct for the kernel's operands; double-rounding note corrected by the second pass (observation 3.13) |
 | Closed-loop governor (F11) | `hetero_runtime/closed_loop_governor.py` (+ `.c`, E2) | F11 divide-by-zero guard on `locked_clock_floor_mhz`; queue-pressure routing by `delta_q`; clock-sag hysteresis (raise +5% above 2% sag near TDP, relax -2% below 1% sag with headroom); tau clamped to [min,max] | Correct policy model; no defects |
 | Unified sizing constants | `kinesis_unified/unified_sizing.h` | W1 28.44x/14.22x, W2 15.06x/7.53x, CTA 4-stage SMEM 98304<=101376, KV INT4 page 4096=1 OS page, descriptors 56/56/128 | All self-consistent |
 | Unlocked Triton GEMM configs | `compiler_unlock/unlocked_gemm.py` | all 6 autotune configs satisfy `(BM+BN)*BK*2*stages <= 101376`; grouped `GROUP_SIZE_M=8` L2 swizzle; warps give `W_M x W_N >= 64x64` | Config logic correct; unexecuted on host (caveat 2.4) |
 | E2E 5-pillar pipeline (G1) | `e2e_transformer_pipeline.py` | composition of the already-verified pillars end to end | Passes via suite G1; composition only, components verified individually above |
-| T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
+| T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct for finite inputs; honestly labeled int8-approximate (see observation 3.5). **Second pass:** NaN dropped, NaN-to-int8 cast is UB (4.12) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
 verification host.
@@ -198,13 +198,21 @@ L2 budget. Harmless today; strictly the L2/L3 branches should accept only type 3
 (data), as the L1D branch already does. No functional impact observed.
 
 ### 3.13 Host bf16x2 FMA rounds twice; exact in practice for these operands
-`host_ptx_fma_rn_bf16x2` converts each bf16 lane to f32, calls `fmaf`, then rounds the f32 result
-back to bf16. That is two roundings (into f32, then into bf16), whereas real `fma.rn.bf16x2` rounds
-once directly to bf16. Double rounding can differ from single rounding in adversarial cases. It does
-not here: both operands are bf16 (8-bit significand), so each product is exactly representable in
-f32 (24-bit) and the `fmaf` step introduces no rounding, leaving only the final f32-to-bf16 rounding.
-So the host shim matches hardware `fma.rn.bf16x2` for every value the unpack path produces. Worth
-knowing if the shim is ever reused for general bf16x2 FMAs with wider-significand intermediates.
+`host_ptx_fma_rn_bf16x2` (and `ptx_fma_rn_bf162` in the emulator) converts each bf16 lane to f32, calls
+`fmaf`, then rounds the f32 result back to bf16. That is two roundings (the add inside `fmaf` rounds to
+f32, then f32 rounds to bf16), whereas real `fma.rn.bf16x2` rounds once directly to bf16.
+
+CORRECTED by the second pass ([docs/14](16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md)): an earlier
+version of this note argued that the `fmaf` step "introduces no rounding" because bf16 x bf16 products are
+exact in f32. The product is exact, but the add is not. For general bf16 triples, double rounding does
+differ from single rounding: a random search found 28,019 counterexamples in 24.7M triples (for example
+`a=0x5983, b=0x23C0, c=0x308F` gives 0x3DC4 from the shim against the correctly rounded 0x3DC5, because
+the product lands exactly on a bf16 midpoint and the tiny `c` is lost in f32).
+
+The conclusion still holds for the operand sets the kernel actually produces. The W1/W2 unpack is exact,
+and the H_2 butterfly and the sieve's `fma(x, 1, y)` each gave 0 mismatches against single rounding over
+50M samples. So the shim matches hardware for every value on the current kernel paths, but it is not a
+general `fma.rn.bf16x2` model and must not be reused as one without a single-rounding implementation.
 
 ## 4. Inconsistencies and latent defects found in this pass
 
@@ -233,6 +241,9 @@ The fix itself is correct where it lives; the claim that it also touched
 refactored). Recommend dropping `smsp_roofline_sim.py` from the F18 and section 0.2 text.
 
 ### 4.3 Latent defect: single-threaded fallback deadlocks the bounded ring
+**Second pass: CONFIRMED by reproduction** (platform macros renamed so the `#else` path builds: the producer
+spins at `seq = 3` and the run hangs, timeout exit 124). The same path also misallocates the ring (4.15).
+
 In `chorus_amx_moe.c`, on `_WIN32` and `__linux__` a worker thread is spawned (line ~509 /
 ~513) before the producer loop, so producer and consumer run concurrently and suite E1 passes.
 On any other platform (for example macOS or BSD) no thread is created, and the inline
@@ -246,15 +257,27 @@ bounded ring: on a single-threaded platform the consumer must be interleaved wit
 or `num_slots` must be at least `total_dispatches`.
 
 ### 4.4 Latent defect: ring slot count truncated to 16 bits on free
+**Second pass: DISPUTED as stated, unreachable with current constants.** A slot is 263,296 B, so the 1 GB
+guard (`bytes <= 1 GB`, which the paragraph below omits) caps the ring at 4,078 slots, not about 7,700, and
+65,535 is never reachable. It becomes reachable only if a slot shrinks below 16 KiB (for example
+`hidden_dim <= 128`). A `static_assert(HUGE_PAGE_1GB / sizeof(slot) <= 0xFFFF)` closes it.
+
 `allocate_pinned_1gb_ring` packs the slot count into `alloc_via_mmap` bits [31:16]
 (`(num_slots & 0xFFFF) << 16`), and `free_pinned_ring` recovers it with `>> 16`. The alloc
 guard rejects only `num_slots > SIZE_MAX / sizeof(slot)`, not `num_slots > 0xFFFF`. A caller
 passing more than 65535 slots allocates the full buffer but stores a truncated count, so the
 free path computes a smaller byte size and unmaps or unlocks the wrong length (partial unmap
-or leak). The intended 1 GB regime holds roughly 7700 slots, well under the limit, so this is
+or leak). The intended 1 GB regime holds at most 4,078 slots (corrected from "roughly 7700"), well under the limit, so this is
 latent, but the allocator should reject `num_slots > 0xFFFF` explicitly or widen the tag.
 
-### 4.5 Latent defect: C ABI size contract is implicit and the copies are unbounded
+### 4.5 Defect (reachable): C ABI size contract is implicit and the copies are unbounded
+**Second pass: CONFIRMED and UPGRADED from latent to reachable.** `KinesisNativeBridge.convert_w1_to_gpu_interleaved`
+allocates `N * (K // 128)` bf16 scales, while `convert_w1_gotoblas_to_gpu_interleaved_u32` writes
+`N * ceil(K / 128)` and the ABI only checks `K % 32 == 0`. With K=160 and N=8, the bridge allocates 8 scales and C++
+writes 16, a 16-byte heap overflow (measured with a sentinel-padded buffer). Every K that is 32, 64 or 96
+mod 128 triggers it from the in-repo caller. The `pack_*` size formulas agree for every odd shape tested.
+The original text below ("no bug today") is superseded. Fix plan: docs/14 F-A.
+
 The `kinesis_c_abi.cpp` entry points take raw output pointers (`out_bits`, `out_scales_bf16`,
 `out_gpu_u32`, ...) with no capacity argument, and `memcpy` into them a length the C++ side
 computes from the panel set (for example `panels.packed_bits.size()`). The reconstruction
@@ -270,6 +293,118 @@ every `memcpy` / `.assign`, or a two-call size-query pattern (ask for required l
 Severity is low for the current in-repo caller, but this is the most dangerous failure mode in
 the bridge because it corrupts memory rather than returning an error code.
 
+### 4.6 Defect (HIGH, second pass): GaLore uint8 round-up `sqrt(V)` storage ratchets
+`quantize_unsigned_uint8(..., round_up=True)` applies `ceil` every step. Because the stored value is
+dequantized, updated and re-quantized each step, the round-up error compounds:
+`e_{t+1} <= sqrt(b2) e_t + q`. The steady state is about `q / (1 - sqrt(b2))`, roughly 2000 quanta
+before saturating. In a simulation (r=16, n=512, b2=0.999, per-column gradient scale 1e-3 to 1), the
+median stored/true `sqrt(V)` was 1.48 at step 10, 3.82 at step 100, 9.21 at step 1000 and 10.49 at step
+3000. Small-gradient columns reached about 52x and large-gradient columns about 2.5x. Adam steps
+therefore shrink by 2.5x to 50x over training: a hidden learning-rate decay that differs per coordinate.
+"Rounding up only shrinks steps (conservative)" is true for one step, but the compounded effect is not
+bounded in practice. This answers 5(d). The 6-step suite D2 cannot see it. Fix plan: docs/14 F-B.
+
+### 4.7 Defect (HIGH, second pass): roofline FLOP-per-HMMA inconsistency
+`peak_tflops` uses 2048 FLOP per HMMA (`2048/tau * 4` per SM per clock), but `t_mma` counts m16n8k16
+instructions, and each of those is `16*8*16*2 = 4096` FLOP (the code's own comment says this). The implied
+SRAM ridge is therefore 8 (locked) / 16 (unlocked) FLOP/B, not the stated 4 / 8. Recomputing the margins
+with `I_warp = W_M W_N / (W_M + W_N)` against the stated ridge gives 32x32 at 3.39x / 1.69x, 64x32 at
+4.76x / 2.38x, 64x64 at 8.0x / 4.0x, 128x64 at 10.67x / 5.33x and fused W1 at 14.95x / 7.47x. Every row
+is compute-bound both locked and unlocked. The only "stalls when unlocked" row (32x32: ratio 0.85x,
+50.76% SassWait) is an artifact of the 2x error. Also: the 0.1 split-K factor contradicts its own
+"upper bound" comment, and tau, beta_conflict and the stage-refill latency are stated rather than derived.
+Fix plan: docs/14 F-E.
+
+### 4.8 Defect (HIGH for training, second pass): clipped STE at c=1.5 permanently freezes weights
+With a Gaussian init, `P(|w| > 1.5 * alpha_g)` is about 23%. Those weights get zero gradient from step 0,
+and since `alpha_g` does not shrink, they never re-enter the range. About half of them have the wrong
+sign. In a teacher-student run (binary-g128 teacher, M=256, K=512, N=128, Adam 1e-4, 400 steps), sign
+accuracy capped at 0.873 against 0.919 unclipped, and loss ended at 0.058 against 0.038. This adds to
+observation 3.4. Note: `clip_mult` defaults to 0 (clipping off) in both `FusedQATG128Function` and
+`FusedQATG128Linear`, and `c=1.5` is only used by the file's own self-test, so this is a latent risk
+of the opt-in clipped mode, not shipped-default behaviour. Fix plan: docs/14 F-C.
+
+### 4.9 Defect (MED, second pass): bf16 master weights stall under a plain optimizer
+`FusedQATG128Linear` defaults to bf16 master weights. With a plain torch optimizer, 73.5% (SGD lr 0.5) /
+56% (Adam 1e-4) of weights get no update on a given step, because the update is below half a bf16 ulp.
+SGD loss ended at 7.5e-4 with bf16 masters and 2.4e-4 with fp32 masters (start 0.262). The GaLore engine's
+`copy_to_param_stochastic` avoids this; a plain optimizer does not. With fp32 masters a smaller mismatch
+appears instead: 2.4% of groups get a scale 1 bf16 ulp off the packer's, and tiny negatives quantize with
+the opposite sign. Fix plan: docs/14 F-D.
+
+### 4.10 Convention gap (MED, second pass): QAT trains the wrong basis and has no ternary path
+The packer quantizes `W @ R1` but QAT trains unrotated W, and sign agreement between the two is 0.487
+(chance), so QAT results do not transfer to the rotated deploy. QAT also implements binary only: the
+packer's W2 has about 31% zeros while QAT `W_hat` has 0%. The "0 bytes for W_hat" claim holds for the
+Triton forward and dX kernels, but the clip path allocates about 226 MiB at 4096^2 (about 7x a bf16
+`W_hat`), and line 242 prints a hardcoded string rather than a measurement. Fix plan: docs/14 F-G.
+
+### 4.11 Defect (MED, second pass): F21 stack-alignment fix does not cover -O0 / -fno-inline
+A `-O0` mingw build of `test_kinesis_unified.cpp` segfaults on `vmovaps %ymm0,-0x50(%rbp)` at hpp:920
+(`execute_smart_w1_gemm`). `-O3 -fno-inline` still emits an unrealigned `vmovaps` ymm stack store for the
+by-value `__m256 v_scale` argument of `avx2_unpack_*`, and survives only by stack luck. Builds at `-O1`
+and above with inlining, and the shipped DLL, have 0 aligned ymm stack moves. This is GCC PR 54412.
+Also: the AVX2 gate requires `__FMA__`, so a build with only `-mavx2` silently compiles the scalar path.
+Fix plan: docs/14 F-I.
+
+### 4.12 Defect (MED, second pass): NaN activations silently skipped
+* The Python sieve does not execute a NaN tile, giving 64/64 finite rows.
+* The `.cu` mask is 0x0 even at tau=0, because `NaN*alpha > tau` is false and `fmaxf` drops NaN.
+* The in-kernel `mi_max > group_max` is false for NaN; this is safe only at the default `tau <= 0`,
+  which short-circuits.
+* T-MAC: `amax = std::max(amax, fabs(v))` ignores NaN.
+  * A NaN in an otherwise-zero group leaves that group's scale at 0, so the group is skipped and all
+    outputs come out finite.
+  * A NaN in a live group reaches `static_cast<int8_t>(NaN)`, which is UB and produced finite garbage.
+
+The C++ SmartTieredCache maps non-finite values to inf and never skips them, which is correct.
+Fix plan: docs/14 F-H.
+
+### 4.13 Semantics (MED, second pass): only the C++ sieve carries the `<= eps` guarantee
+The cumulative sorted-bound budget exists only in `SmartTieredCache::plan_panel_sieve`.
+`tiled_cbc_subtile_rowmax_bound_mask` thresholds each 32-wide sub-tile independently, so total skipped
+error is up to (#skipped sub-tiles) x tau. `warp_sieve_k32_active` has no weight-scale factor and
+accumulates the row L1 in bf16 (it rounds and can under-estimate). This generalises observation 3.6 to
+the `.cu` and kernel gates. Fix plan: docs/14 F-J.
+
+### 4.14 Convention gap (LOW-MED, second pass): CPU W2 quantizer differs from GPU W2
+The CPU scale is mean|w| over `|w| >= 0.5*mean|w|` with round-half-away; the GPU/spinquant scale is plain
+mean|w| with round-half-even and a 1e-6 clamp. On the same weights, 128/128 groups get a different scale,
+1507/16384 trits differ, and the zero fraction is 0.402 vs 0.310. The "L2-optimal over active trits"
+comment is also not self-consistent, because the set used for the scale differs from the final support.
+Fix plan: docs/14 F-F.
+
+### 4.15 Latent defect (LOW, second pass): generic ring allocator is misaligned
+The `#else` allocator in `chorus_amx_moe.c` uses `calloc` for an `aligned(64)` struct. The alignment
+assert fires on that build, and over-aligned `_Atomic` access through it is UB. macOS falls into this
+branch, because `__unix__` is not defined on Apple. It is the same platform set as 4.3. Fix plan: docs/14 F-K.
+
+### 4.16 Test-coverage gaps (LOW, second pass)
+Several suites pass for reasons other than the property they claim to check:
+* **Cayley (B4)**: `k_after < k_before` passes with 0 steps, because the fixed Hadamard init alone gives
+  25.00 -> 2.594.
+* **LServe (C3)**: blind and profiled are measured on different datasets.
+* **cuBLAS shim (A1)**: every control uses the forced override or the TLS latch, so the `dladdr`/backtrace
+  classification never runs. Also, on real drivers attribute 34 is a PCI slot number (0..31), so the
+  `>= 0x1000` spoof gate never fires outside the mock.
+* **Sieve negative controls (C1/C2)**: they compare against a mean or a hand-computed assertion rather than
+  running the legacy heuristic.
+* **QAT D1**: the dW check compares `dy^T x` against `dy^T x`.
+* **GaLore D2**: the peak table assert is tautological (`sum/2` of itself).
+* **PTX MMA emulator**: matches its reference by construction (same k order), so it is no evidence of
+  hardware HMMA bit-exactness.
+
+### 4.17 Minor items (second pass)
+* The AMX emulator computes `c + (a0b0 + a1b1)`; the SDM is `(c + a0b0) + a1b1`.
+* `ptx_max_bf162` returns b when b is NaN; PTX max returns the non-NaN operand.
+* `GET_NAME_STRING` calls `strstr` on a buffer that may not be NUL-terminated.
+* The mode-2 H_2 gain is `2*0x3F35^2 = 0.99979`, a -1.07e-4 systematic bias against the packer's exact
+  1/sqrt2. It is below bf16 noise but undocumented.
+* LServe centroids are rounded with RNE rather than outward, and the K payload is 4.625 bpw, not 4.25.
+* The "exhaustive 2^16 noise states" in the emulator are 65,536 pseudo-random patterns.
+* The V transport (3.1) with correlated coordinates has max relative error 1.44; it is not a small
+  correction.
+
 ## 5. Open cross-check items (pending a second independent reviewer)
 
 The areas in section 1 were reviewed by a single pass. A second independent reviewer
@@ -280,8 +415,14 @@ two live BAR1 mappings, (d) whether the GaLore V transport bias from uint8 round
 storage is bounded, and (e) whether the SPSC ring has any reordering the acquire/release
 pairs miss under a weak memory model (the current pass reasoned on x86 TSO plus the explicit
 C11 orderings). The second reviewer should read both the code and this document and confirm
-or dispute each finding here, including the three latent defects in section 4. Prompts for this
+or dispute each finding here, including the three latent defects in section 4. Audit checks for this
 second pass are maintained outside the repository.
+
+**Second-pass answers** ([docs/14](16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md), 2026-11-08):
+(a) Riemannian GD with a Cayley retraction, confirmed. (b) Only negative or non-finite scales break the
+zero, and absmean never produces them. (c) NOT checked, still open. (d) Not bounded in practice; it
+ratchets (4.6). (e) No missed reordering found. Latent defects: 4.3 confirmed, 4.4 unreachable today,
+4.5 confirmed and reachable.
 
 ## 6. Coverage summary
 
@@ -304,7 +445,13 @@ This pass reviewed the full host-verifiable surface of the repository, file by f
   configs (`unlocked_gemm.py`), the empirical CPU roofline bench (`bench_cpu_roofline.cpp`), and the
   end-to-end 5-pillar pipeline (`e2e_transformer_pipeline.py`).
 
-Result of the independent pass: **no correctness defect** was found in any math, quantization,
+> [!WARNING]
+> The second pass ([docs/14](16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md)) **disputes** the
+> paragraph below. It found correctness defects in a quantization path (4.6), a model's published
+> verdicts (4.7), a marshalling path (4.5, reachable heap overflow), training behaviour (4.8 to 4.10),
+> and NaN handling (4.12). The paragraph is kept as the first pass's record.
+
+Result of the first independent pass: **no correctness defect** was found in any math, quantization,
 serialization, or marshalling path. Every such path was re-derived and, where runnable, executed
 (all 20 host suites pass). The findings are: **three low-severity latent defects** on untested paths
 (sections 4.3, 4.4, 4.5, none reached by the Win/Linux CI), **two documentation inconsistencies** in
