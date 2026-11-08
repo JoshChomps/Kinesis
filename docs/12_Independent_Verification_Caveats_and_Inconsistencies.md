@@ -31,6 +31,8 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | C ABI ctypes marshalling (F2/F21) | `kinesis_unified/kinesis_c_abi.cpp` + `kinesis_bridge.py` | every entry point is `try/catch(...)`-guarded (no exception crosses `extern "C"`); correct `argtypes`/`restype`; `.contiguous()` inputs; buffers kept alive across the synchronous call | Correct and verified end-to-end; implicit unbounded size contract (see 4.5) |
 | cuBLAS device-ID shim logic (F12/O2/F6) | `compiler_unlock/libcublas_unlock_shim.c` | resolver self-hook returns the hook pointer (self-assignment guarded against recursion); caller gating spoofs only when a blas/dnn DSO is on the call chain; ioctl requires both NR 0x2A and TYPE 'F' | Logic correct and mock-verified: blas caller sees workstation ID, PyTorch/NCCL see true ID and SM count (see observation 3.10) |
 | SMSP roofline model (Pillar 1) | `sim_harness/smsp_roofline_sim.py` | `I_warp = W_M W_N/(W_M+W_N)`, peak `= sm_count * (2048/tau) * 4 * clock`, DRAM ridge `= peak/BW` in units of batch M | Arithmetic self-consistent; it is a model, not a measurement (see observation 3.11) |
+| Memory primitives (F20/F21 hardening) | `kinesis_unified/memory_primitives.hpp` | arena bump math uses `capacity - offset` form (no overflow); slab `deallocate` rejects double-free via `is_free_` bitmap; `total_elements`/`from_shape_row_major` saturate; Shape/Strides/TensorView are exactly 56/56/128 bytes | Correct; no defects |
+| Hardware discovery + swizzle (L5/§2.2) | `kinesis_unified/hardware_and_sandbox.hpp` | CPUID gated by XGETBV OS-save bits (YMM/ZMM/AMX); leaf-4 cache size `ways*partitions*line*sets`; BLIS KC/MC/NC from live cache; `offset ^ ((offset>>3)&0x70)` yields `chunk ^ (r&7)` | Correct; one trivial imprecision (observation 3.12) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -179,6 +181,14 @@ hetero CPU/GPU splits are explicitly banner-labelled analytical models with stat
 (`SM_FRACTION_TO_SATURATE_DRAM = 0.5`, DDR5 80 GB/s, PCIe 25 GB/s). The `simulate_smsp_cycle_accurate`
 docstring says "cycle-accurate", which oversells what is an analytical contention model with
 heuristic stage-refill latencies; the arithmetic is sound but the label should read "analytical".
+
+### 3.12 CPUID L2/L3 discovery accepts cache-type 2 (instruction)
+`query_deterministic_caches` classifies an L2 or L3 entry when `cache_type == 2 || cache_type == 3`,
+where type 2 is an instruction cache and type 3 is unified. On real x86 parts L2 and L3 are reported
+as unified (type 3), so this never mis-sizes in practice (the F3 bench reads L1D=48KB, L2=1280KB,
+L3=24576KB correctly on the dev host). But an instruction-only L2 would be accepted as the data-path
+L2 budget. Harmless today; strictly the L2/L3 branches should accept only type 3 (unified) or type 1
+(data), as the L1D branch already does. No functional impact observed.
 
 ## 4. Inconsistencies and latent defects found in this pass
 
