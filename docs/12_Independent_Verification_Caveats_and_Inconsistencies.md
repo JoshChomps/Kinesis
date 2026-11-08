@@ -29,6 +29,8 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | LServe sparse + INT4 Hadamard attention (F15) | `structural_filters/lserve_sparse_attn.py` | H_16 cancels in `q_rot k_rot^T = q k^T`; V output un-rotated by `H^T`; per-dim `max(q*k_min, q*k_max)` is the exact box-corner upper bound (admissible page prune); salience = out-window minus in-window | Correct; verified blind 0.70 vs profiled 0.993 (see observation 3.8) |
 | SafeTensors serializer + round-trip (F2) | `kinesis_unified/kinesis_bridge.py` | `[8-byte LE u64 len][space-padded JSON header][contiguous data]`, offsets from data start, 8-byte header alignment | Spec-compliant; independently bit-exact across 5 dtypes + empty (see observation 3.9) |
 | C ABI ctypes marshalling (F2/F21) | `kinesis_unified/kinesis_c_abi.cpp` + `kinesis_bridge.py` | every entry point is `try/catch(...)`-guarded (no exception crosses `extern "C"`); correct `argtypes`/`restype`; `.contiguous()` inputs; buffers kept alive across the synchronous call | Correct and verified end-to-end; implicit unbounded size contract (see 4.5) |
+| cuBLAS device-ID shim logic (F12/O2/F6) | `compiler_unlock/libcublas_unlock_shim.c` | resolver self-hook returns the hook pointer (self-assignment guarded against recursion); caller gating spoofs only when a blas/dnn DSO is on the call chain; ioctl requires both NR 0x2A and TYPE 'F' | Logic correct and mock-verified: blas caller sees workstation ID, PyTorch/NCCL see true ID and SM count (see observation 3.10) |
+| SMSP roofline model (Pillar 1) | `sim_harness/smsp_roofline_sim.py` | `I_warp = W_M W_N/(W_M+W_N)`, peak `= sm_count * (2048/tau) * 4 * clock`, DRAM ridge `= peak/BW` in units of batch M | Arithmetic self-consistent; it is a model, not a measurement (see observation 3.11) |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -155,6 +157,28 @@ contiguous, non-overlapping, or within bounds beyond the final-size assertion. B
 round-tripping the project's own checkpoints (independently verified bit-exact across bf16, int8,
 uint8, int32, fp32, and an empty tensor), but a hardened loader for untrusted files would validate
 offsets and handle endianness.
+
+### 3.10 cuBLAS shim is host-mock-verified only, and leans on community device IDs
+`libcublas_unlock_shim.c` is reviewed as logic against a mock driver table; its real
+`LD_PRELOAD` behaviour against closed-source `libcuda.so.1` is unverified (the doc 11
+caveat stands). The caller gating is the important safety property and it holds in the mock:
+only a blas/dnn caller receives the workstation ID, while PyTorch and NCCL always read the
+true device ID and the physical SM count. Two notes: the RTX 4090 D, 5090, and PRO 6000
+Blackwell IDs are community-reported and unverified on hardware (doc 11 O17), and the `ioctl`
+hook reads its third argument with `va_arg(void*)`, which assumes a pointer-typed argument
+(the standard shim limitation; non-pointer ioctls are passed through untouched but the read
+itself is technically unspecified for an int-argument ioctl).
+
+### 3.11 SMSP roofline peak is calibrated to the documented TFLOPS, not measured
+`smsp_roofline_sim.py` is internally consistent: `I_warp`, the compute-to-SRAM ratios, and the
+DRAM ridge points all follow from the stated equations. But `peak_tflops` is constructed so that
+`sm_count * (2048/tau) * smsp * clock` reproduces the raw-MMA TFLOPS quoted in doc 00/01 (for
+example RTX 4090 locked 165.6, unlocked 331.6), which are themselves unverified external claims.
+So the roofline's absolute numbers inherit that unverified-ness. The decode 2D-vs-Stream-K and the
+hetero CPU/GPU splits are explicitly banner-labelled analytical models with stated assumptions
+(`SM_FRACTION_TO_SATURATE_DRAM = 0.5`, DDR5 80 GB/s, PCIe 25 GB/s). The `simulate_smsp_cycle_accurate`
+docstring says "cycle-accurate", which oversells what is an analytical contention model with
+heuristic stage-refill latencies; the arithmetic is sound but the label should read "analytical".
 
 ## 4. Inconsistencies and latent defects found in this pass
 
