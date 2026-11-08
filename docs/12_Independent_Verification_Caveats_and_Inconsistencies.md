@@ -36,6 +36,10 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | 4x8 GotoBLAS FP32 GEMM + W1/W2 packers | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | standard BLIS 5-loop (jc/pc/ic/jr/ir) with 4-accumulator micro-kernel, FP32 accumulation, F21-safe `storeu`; branchless AVX2 sign unpack; zero-group scale 0 (F5/F14); W2 threshold conditional-mean ternary scale; RNE `fp32_to_bf16_bits` with NaN preservation | Correct; no defects |
 | SmartTieredCache error budget (O8/O9/O11) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | exact by default (O8); O9 worst-case bound `bound[g] = max_col|scale| * max_m row-L1`, greedy skip while `sum bound <= eps` guarantees per-output abs error `<= eps`; non-finite rows never skipped; promotion counted once per GEMM, saturating (O11); LFU+LRU eviction only when strictly hotter | Correct and rigorous; no defects (confirms observation 3.6) |
 | Host CTA shim PTX primitives (F17/F18/F19) | `fused_w1_hadacore/w1a16_host_cta_shim.hpp` | `lop3_b32` fast-paths 0xAE/0xEA and the generic bit-LUT, all agreeing; W1/W2 unpack use 64.0=0x4280, -129.0=0xC301, H_2=0x3F35 matching the kernel; `__shfl_xor_sync`/`__ballot_sync` assert on intra-warp divergence | Correct; one theoretical double-rounding note (observation 3.13) |
+| Closed-loop governor (F11) | `hetero_runtime/closed_loop_governor.py` (+ `.c`, E2) | F11 divide-by-zero guard on `locked_clock_floor_mhz`; queue-pressure routing by `delta_q`; clock-sag hysteresis (raise +5% above 2% sag near TDP, relax -2% below 1% sag with headroom); tau clamped to [min,max] | Correct policy model; no defects |
+| Unified sizing constants | `kinesis_unified/unified_sizing.h` | W1 28.44x/14.22x, W2 15.06x/7.53x, CTA 4-stage SMEM 98304<=101376, KV INT4 page 4096=1 OS page, descriptors 56/56/128 | All self-consistent |
+| Unlocked Triton GEMM configs | `compiler_unlock/unlocked_gemm.py` | all 6 autotune configs satisfy `(BM+BN)*BK*2*stages <= 101376`; grouped `GROUP_SIZE_M=8` L2 swizzle; warps give `W_M x W_N >= 64x64` | Config logic correct; unexecuted on host (caveat 2.4) |
+| E2E 5-pillar pipeline (G1) | `e2e_transformer_pipeline.py` | composition of the already-verified pillars end to end | Passes via suite G1; composition only, components verified individually above |
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct; honestly labeled int8-approximate (see observation 3.5) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
@@ -276,5 +280,35 @@ two live BAR1 mappings, (d) whether the GaLore V transport bias from uint8 round
 storage is bounded, and (e) whether the SPSC ring has any reordering the acquire/release
 pairs miss under a weak memory model (the current pass reasoned on x86 TSO plus the explicit
 C11 orderings). The second reviewer should read both the code and this document and confirm
-or dispute each finding here, including the two latent defects in section 4. Prompts for this
+or dispute each finding here, including the three latent defects in section 4. Prompts for this
 second pass are maintained outside the repository.
+
+## 6. Coverage summary
+
+This pass reviewed the full host-verifiable surface of the repository, file by file:
+
+* **Pillar math and kernels**: Cayley-SGD rotation and the sub-2-bit unpackers (`spinquant_packer.py`),
+  the PTX emulator constants and the host CTA shim primitives (`ptx_bf162_emu.c`,
+  `w1a16_host_cta_shim.hpp`), the Tiled-CBC Holder sieve (`tiled_cbc_sieve.py`), and LServe sparse
+  attention (`lserve_sparse_attn.py`).
+* **CPU engine**: the 4x8 GotoBLAS GEMM, W1/W2 packers and unpackers, the T-MAC LUT kernel, and the
+  SmartTieredCache error budget (`sub2bit_gemm_and_smart_cache.hpp`); the memory subsystem and hardware
+  discovery (`memory_primitives.hpp`, `hardware_and_sandbox.hpp`); the C ABI and SafeTensors bridge
+  (`kinesis_c_abi.cpp`, `kinesis_bridge.py`); and the sizing single-source-of-truth (`unified_sizing.h`).
+* **QAT / optimizer**: the fused STE (`fused_qat_ste.py`) and 8-bit GaLore with moment reprojection
+  (`galore_async_offload.py`).
+* **Runtime and firmware mocks**: the SPSC AMX ring (`chorus_amx_moe.c`), the closed-loop governor
+  (`closed_loop_governor.py` / `.c`), the driver BAR1 and S3 mock (`nv_gpu_ops_and_s3_unlock.c`), and the
+  cuBLAS device-ID shim (`libcublas_unlock_shim.c`).
+* **Models and integration**: the SMSP roofline model (`smsp_roofline_sim.py`), the unlocked Triton GEMM
+  configs (`unlocked_gemm.py`), the empirical CPU roofline bench (`bench_cpu_roofline.cpp`), and the
+  end-to-end 5-pillar pipeline (`e2e_transformer_pipeline.py`).
+
+Result of the independent pass: **no correctness defect** was found in any math, quantization,
+serialization, or marshalling path. Every such path was re-derived and, where runnable, executed
+(all 20 host suites pass). The findings are: **three low-severity latent defects** on untested paths
+(sections 4.3, 4.4, 4.5, none reached by the Win/Linux CI), **two documentation inconsistencies** in
+doc 11 (sections 4.1, 4.2, both fixed), and a set of caveats and modelling assumptions (sections 2 and 3)
+that are true-by-design limits rather than bugs. The single largest unverified surface remains the GPU
+device code: the PTX is modelled, not assembled, and the Triton kernels have no host execution path, so
+nothing here proves `ptxas` acceptance, register or occupancy counts, or any on-GPU performance figure.
