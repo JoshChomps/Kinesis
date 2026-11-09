@@ -43,7 +43,7 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | T-MAC 256-bit vpshufb LUT (F14) | `kinesis_unified/sub2bit_gemm_and_smart_cache.hpp` | 16-entry sign-combination LUT per 4-chunk, 4-panel (32-column) nibble interleave feeding one `_mm256_shuffle_epi8`, scale chain `acc * a_scale * w_scale` | Correct for finite inputs; honestly labeled int8-approximate (see observation 3.5). **Second pass:** NaN dropped, NaN-to-int8 cast is UB (4.12) |
 
 The full suite reports 20/20 passing (`python run_all_tests.py`, 0 warnings) on the
-verification host.
+verification host. After the 2026-11-08 fix pass it reports 22/22 (two suites added: E4 Chorus fallback, F4 F21 build matrix).
 
 ## 2. Caveats (true limitations, not bugs)
 
@@ -241,6 +241,8 @@ The fix itself is correct where it lives; the claim that it also touched
 refactored). Recommend dropping `smsp_roofline_sim.py` from the F18 and section 0.2 text.
 
 ### 4.3 Latent defect: single-threaded fallback deadlocks the bounded ring
+**FIXED (2026-11-08, docs/14 section 8).** The single-threaded build now drives the consumer inline whenever the producer would block; suite E4 builds that path on the host and passes 8/8.
+
 **Second pass: CONFIRMED by reproduction** (platform macros renamed so the `#else` path builds: the producer
 spins at `seq = 3` and the run hangs, timeout exit 124). The same path also misallocates the ring (4.15).
 
@@ -257,6 +259,8 @@ bounded ring: on a single-threaded platform the consumer must be interleaved wit
 or `num_slots` must be at least `total_dispatches`.
 
 ### 4.4 Latent defect: ring slot count truncated to 16 bits on free
+**CLOSED (2026-11-08, docs/14 section 8).** `_Static_assert(1 GB / sizeof(slot) <= 0xFFFF)` plus a runtime reject above 65,535 slots.
+
 **Second pass: DISPUTED as stated, unreachable with current constants.** A slot is 263,296 B, so the 1 GB
 guard (`bytes <= 1 GB`, which the paragraph below omits) caps the ring at 4,078 slots, not about 7,700, and
 65,535 is never reachable. It becomes reachable only if a slot shrinks below 16 KiB (for example
@@ -271,6 +275,8 @@ or leak). The intended 1 GB regime holds at most 4,078 slots (corrected from "ro
 latent, but the allocator should reject `num_slots > 0xFFFF` explicitly or widen the tag.
 
 ### 4.5 Defect (reachable): C ABI size contract is implicit and the copies are unbounded
+**FIXED (2026-11-08, docs/14 section 8).** Every packed buffer crosses the ABI with its element capacity; short buffers return -3 untouched, and the GPU convert rejects `K % 128 != 0` in C++, the ABI and Python. Regression: F2 [5].
+
 **Second pass: CONFIRMED and UPGRADED from latent to reachable.** `KinesisNativeBridge.convert_w1_to_gpu_interleaved`
 allocates `N * (K // 128)` bf16 scales, while `convert_w1_gotoblas_to_gpu_interleaved_u32` writes
 `N * ceil(K / 128)` and the ABI only checks `K % 32 == 0`. With K=160 and N=8, the bridge allocates 8 scales and C++
@@ -294,6 +300,8 @@ Severity is low for the current in-repo caller, but this is the most dangerous f
 the bridge because it corrupts memory rather than returning an error code.
 
 ### 4.6 Defect (HIGH, second pass): GaLore uint8 round-up `sqrt(V)` storage ratchets
+**FIXED (2026-11-08, docs/14 section 8).** 8-bit log code with stochastic rounding that is unbiased in V (provably E[V_hat_t] = V_t). Measured median 0.988, E[V_hat/V] 0.999 over 3000 steps. Regression: D2 [V].
+
 `quantize_unsigned_uint8(..., round_up=True)` applies `ceil` every step. Because the stored value is
 dequantized, updated and re-quantized each step, the round-up error compounds:
 `e_{t+1} <= sqrt(b2) e_t + q`. The steady state is about `q / (1 - sqrt(b2))`, roughly 2000 quanta
@@ -305,6 +313,8 @@ therefore shrink by 2.5x to 50x over training: a hidden learning-rate decay that
 bounded in practice. This answers 5(d). The 6-step suite D2 cannot see it. Fix plan: docs/14 F-B.
 
 ### 4.7 Defect (HIGH, second pass): roofline FLOP-per-HMMA inconsistency
+**FIXED (2026-11-08, docs/14 section 8).** tau re-based to the m16n8k16 interval (32 locked / 16 unlocked, peaks unchanged), with an assertion that `t_mma` and `peak_tflops` agree. Every row is now compute-bound in both states; docs/01 table corrected.
+
 `peak_tflops` uses 2048 FLOP per HMMA (`2048/tau * 4` per SM per clock), but `t_mma` counts m16n8k16
 instructions, and each of those is `16*8*16*2 = 4096` FLOP (the code's own comment says this). The implied
 SRAM ridge is therefore 8 (locked) / 16 (unlocked) FLOP/B, not the stated 4 / 8. Recomputing the margins
@@ -316,6 +326,8 @@ is compute-bound both locked and unlocked. The only "stalls when unlocked" row (
 Fix plan: docs/14 F-E.
 
 ### 4.8 Defect (HIGH for training, second pass): clipped STE at c=1.5 permanently freezes weights
+**MITIGATED (2026-11-08, docs/14 section 8).** Severity corrected to LOW: the clip is opt-in, and the in-repo e2e value c=2.5 measured harmless (4.5% gated, loss and sign accuracy equal to unclipped). `clip_mult` in (0, 2.5) now warns with the gated fraction erfc(c/sqrt(pi)); negative or non-finite values are rejected. The self-test uses 2.5.
+
 With a Gaussian init, `P(|w| > 1.5 * alpha_g)` is about 23%. Those weights get zero gradient from step 0,
 and since `alpha_g` does not shrink, they never re-enter the range. About half of them have the wrong
 sign. In a teacher-student run (binary-g128 teacher, M=256, K=512, N=128, Adam 1e-4, 400 steps), sign
@@ -325,6 +337,8 @@ observation 3.4. Note: `clip_mult` defaults to 0 (clipping off) in both `FusedQA
 of the opt-in clipped mode, not shipped-default behaviour. Fix plan: docs/14 F-C.
 
 ### 4.9 Defect (MED, second pass): bf16 master weights stall under a plain optimizer
+**MITIGATED (2026-11-08, docs/14 section 8).** `FusedQATG128Linear(master_dtype=...)` added; bf16 stays the default for the memory budget, with the caveat documented. Regression: D1 [6] (fp32 masters 100% of weights updated).
+
 `FusedQATG128Linear` defaults to bf16 master weights. With a plain torch optimizer, 73.5% (SGD lr 0.5) /
 56% (Adam 1e-4) of weights get no update on a given step, because the update is below half a bf16 ulp.
 SGD loss ended at 7.5e-4 with bf16 masters and 2.4e-4 with fp32 masters (start 0.262). The GaLore engine's
@@ -333,6 +347,8 @@ appears instead: 2.4% of groups get a scale 1 bf16 ulp off the packer's, and tin
 the opposite sign. Fix plan: docs/14 F-D.
 
 ### 4.10 Convention gap (MED, second pass): QAT trains the wrong basis and has no ternary path
+**OPEN (feature work, docs/14 section 8).** The "0 bytes" print now says it is by construction and not measured; rotated-basis QAT and a ternary QAT forward are not implemented.
+
 The packer quantizes `W @ R1` but QAT trains unrotated W, and sign agreement between the two is 0.487
 (chance), so QAT results do not transfer to the rotated deploy. QAT also implements binary only: the
 packer's W2 has about 31% zeros while QAT `W_hat` has 0%. The "0 bytes for W_hat" claim holds for the
@@ -340,6 +356,8 @@ Triton forward and dX kernels, but the clip path allocates about 226 MiB at 4096
 `W_hat`), and line 242 prints a hardcoded string rather than a measurement. Fix plan: docs/14 F-G.
 
 ### 4.11 Defect (MED, second pass): F21 stack-alignment fix does not cover -O0 / -fno-inline
+**FIXED (2026-11-08, docs/14 section 8).** No by-value `__m256` anywhere, `-Wa,-muse-unaligned-vector-move` in every mingw build, and a `#warning` for `-mavx2` without `-mfma`. Suite F4 builds -O0, -O3 -fno-inline and -O3, runs them, and scans for aligned YMM stack moves (0 in each).
+
 A `-O0` mingw build of `test_kinesis_unified.cpp` segfaults on `vmovaps %ymm0,-0x50(%rbp)` at hpp:920
 (`execute_smart_w1_gemm`). `-O3 -fno-inline` still emits an unrealigned `vmovaps` ymm stack store for the
 by-value `__m256 v_scale` argument of `avx2_unpack_*`, and survives only by stack luck. Builds at `-O1`
@@ -348,6 +366,8 @@ Also: the AVX2 gate requires `__FMA__`, so a build with only `-mavx2` silently c
 Fix plan: docs/14 F-I.
 
 ### 4.12 Defect (MED, second pass): NaN activations silently skipped
+**FIXED (2026-11-08, docs/14 section 8).** T-MAC accumulates non-finite groups exactly in FP32 (no int8 cast), and all gates use NaN-sticky max and `!(x <= tau)`. Also fixed: one Inf used to make the T-MAC sieve skip every finite group of its row. Regressions: F1 [9], C1 [5], C2 [5], B3 [6].
+
 * The Python sieve does not execute a NaN tile, giving 64/64 finite rows.
 * The `.cu` mask is 0x0 even at tau=0, because `NaN*alpha > tau` is false and `fmaxf` drops NaN.
 * The in-kernel `mi_max > group_max` is false for NaN; this is safe only at the default `tau <= 0`,
@@ -361,6 +381,8 @@ The C++ SmartTieredCache maps non-finite values to inf and never skips them, whi
 Fix plan: docs/14 F-H.
 
 ### 4.13 Semantics (MED, second pass): only the C++ sieve carries the `<= eps` guarantee
+**CLARIFIED (2026-11-08, docs/14 section 8).** The `.cu` gate is documented as a per-sub-tile threshold, and `tiled_cbc_subtile_tau_for_budget(eps, K) = eps/(K/32)` gives a sound total budget by the union bound (C1 [6]). The Python and in-kernel gates are documented as activation-energy thresholds.
+
 The cumulative sorted-bound budget exists only in `SmartTieredCache::plan_panel_sieve`.
 `tiled_cbc_subtile_rowmax_bound_mask` thresholds each 32-wide sub-tile independently, so total skipped
 error is up to (#skipped sub-tiles) x tau. `warp_sieve_k32_active` has no weight-scale factor and
@@ -368,6 +390,8 @@ accumulates the row L1 in bf16 (it rounds and can under-estimate). This generali
 the `.cu` and kernel gates. Fix plan: docs/14 F-J.
 
 ### 4.14 Convention gap (LOW-MED, second pass): CPU W2 quantizer differs from GPU W2
+**FIXED (2026-11-08, docs/14 section 8).** The CPU packer now uses BitNet b1.58 absmean, the GPU rule. CPU vs GPU dequantized mismatches: 0/20,480 (F2 [6]).
+
 The CPU scale is mean|w| over `|w| >= 0.5*mean|w|` with round-half-away; the GPU/spinquant scale is plain
 mean|w| with round-half-even and a 1e-6 clamp. On the same weights, 128/128 groups get a different scale,
 1507/16384 trits differ, and the zero fraction is 0.402 vs 0.310. The "L2-optimal over active trits"
@@ -375,11 +399,15 @@ comment is also not self-consistent, because the set used for the scale differs 
 Fix plan: docs/14 F-F.
 
 ### 4.15 Latent defect (LOW, second pass): generic ring allocator is misaligned
+**FIXED (2026-11-08, docs/14 section 8).** Portable over-allocated 64-byte alignment (UCRT has no `aligned_alloc`), with an unlock-then-free path. Exercised by E4.
+
 The `#else` allocator in `chorus_amx_moe.c` uses `calloc` for an `aligned(64)` struct. The alignment
 assert fires on that build, and over-aligned `_Atomic` access through it is UB. macOS falls into this
 branch, because `__unix__` is not defined on Apple. It is the same platform set as 4.3. Fix plan: docs/14 F-K.
 
 ### 4.16 Test-coverage gaps (LOW, second pass)
+**PARTLY FIXED (2026-11-08, docs/14 section 8).** The Cayley test now requires improvement over the initial rotation (2.59 -> 1.82). Still open: same-dataset LServe comparison, sieve negative controls, the D1 dW tautology, the D2 table tautology, and a Linux `dladdr` test for the shim.
+
 Several suites pass for reasons other than the property they claim to check:
 * **Cayley (B4)**: `k_after < k_before` passes with 0 steps, because the fixed Hadamard init alone gives
   25.00 -> 2.594.
@@ -395,6 +423,8 @@ Several suites pass for reasons other than the property they claim to check:
   hardware HMMA bit-exactness.
 
 ### 4.17 Minor items (second pass)
+**PARTLY FIXED (2026-11-08, docs/14 section 8).** `ptx_max_bf162` NaN semantics and the shim `GET_NAME_STRING` bounded scan are fixed with tests. Still open: AMX emulator add order (needs the SDM text checked), LServe outward rounding, and the H_2 gain note.
+
 * The AMX emulator computes `c + (a0b0 + a1b1)`; the SDM is `(c + a0b0) + a1b1`.
 * `ptx_max_bf162` returns b when b is NaN; PTX max returns the non-NaN operand.
 * `GET_NAME_STRING` calls `strstr` on a buffer that may not be NUL-terminated.
@@ -450,6 +480,8 @@ This pass reviewed the full host-verifiable surface of the repository, file by f
 > paragraph below. It found correctness defects in a quantization path (4.6), a model's published
 > verdicts (4.7), a marshalling path (4.5, reachable heap overflow), training behaviour (4.8 to 4.10),
 > and NaN handling (4.12). The paragraph is kept as the first pass's record.
+> A fix pass on 2026-11-08 (docs/14 section 8) closed 4.3 to 4.7, 4.11, 4.12, 4.14 and 4.15 in code, with
+> regression tests (22/22 suites). 4.10 and parts of 4.16/4.17 remain open.
 
 Result of the first independent pass: **no correctness defect** was found in any math, quantization,
 serialization, or marshalling path. Every such path was re-derived and, where runnable, executed

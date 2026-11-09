@@ -34,7 +34,9 @@ if str(ROOT_DIR / "fused_w1_hadacore") not in sys.path:
 from spinquant_packer import (  # noqa: E402
     optimize_kronecker_stiefel_rotation,
     quantize_and_pack_w1_g128_interleaved,
+    quantize_and_pack_w2_ternary_interleaved,
     unpack_w1_g128_lop3_reference,
+    unpack_w2_ternary_lop3_reference,
 )
 
 
@@ -69,7 +71,8 @@ def build_or_locate_kinesis_shared_lib(force_rebuild: bool = False) -> Path:
             "-shared",
         ]
         if os.name == "nt":
-            cmd.extend(["-static-libgcc", "-static-libstdc++", "-static"])
+            # -Wa,-muse-unaligned-vector-move: F21 / GCC PR 54412, see docs/12 4.11
+            cmd.extend(["-static-libgcc", "-static-libstdc++", "-static", "-Wa,-muse-unaligned-vector-move"])
         else:
             cmd.append("-fPIC")
         cmd.extend([
@@ -119,23 +122,26 @@ class KinesisNativeBridge:
         c_u32_p = ctypes.POINTER(ctypes.c_uint32)
         c_size_p = ctypes.POINTER(ctypes.c_size_t)
 
+        sz = ctypes.c_size_t
+        # Every packed buffer is followed by its capacity in elements (docs/12 4.5); the C side returns
+        # -3 instead of writing or reading past a short buffer.
         self._lib.uha_kinesis_pack_w1_panels.argtypes = [
-            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u8_p, c_u16_p
+            c_f32_p, sz, sz, c_u8_p, sz, c_u16_p, sz
         ]
         self._lib.uha_kinesis_pack_w1_panels.restype = ctypes.c_int
 
         self._lib.uha_kinesis_pack_w2_panels.argtypes = [
-            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u16_p, c_u16_p
+            c_f32_p, sz, sz, c_u16_p, sz, c_u16_p, sz
         ]
         self._lib.uha_kinesis_pack_w2_panels.restype = ctypes.c_int
 
         self._lib.uha_kinesis_pack_tmac_w1_panels.argtypes = [
-            c_f32_p, ctypes.c_size_t, ctypes.c_size_t, c_u32_p, c_u16_p
+            c_f32_p, sz, sz, c_u32_p, sz, c_u16_p, sz
         ]
         self._lib.uha_kinesis_pack_tmac_w1_panels.restype = ctypes.c_int
 
         self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32.argtypes = [
-            c_u8_p, c_u16_p, ctypes.c_size_t, ctypes.c_size_t, c_u32_p, c_u16_p
+            c_u8_p, sz, c_u16_p, sz, sz, sz, c_u32_p, sz, c_u16_p, sz
         ]
         self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32.restype = ctypes.c_int
 
@@ -145,21 +151,21 @@ class KinesisNativeBridge:
         self._lib.uha_kinesis_gemm_fp32_4x8.restype = ctypes.c_int
 
         self._lib.uha_kinesis_smart_w1_gemm.argtypes = [
-            c_f32_p, c_u8_p, c_u16_p, c_f32_p,
+            c_f32_p, c_u8_p, sz, c_u16_p, sz, c_f32_p,
             ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_float, c_size_p, c_size_p,
         ]
         self._lib.uha_kinesis_smart_w1_gemm.restype = ctypes.c_int
 
         self._lib.uha_kinesis_smart_w2_gemm.argtypes = [
-            c_f32_p, c_u16_p, c_u16_p, c_f32_p,
+            c_f32_p, c_u16_p, sz, c_u16_p, sz, c_f32_p,
             ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_float, c_size_p, c_size_p,
         ]
         self._lib.uha_kinesis_smart_w2_gemm.restype = ctypes.c_int
 
         self._lib.uha_kinesis_tmac_lut_w1_gemm.argtypes = [
-            c_f32_p, c_u32_p, c_u16_p, c_f32_p,
+            c_f32_p, c_u32_p, sz, c_u16_p, sz, c_f32_p,
             ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_float, c_size_p, c_size_p,
         ]
@@ -178,7 +184,9 @@ class KinesisNativeBridge:
             K,
             N,
             ctypes.cast(bits.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            bits.numel(),
             ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_u16.numel(),
         )
         if rc != 0:
             raise RuntimeError(f"uha_kinesis_pack_w1_panels failed with status {rc}")
@@ -197,7 +205,9 @@ class KinesisNativeBridge:
             K,
             N,
             ctypes.cast(trits_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            trits_u16.numel(),
             ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_u16.numel(),
         )
         if rc != 0:
             raise RuntimeError(f"uha_kinesis_pack_w2_panels failed with status {rc}")
@@ -218,7 +228,9 @@ class KinesisNativeBridge:
             K,
             N,
             ctypes.cast(nibbles_u32.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            nibbles_u32.numel(),
             ctypes.cast(scales_u16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_u16.numel(),
         )
         if rc != 0:
             raise RuntimeError(f"uha_kinesis_pack_tmac_w1_panels failed with status {rc}")
@@ -228,17 +240,24 @@ class KinesisNativeBridge:
         self, bits: torch.Tensor, scales_u16: torch.Tensor, K: int, N: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Losslessly converts CPU GotoBLAS W1 panels into GPU [N, K/32] Interleaved uint32 layout."""
+        if K <= 0 or N <= 0 or K % 128 != 0:
+            # GPU layout [N, K/128] has no tail group (docs/12 4.5).
+            raise ValueError(f"convert_w1_to_gpu_interleaved requires K % 128 == 0 and N > 0 (got K={K}, N={N})")
         bits_c = bits.detach().to(device="cpu", dtype=torch.uint8).contiguous()
         scales_c = scales_u16.detach().to(device="cpu", dtype=torch.int16).contiguous()
         gpu_u32 = torch.empty((N, K // 32), dtype=torch.int32, device="cpu")
         gpu_scales_bf16 = torch.empty((N, K // 128), dtype=torch.bfloat16, device="cpu")
         rc = self._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32(
             ctypes.cast(bits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            bits_c.numel(),
             ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_c.numel(),
             K,
             N,
             ctypes.cast(gpu_u32.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            gpu_u32.numel(),
             ctypes.cast(gpu_scales_bf16.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            gpu_scales_bf16.numel(),
         )
         if rc != 0:
             raise RuntimeError(f"uha_kinesis_convert_w1_to_gpu_interleaved_u32 failed with status {rc}")
@@ -281,7 +300,9 @@ class KinesisNativeBridge:
         rc = self._lib.uha_kinesis_smart_w1_gemm(
             ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(bits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint8)),
+            bits_c.numel(),
             ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_c.numel(),
             ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             M,
             N,
@@ -318,7 +339,9 @@ class KinesisNativeBridge:
         rc = self._lib.uha_kinesis_smart_w2_gemm(
             ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(trits_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            trits_c.numel(),
             ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_c.numel(),
             ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             M,
             N,
@@ -355,7 +378,9 @@ class KinesisNativeBridge:
         rc = self._lib.uha_kinesis_tmac_lut_w1_gemm(
             ctypes.cast(a_c.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(nibbles_c.data_ptr(), ctypes.POINTER(ctypes.c_uint32)),
+            nibbles_c.numel(),
             ctypes.cast(scales_c.data_ptr(), ctypes.POINTER(ctypes.c_uint16)),
+            scales_c.numel(),
             ctypes.cast(c_mn.data_ptr(), ctypes.POINTER(ctypes.c_float)),
             M,
             N,
@@ -629,6 +654,67 @@ def run_kinesis_bridge_verification() -> None:
         f"{ckpt_stats['kurtosis_kron']:.2f} | Compression = {ckpt_stats['mlp_compression_vs_fp32']:.2f}x | "
         f"SafeTensors Bytes = {len(blob)} (0 bit errors) | PASS"
     )
+
+    # [5] docs/12 4.5 regression: the ABI size contract is explicit and enforced.
+    #   (a) K % 128 != 0 is rejected before any buffer is allocated or written (used to overflow by
+    #       N*16 bytes for K=160).
+    #   (b) A caller buffer one element short gets status -3 and is left untouched (sentinel check),
+    #       for both an output (convert) and an input (smart GEMM reconstruction) buffer.
+    K_bad, N_bad = 160, 8
+    bits_bad, scales_bad = bridge.pack_w1_panels(torch.randn((K_bad, N_bad)))
+    try:
+        bridge.convert_w1_to_gpu_interleaved(bits_bad, scales_bad, K_bad, N_bad)
+        raise AssertionError("K=160 must be rejected by convert_w1_to_gpu_interleaved")
+    except ValueError:
+        pass
+    c_u8, c_u16, c_u32 = (ctypes.POINTER(t) for t in (ctypes.c_uint8, ctypes.c_uint16, ctypes.c_uint32))
+    rc_k160 = bridge._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32(
+        ctypes.cast(bits_bad.data_ptr(), c_u8), bits_bad.numel(),
+        ctypes.cast(scales_bad.data_ptr(), c_u16), scales_bad.numel(), K_bad, N_bad,
+        ctypes.cast(torch.empty(N_bad * K_bad // 32, dtype=torch.int32).data_ptr(), c_u32), N_bad * K_bad // 32,
+        ctypes.cast(torch.empty(N_bad, dtype=torch.int16).data_ptr(), c_u16), N_bad,
+    )
+    assert rc_k160 == -1, rc_k160
+    sentinel = 0x5A5A
+    short_scales = torch.full((N_w1 * (K_w1 // 128) - 1 + 4,), sentinel, dtype=torch.int16)
+    rc_short_out = bridge._lib.uha_kinesis_convert_w1_to_gpu_interleaved_u32(
+        ctypes.cast(bits_u8.data_ptr(), c_u8), bits_u8.numel(),
+        ctypes.cast(scales_i16.data_ptr(), c_u16), scales_i16.numel(), K_w1, N_w1,
+        ctypes.cast(torch.empty(N_w1 * K_w1 // 32, dtype=torch.int32).data_ptr(), c_u32), N_w1 * K_w1 // 32,
+        ctypes.cast(short_scales.data_ptr(), c_u16), N_w1 * (K_w1 // 128) - 1,
+    )
+    assert rc_short_out == -3 and bool((short_scales == sentinel).all()), rc_short_out
+    rc_short_in = bridge._lib.uha_kinesis_smart_w1_gemm(
+        ctypes.cast(a_w1.contiguous().data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        ctypes.cast(bits_u8.data_ptr(), c_u8), bits_u8.numel() - 1,
+        ctypes.cast(scales_i16.data_ptr(), c_u16), scales_i16.numel(),
+        ctypes.cast(torch.empty((M_w1, N_w1)).data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        M_w1, N_w1, K_w1, ctypes.c_float(0.0), None, None,
+    )
+    assert rc_short_in == -3, rc_short_in
+    print("[5] C ABI Size Contract (docs/12 4.5)           : K=160 rejected (-1), short out/in buffers -> -3, "
+          "sentinel intact | PASS")
+
+    # [6] docs/12 4.14 regression: the CPU W2 GotoBLAS packer and the GPU (spinquant) W2 packer must produce the
+    # same dequantized ternary weights for the same input, so a W2 tile decodes identically on either tier.
+    torch.manual_seed(9)
+    K_c, N_c = 512, 40
+    w_c_nk = torch.randn((N_c, K_c)) * 0.03
+    w_c_nk[3, :128] = 0.0                       # an all-zero group (exercises the 1e-6 clamp)
+    trits_cpu, sc_cpu = bridge.pack_w2_panels(w_c_nk.T.contiguous())
+    gc = K_c // 128
+    tr = trits_cpu.view(torch.int16).to(torch.int32) & 0xFFFF
+    cpu_deq = torch.empty((N_c, K_c))
+    sc_f32 = sc_cpu.view(torch.bfloat16).to(torch.float32)
+    for n in range(N_c):
+        p, c = divmod(n, 8)
+        codes = ((tr[p * K_c:(p + 1) * K_c] >> (2 * c)) & 3) - 1
+        scales = sc_f32[(p * gc + torch.arange(gc)) * 8 + c].repeat_interleave(128)
+        cpu_deq[n] = codes.to(torch.float32) * scales
+    gpu_deq = unpack_w2_ternary_lop3_reference(*quantize_and_pack_w2_ternary_interleaved(w_c_nk)).to(torch.float32)
+    w2_cross = int((cpu_deq != gpu_deq).sum().item())
+    assert w2_cross == 0, w2_cross
+    print(f"[6] W2 CPU GotoBLAS vs GPU spinquant (docs/12 4.14): dequantized mismatches = {w2_cross}/{N_c * K_c} | PASS")
     print("\n[+] ALL SUITE F2 NATIVE C++20 BRIDGE & SAFETENSORS CHECKS PASSED.")
 
 

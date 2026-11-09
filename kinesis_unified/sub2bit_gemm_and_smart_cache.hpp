@@ -26,6 +26,10 @@
 #if defined(__AVX2__) && (defined(_MSC_VER) || defined(__FMA__))
 #include <immintrin.h>
 #define KINESIS_UNIFIED_HAS_AVX2 1
+#elif defined(__AVX2__) && !defined(KINESIS_UNIFIED_ALLOW_SCALAR)
+// The AVX2 kernels use _mm256_fmadd_ps, so they need -mfma as well. Without it every kernel silently falls back
+// to the scalar path (docs/12 4.11). Define KINESIS_UNIFIED_ALLOW_SCALAR to accept that deliberately.
+#warning "sub2bit_gemm_and_smart_cache.hpp: -mavx2 without -mfma builds the SCALAR kernels; add -mfma"
 #endif
 
 namespace kinesis::unified {
@@ -333,7 +337,11 @@ struct W1GotoBlasPanelSet {
  *          bit c == 0 -> -scale[c]
  */
 #if defined(KINESIS_UNIFIED_HAS_AVX2)
-[[nodiscard]] inline __m256 avx2_unpack_w1_nr8_byte(uint8_t packed_byte, __m256 v_scale) noexcept {
+// The scale is taken as a pointer to 8 floats and loaded unaligned inside, never as a by-value __m256: on
+// x86_64-w64-mingw32 a by-value __m256 is materialized in a caller stack temporary with an aligned vmovaps that
+// the 16-byte Windows x64 stack does not guarantee (GCC PR 54412; docs/12 4.11, seen at -O3 -fno-inline).
+[[nodiscard]] inline __m256 avx2_unpack_w1_nr8_byte(uint8_t packed_byte, const float* scale8) noexcept {
+    const __m256 v_scale = _mm256_loadu_ps(scale8);
     const __m256i bit_positions = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
     const __m256i bcast = _mm256_set1_epi32(static_cast<int>(packed_byte));
     const __m256i masked = _mm256_and_si256(bcast, bit_positions);
@@ -401,19 +409,12 @@ struct W2GotoBlasPanelSet {
                         asum += std::fabs(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c)));
                     }
                     const float mean_abs = (k_len > 0) ? (asum / static_cast<float>(k_len)) : 0.0f;
-                    const float thresh = 0.5f * mean_abs;
-                    // Compute conditional L2-optimal scale over active (non-zero) trits
-                    float active_sum = 0.0f;
-                    size_t active_cnt = 0;
-                    for (size_t k = k_base; k < k_end; ++k) {
-                        const float av = std::fabs(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c)));
-                        if (av >= thresh) {
-                            active_sum += av;
-                            ++active_cnt;
-                        }
-                    }
-                    float sc = (active_cnt > 0) ? (active_sum / static_cast<float>(active_cnt)) : mean_abs;
-                    if (sc < 1e-6f) sc = 0.0f;
+                    // BitNet b1.58 absmean (Ma et al. 2024): gamma = mean|W| over the group, W~ = RoundClip(W/gamma,
+                    // -1, 1). This is the exact rule the GPU packer (spinquant_packer.quantize_and_pack_w2_ternary_
+                    // interleaved) and kernels use: same 1e-6 clamp, bf16-rounded scale, round-half-even division.
+                    // The previous conditional-mean scale differed on every group (docs/12 4.14), so a W2 tile
+                    // decoded differently on the CPU tier than on the GPU tier.
+                    const float sc = std::max(mean_abs, 1e-6f);
                     const uint16_t sc_bf16 = fp32_to_bf16_bits(sc);
                     out.packed_scales_bf16[(p * out.groups_per_col + g) * kNr8 + c] = sc_bf16;
                     scales_f32[c] = bf16_bits_to_fp32(sc_bf16);
@@ -426,7 +427,8 @@ struct W2GotoBlasPanelSet {
                     uint16_t q_code = 1U; // 0 -> -1, 1 -> 0, 2 -> +1
                     if (n_base + c < out.N) {
                         const float v = W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c));
-                        const float scaled = (scales_f32[c] > 0.0f) ? std::round(v / scales_f32[c]) : 0.0f;
+                        // std::nearbyint under the default FE_TONEAREST mode is round-half-even, matching torch.round
+                        const float scaled = (scales_f32[c] > 0.0f) ? std::nearbyint(v / scales_f32[c]) : 0.0f;
                         const int tr = std::clamp(static_cast<int>(scaled), -1, 1);
                         q_code = static_cast<uint16_t>(tr + 1);
                     }
@@ -440,7 +442,8 @@ struct W2GotoBlasPanelSet {
 }
 
 #if defined(KINESIS_UNIFIED_HAS_AVX2)
-[[nodiscard]] inline __m256 avx2_unpack_w2_nr8_u16(uint16_t packed_trits, __m256 v_scale) noexcept {
+[[nodiscard]] inline __m256 avx2_unpack_w2_nr8_u16(uint16_t packed_trits, const float* scale8) noexcept {
+    const __m256 v_scale = _mm256_loadu_ps(scale8);
     const __m256i shifts = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
     const __m256i bcast = _mm256_set1_epi32(static_cast<int>(packed_trits));
     const __m256i codes = _mm256_and_si256(_mm256_srlv_epi32(bcast, shifts), _mm256_set1_epi32(0x3));
@@ -459,8 +462,16 @@ inline void convert_w1_gotoblas_to_gpu_interleaved_u32(
     std::vector<uint32_t>& gpu_w_packed_u32,   // [N, K / 32]
     std::vector<uint16_t>& gpu_scales_bf16     // [N, K / 128]
 ) {
-    if (cpu_panels.K == 0 || (cpu_panels.K % UHA_W1_WEIGHTS_PER_U32) != 0) {
-        throw std::invalid_argument("convert_w1_gotoblas_to_gpu_interleaved_u32 requires K > 0 and K % 32 == 0");
+    // The GPU layout is [N, K/128] scales with no tail group, so K must be a multiple of 128 (which
+    // implies K % 32 == 0). Accepting K % 128 != 0 used to emit N*ceil(K/128) scales, one more per
+    // column than the GPU layout and the Python caller allocate (docs/12 4.5).
+    if (cpu_panels.K == 0 || (cpu_panels.K % kGroupSizeG128) != 0) {
+        throw std::invalid_argument("convert_w1_gotoblas_to_gpu_interleaved_u32 requires K > 0 and K % 128 == 0");
+    }
+    if (cpu_panels.groups_per_col != cpu_panels.K / kGroupSizeG128 ||
+        cpu_panels.packed_bits.size() < cpu_panels.num_panels * cpu_panels.K ||
+        cpu_panels.packed_scales_bf16.size() < cpu_panels.num_panels * cpu_panels.groups_per_col * kNr8) {
+        throw std::invalid_argument("convert_w1_gotoblas_to_gpu_interleaved_u32: panel set is inconsistent with K/N");
     }
     const size_t K = cpu_panels.K;
     const size_t N = cpu_panels.N;
@@ -591,6 +602,7 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
 
     // Allocate per-row scratch buffers once outside the M row loop
     std::vector<float> g_scale(groups, 0.0f), g_energy(groups, 0.0f);
+    std::vector<uint8_t> g_nonfinite(groups, 0);
     std::vector<int8_t> aq(K, 0);
 
     for (size_t m = 0; m < M; ++m) {
@@ -600,16 +612,31 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
         std::fill(g_scale.begin(), g_scale.end(), 0.0f);
         std::fill(g_energy.begin(), g_energy.end(), 0.0f);
         std::fill(aq.begin(), aq.end(), static_cast<int8_t>(0));
+        std::fill(g_nonfinite.begin(), g_nonfinite.end(), static_cast<uint8_t>(0));
+        // Non-finite activations (docs/12 4.12): std::max(amax, NaN) silently returns amax, so a NaN used to be
+        // dropped (or, in a live group, cast to int8, which is UB). A group with any NaN/Inf now skips int8
+        // quantization and is accumulated exactly in FP32 below, so NaN/Inf propagate with IEEE semantics. It is
+        // never sieved, and it is excluded from the row's mean energy (one Inf would otherwise make the
+        // threshold infinite and skip every finite group of the row).
         float mean_energy = 0.0f;
+        size_t finite_groups = 0;
         for (size_t g = 0; g < groups; ++g) {
             float amax = 0.0f, l1 = 0.0f;
+            bool nonfinite = false;
             for (size_t k = g * kGroupSizeG128; k < (g + 1) * kGroupSizeG128; ++k) {
                 const float v = A(static_cast<int64_t>(m), static_cast<int64_t>(k));
+                nonfinite |= !std::isfinite(v);
                 amax = std::max(amax, std::fabs(v));
                 l1 += std::fabs(v);
             }
+            if (nonfinite) {
+                g_nonfinite[g] = 1;
+                g_energy[g] = std::numeric_limits<float>::infinity();
+                continue;
+            }
             g_energy[g] = l1;
             mean_energy += l1;
+            ++finite_groups;
             if (amax > 0.0f) {
                 g_scale[g] = amax / 127.0f;
                 for (size_t k = g * kGroupSizeG128; k < (g + 1) * kGroupSizeG128; ++k) {
@@ -618,11 +645,31 @@ inline TmacRunStats execute_tmac_lut_w1_gemm(
                 }
             }
         }
-        mean_energy = (groups > 0) ? mean_energy / static_cast<float>(groups) : 0.0f;
+        mean_energy = (finite_groups > 0) ? mean_energy / static_cast<float>(finite_groups) : 0.0f;
         const float thresh = (energy_sieve_tau > 0.0f) ? energy_sieve_tau * mean_energy : -1.0f;
 
         for (size_t g = 0; g < groups; ++g) {
             ++stats.groups_total;
+            if (g_nonfinite[g]) {
+                // Exact FP32 accumulation from the nibble signs: in word (p, k/4), nibble c bit (k % 4) is the sign
+                // of W[k, n_base + c] (1 -> +scale, 0 -> -scale), the same convention the LUT uses.
+                for (size_t p = 0; p < B.num_panels; ++p) {
+                    const size_t n_base = p * kNr8;
+                    const size_t n_valid = std::min(kNr8, N - n_base);
+                    const uint16_t* sc = &B.scales_bf16[(p * groups + g) * kNr8];
+                    for (size_t c = 0; c < n_valid; ++c) {
+                        const float s = bf16_bits_to_fp32(sc[c]);
+                        float sum = 0.0f;
+                        for (size_t k = g * kGroupSizeG128; k < (g + 1) * kGroupSizeG128; ++k) {
+                            const uint32_t word = B.nibbles[p * B.chunks() + k / kTmacChunk];
+                            const bool pos = ((word >> (4 * c + (k % kTmacChunk))) & 1U) != 0U;
+                            sum += A(static_cast<int64_t>(m), static_cast<int64_t>(k)) * (pos ? s : -s);
+                        }
+                        C(static_cast<int64_t>(m), static_cast<int64_t>(n_base + c)) += sum;
+                    }
+                }
+                continue;
+            }
             if (g_scale[g] == 0.0f || g_energy[g] < thresh) {
                 if (g_scale[g] != 0.0f) ++stats.groups_skipped; // skipped by the sieve, not by true zeros
                 continue;
@@ -914,10 +961,8 @@ public:
                     for (size_t c = 0; c < kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
-
                     for (size_t k = k_base; k < k_end; ++k) {
-                        const __m256 vb = avx2_unpack_w1_nr8_byte(bits_ptr[k], v_scale);
+                        const __m256 vb = avx2_unpack_w1_nr8_byte(bits_ptr[k], scale_f32);
                         if (m_valid > 0)
                             acc0 = _mm256_fmadd_ps(_mm256_set1_ps(A(static_cast<int64_t>(ir + 0), static_cast<int64_t>(k))), vb, acc0);
                         if (m_valid > 1)
@@ -1036,10 +1081,8 @@ public:
                     for (size_t c = 0; c < kNr8; ++c) {
                         scale_f32[c] = bf16_bits_to_fp32(scale_bf16_ptr[c]);
                     }
-                    const __m256 v_scale = _mm256_loadu_ps(scale_f32);
-
                     for (size_t k = k_base; k < k_end; ++k) {
-                        const __m256 vb = avx2_unpack_w2_nr8_u16(trits_ptr[k], v_scale);
+                        const __m256 vb = avx2_unpack_w2_nr8_u16(trits_ptr[k], scale_f32);
                         if (m_valid > 0)
                             acc0 = _mm256_fmadd_ps(_mm256_set1_ps(A(static_cast<int64_t>(ir + 0), static_cast<int64_t>(k))), vb, acc0);
                         if (m_valid > 1)

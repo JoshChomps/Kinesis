@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """
 File: sim_harness/smsp_roofline_sim.py
-Cycle-Accurate SMSP Roofline & Scoreboard Simulator for GA102 (sm_86) and AD102 (sm_89).
+Analytical SMSP Roofline & Scoreboard Contention Model for GA102 (sm_86) and AD102 (sm_89).
+(An analytical discrete-step model with stated assumptions, not a cycle-accurate simulator.)
 Models:
   - 4 SMSP warp schedulers per SM (N_SMSP = 4)
   - 32-bank Shared Memory crossbar (32 banks x 4B = 128 Bytes/cycle/SM)
   - cp.async.cg.shared.global L2/DRAM multi-stage arrival pipeline
   - ldmatrix.sync.aligned.m8n8.x4.shared.b16 (512 Bytes = 4 SM cycles conflict-free)
-  - HMMA.16816.F32 Tensor Core issue interval: tau = 16 cycles (Locked) vs tau = 8 cycles (Unlocked)
+  - HMMA.16816.F32 Tensor Core issue interval per SMSP: tau = 32 cycles (Locked) vs tau = 16 cycles (Unlocked)
+    FLOP accounting (docs/12 4.7): one m16n8k16 instruction is 2*16*8*16 = 4096 FLOP. tau is the interval between
+    m16n8k16 issues on one SMSP, so an SM does 4 * 4096 / tau FLOP/cycle: 512 locked (= 165.8 TF on AD102 at
+    2530 MHz, the public FP32-accumulate figure) and 1024 unlocked. Earlier versions used 2048 FLOP per HMMA in
+    peak_tflops but counted m16n8k16 instructions in t_mma, which halved every T_MMA and doubled every ridge.
   - Fused W1A16_F32 (Binary g128, 1.125 bpw, 14.22x compression) vs Dense W16A16 (BF16)
 """
 
 from dataclasses import dataclass
 from typing import List, Dict
+
+FLOPS_PER_HMMA_16816 = 2 * 16 * 8 * 16    # 4096 FLOP per mma.sync.m16n8k16 (2048 FMA)
+TAU_LOCKED = 32                           # cycles per m16n8k16 per SMSP, GeForce FP32-accumulate (half rate)
+TAU_UNLOCKED = 16                         # ASSUMPTION: the full-rate interval the unlock premise targets
 
 
 @dataclass(frozen=True)
@@ -32,10 +41,16 @@ class GPUArchSpec:
     def sram_bw_bytes_per_cycle(self) -> int:
         return self.sram_banks * self.bytes_per_bank_per_cycle  # 128 B/cycle/SM
 
+    def flops_per_sm_per_cycle(self, tau_cycles: int) -> float:
+        # Locked (tau=32): 512 FLOPs/cycle/SM; Unlocked (tau=16): 1,024 FLOPs/cycle/SM
+        return (FLOPS_PER_HMMA_16816 / tau_cycles) * self.smsp_per_sm
+
+    def sram_ridge_flops_per_byte(self, tau_cycles: int) -> float:
+        # Conflict-free SRAM ridge: compute rate / crossbar bandwidth. Locked 4.0, unlocked 8.0 FLOP/B.
+        return self.flops_per_sm_per_cycle(tau_cycles) / self.sram_bw_bytes_per_cycle
+
     def peak_tflops(self, tau_cycles: int) -> float:
-        # Locked (tau=16): 512 FLOPs/cycle/SM; Unlocked (tau=8): 1,024 FLOPs/cycle/SM
-        flops_per_sm_per_cycle = (2048.0 / tau_cycles) * self.smsp_per_sm
-        return (self.sm_count * flops_per_sm_per_cycle * (self.clock_mhz * 1e6)) / 1e12
+        return (self.sm_count * self.flops_per_sm_per_cycle(tau_cycles) * (self.clock_mhz * 1e6)) / 1e12
 
 
 GA102_RTX_3090 = GPUArchSpec(
@@ -118,6 +133,10 @@ def simulate_smsp_cycle_accurate(
 
     t_sram_step = (bytes_ldmatrix / gpu.sram_bw_bytes_per_cycle) * cfg.beta_conflict
     t_mma_step = (cfg.num_warps * hmma_per_warp_step / gpu.smsp_per_sm) * tau_cycles
+    # Single-source check (docs/12 4.7): the FLOP rate t_mma implies must equal the rate peak_tflops uses.
+    flops_per_step = cfg.num_warps * 2.0 * cfg.warp_m * cfg.warp_n * 16.0
+    implied = flops_per_step / t_mma_step
+    assert abs(implied - gpu.flops_per_sm_per_cycle(tau_cycles)) < 1e-9 * implied, (implied, tau_cycles)
 
     # Discrete-event simulation across k_iters steps with cp.async stage ring buffer
     sram_Crossbar_free_cycle = 0.0
@@ -125,8 +144,9 @@ def simulate_smsp_cycle_accurate(
     total_smsp_busy_cycles = 0.0
     total_smsp_stall_cycles = 0.0
 
-    # Pipeline stage latency penalty when num_stages < 4 on unlocked core (tau=8)
-    stage_refill_latency = max(0.0, (4 - cfg.num_stages) * 14.0 * (16.0 / tau_cycles))
+    # ASSUMPTION (stated, not derived): cp.async refill penalty of 14 cycles per missing stage below 4 when locked,
+    # doubling when unlocked. Kept numerically identical to the earlier model (tau re-based from 16/8 to 32/16).
+    stage_refill_latency = max(0.0, (4 - cfg.num_stages) * 14.0 * (float(TAU_LOCKED) / tau_cycles))
 
     for step in range(k_iters):
         # 1. cp.async stage arrival time
@@ -171,7 +191,7 @@ def simulate_smsp_cycle_accurate(
     }
 
 
-def evaluate_dram_ridge_points(gpu: GPUArchSpec, tau_cycles: int = 8) -> Dict[str, float]:
+def evaluate_dram_ridge_points(gpu: GPUArchSpec, tau_cycles: int = TAU_UNLOCKED) -> Dict[str, float]:
     peak_flops = gpu.peak_tflops(tau_cycles) * 1e12
     dram_bw = gpu.dram_bw_gbps * 1e9
     # Standard W16A16: 2 bytes per weight -> ridge point in FLOPs/Byte = Peak_FLOPs / DRAM_BW
@@ -199,6 +219,9 @@ def evaluate_dram_ridge_points(gpu: GPUArchSpec, tau_cycles: int = 8) -> Dict[st
 # ASSUMPTION: a decode GEMV is DRAM-bound and one SM can only pull a fraction of DRAM bandwidth; the GPU
 # needs roughly this fraction of its SMs active to saturate DRAM. Real values vary by part and access pattern.
 SM_FRACTION_TO_SATURATE_DRAM = 0.5
+# ASSUMPTION: fraction of the split-K FP32 partial-sum traffic (M * N * 4 B * splits, an upper bound) that spills
+# from L2 to DRAM. Atomics into a hot L2 mostly stay on chip; 0.1 is a stated guess, not a derived value.
+SPLITK_PARTIAL_DRAM_SPILL_FRACTION = 0.1
 
 
 def decode_gemv_time_us(gpu: GPUArchSpec, m: int, n: int, k: int, bytes_per_weight: float,
@@ -222,10 +245,10 @@ def compare_2d_tiling_vs_stream_k(gpu: GPUArchSpec, m: int, n: int, k: int,
     splits = max(1, (gpu.sm_count * 2 + n_tiles - 1) // n_tiles)  # target 2 CTAs per SM
     ctas_sk = n_tiles * splits
     active_sk = min(ctas_sk, gpu.sm_count)
-    # Split-K partials are accumulated by FP32 atomics in L2: model their cost as extra traffic of
-    # M * N * 4 B * splits (an upper bound; it mostly stays in L2 rather than DRAM)
+    # Split-K partials are accumulated by FP32 atomics in L2. Upper bound on that traffic: M * N * 4 B * splits;
+    # only SPLITK_PARTIAL_DRAM_SPILL_FRACTION of it is charged to DRAM (assumption, see the constant).
     t_sk = decode_gemv_time_us(gpu, m, n, k, bytes_per_weight, active_sk,
-                               extra_dram_bytes=0.1 * m * n * 4.0 * splits)
+                               extra_dram_bytes=SPLITK_PARTIAL_DRAM_SPILL_FRACTION * m * n * 4.0 * splits)
     return {"ctas_2d": float(ctas_2d), "active_sms_2d": float(active_2d), "t_2d_us": t_2d,
             "ctas_sk": float(ctas_sk), "active_sms_sk": float(active_sk), "t_sk_us": t_sk,
             "speedup": t_2d / t_sk, "splits": float(splits)}
@@ -260,7 +283,7 @@ def simulate_hetero_cpu_gpu_roofline(
 
 def main() -> None:
     print("================================================================================")
-    print("  WORKSTREAM 1: CYCLE-ACCURATE SMSP ROOFLINE & SCOREBOARD SIMULATOR")
+    print("  WORKSTREAM 1: ANALYTICAL SMSP ROOFLINE & SCOREBOARD CONTENTION MODEL")
     print("================================================================================\n")
 
     warp_tiles: List[TileConfig] = [
@@ -277,7 +300,7 @@ def main() -> None:
     print("-" * 114)
 
     for cfg in warp_tiles:
-        for state_label, tau in [("Locked", 16), ("Unlocked", 8)]:
+        for state_label, tau in [("Locked", TAU_LOCKED), ("Unlocked", TAU_UNLOCKED)]:
             res = simulate_smsp_cycle_accurate(AD102_RTX_4090, cfg, tau_cycles=tau)
             print(
                 f"{cfg.label:<35} | {cfg.warp_arithmetic_intensity:>6.1f}   | {state_label:<8} | "
@@ -293,7 +316,7 @@ def main() -> None:
     print(f"{'GPU Architecture':<22} | {'Phys BW':>10} | {'Eff W1 BW':>10} | {'Unlocked Peak':>14} | {'W16A16 Ridge':>14} | {'W1A16 Ridge':>14}")
     print("-" * 106)
     for gpu in [GA102_RTX_3090, GA102_RTX_3090_TI, AD102_RTX_4090]:
-        r = evaluate_dram_ridge_points(gpu, tau_cycles=8)
+        r = evaluate_dram_ridge_points(gpu, tau_cycles=TAU_UNLOCKED)
         print(
             f"{gpu.name:<22} | {gpu.dram_bw_gbps:>7.1f} GB/s | {r['effective_bw_tbps']:>7.2f} TB/s | "
             f"{r['peak_tflops']:>10.1f} TF | M >= {r['ridge_w16a16']:>6.1f}   | M >= {r['ridge_w1a16']:>6.1f}"

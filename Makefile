@@ -6,6 +6,10 @@ NVCC     ?= nvcc
 PYTHON   ?= python
 CFLAGS   := -O3 -std=c11 -Wall -Wextra
 CXXFLAGS := -O3 -std=c++20 -mavx2 -mfma -Wall -Wextra
+ifeq ($(OS),Windows_NT)
+# F21 / GCC PR 54412 (docs/12 4.11): no aligned YMM stack moves on the 16-byte Windows x64 stack
+CXXFLAGS += -Wa,-muse-unaligned-vector-move
+endif
 
 .PHONY: all sim shim kernel_patch hetero kinesis_unified python_tests verify clean
 
@@ -58,6 +62,7 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	./kinesis_unified/test_kinesis_unified
 	$(PYTHON) kinesis_unified/kinesis_bridge.py
 	./kinesis_unified/bench_cpu_roofline
+	$(PYTHON) kinesis_unified/verify_f21_build_matrix.py
 	$(PYTHON) e2e_transformer_pipeline.py
 
 clean:

@@ -8,7 +8,39 @@ group size G = 128 so both forward (Y = X @ W_hat^T) and backward activation gra
 inside SRAM/registers, allocating 0 Bytes of global VRAM for quantized weights.
 """
 
+import math
+import warnings
+
 import torch
+
+# Clipped-STE safety floor (docs/12 4.8). The gate zeroes dW for |w| > c * alpha_g with alpha_g = mean|w|
+# over the g128 group. For Gaussian weights E|w| = sigma * sqrt(2/pi), so the permanently gated fraction is
+#   P(|w| > c * alpha_g) = erfc(c / sqrt(pi)),
+# because |w| > c*sigma*sqrt(2/pi) <=> |z| > c*sqrt(2/pi), and P(|z| > a) = erfc(a / sqrt(2)).
+# That gives 23.1% at c = 1.5 (measured: sign accuracy 0.873 vs 0.919 unclipped), 11.0% at c = 2.0, and
+# 4.6% at c = 2.5 (measured: indistinguishable from unclipped). Gated weights never recover, because alpha_g
+# does not shrink once their gradient is cut off.
+CLIP_MULT_SAFE_MIN = 2.5
+
+
+def clipped_ste_frozen_fraction_gaussian(clip_mult: float) -> float:
+    """Fraction of N(0, sigma^2) weights the clipped-STE gate zeroes at init: erfc(c / sqrt(pi))."""
+    return math.erfc(clip_mult / math.sqrt(math.pi)) if clip_mult > 0.0 else 0.0
+
+
+def _check_clip_mult(clip_mult: float) -> float:
+    c = float(clip_mult)
+    if c < 0.0 or not math.isfinite(c):
+        raise ValueError(f"clip_mult must be finite and >= 0 (0 disables the clipped STE), got {clip_mult}")
+    if 0.0 < c < CLIP_MULT_SAFE_MIN:
+        warnings.warn(
+            f"clip_mult={c} gates {100.0 * clipped_ste_frozen_fraction_gaussian(c):.1f}% of Gaussian-initialised "
+            f"weights permanently (zero gradient that never recovers; docs/12 4.8). Use 0 (off) or >= "
+            f"{CLIP_MULT_SAFE_MIN}.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return c
 
 try:
     import triton
@@ -147,7 +179,7 @@ class FusedQATG128Function(torch.autograd.Function):
         N, Kw = w.shape
         assert K == Kw and K % 128 == 0, f"Invalid FusedQATG128 shapes: x={x.shape}, w={w.shape}"
         ctx.save_for_backward(x, w)
-        ctx.clip_mult = float(clip_mult)
+        ctx.clip_mult = _check_clip_mult(clip_mult)
         if HAS_TRITON and x.is_cuda and w.is_cuda:
             y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
             grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
@@ -191,14 +223,28 @@ class FusedQATG128Function(torch.autograd.Function):
 
 
 class FusedQATG128Linear(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, clip_mult: float = 0.0, device=None) -> None:
+    """
+    Binary g128 QAT linear layer.
+
+    master_dtype (docs/12 4.9): the default bf16 master weights match the 32B memory budget, but bf16 rounds
+    away any update smaller than half an ulp. With a plain torch optimizer that drops 56% (Adam 1e-4) to 74%
+    (SGD) of weight updates per step. bf16 masters are only correct when the parameter is written with
+    stochastic rounding, as LayerWise8BitGaLoreEngine does (copy_to_param_stochastic). For training with a
+    plain torch optimizer, pass master_dtype=torch.float32. The forward rounds w to bf16 before computing the
+    scale and sign either way, so the quantized forward and the packer convention are unchanged.
+    """
+
+    def __init__(self, in_features: int, out_features: int, clip_mult: float = 0.0, device=None,
+                 master_dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
         assert in_features % 128 == 0
+        if master_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"master_dtype must be torch.bfloat16 or torch.float32, got {master_dtype}")
         self.in_features = in_features
         self.out_features = out_features
-        self.clip_mult = float(clip_mult)
+        self.clip_mult = _check_clip_mult(clip_mult)
         self.weight = torch.nn.Parameter(
-            torch.randn((out_features, in_features), device=device, dtype=torch.bfloat16) * 0.02
+            (torch.randn((out_features, in_features), device=device, dtype=torch.float32) * 0.02).to(master_dtype)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -239,14 +285,18 @@ def main() -> None:
     dx_diff = int((x.grad != dx_ref).sum().item())
     dw_diff = int((layer.weight.grad != dw_ref).sum().item())
 
-    print(f"[1] Materialized W_hat Global VRAM Allocation : 0 Bytes (computed on-the-fly in SRAM)")
+    # Not measured on the host (the Triton kernels need a GPU). By construction the Triton forward and dX kernels
+    # never write W_hat to global memory; the clipped-STE backward path does allocate fp32 temporaries.
+    print(f"[1] Materialized W_hat Global VRAM Allocation : 0 Bytes by construction in the Triton fwd/dX kernels "
+          f"(not measured on host)")
     print(f"[2] Forward Pass (Y = X W_hat^T) Mismatches   : {fwd_diff}")
     print(f"[3] Backward dX (dY W_hat) Mismatches         : {dx_diff}")
     print(f"[4] Backward STE dW (dY^T X) Mismatches       : {dw_diff}")
     assert fwd_diff == 0 and dx_diff == 0 and dw_diff == 0
 
-    # [5] Clipped STE indicator 1(|W| <= clip_mult * alpha_g) verification
-    clipped_layer = FusedQATG128Linear(K, N, clip_mult=1.5)
+    # [5] Clipped STE indicator 1(|W| <= clip_mult * alpha_g) verification. c = 2.5 (the safe floor) still masks
+    # the forced 10x outlier; c = 1.5 used to be exercised here and is now rejected with a warning (docs/12 4.8).
+    clipped_layer = FusedQATG128Linear(K, N, clip_mult=CLIP_MULT_SAFE_MIN)
     with torch.no_grad():
         clipped_layer.weight.copy_(layer.weight)
         # Force row 0, col 0 weight to be a 10x outlier outside 1.5 * alpha_g
@@ -256,7 +306,36 @@ def main() -> None:
     y_c.backward(dy)
     assert float(clipped_layer.weight.grad[0, 0].item()) == 0.0
     assert int((clipped_layer.weight.grad != 0).sum().item()) > 0
-    print(f"[5] Clipped STE Indicator (|W| <= 1.5*alpha_g): Outlier dW[0,0]={float(clipped_layer.weight.grad[0, 0].item()):.1f} (masked)")
+    print(f"[5] Clipped STE Indicator (|W| <= 2.5*alpha_g): Outlier dW[0,0]={float(clipped_layer.weight.grad[0, 0].item()):.1f} (masked)")
+
+    # [6] docs/12 4.8 / 4.9 regressions
+    #   (a) the Gaussian gated fraction erfc(c/sqrt(pi)) matches a Monte-Carlo count at init, and small c warns
+    #   (b) fp32 master weights receive every Adam update that bf16 masters drop
+    torch.manual_seed(3)
+    w_mc = torch.randn(4096, 1024)
+    g_mc = w_mc.view(4096, 8, 128)
+    a_mc = g_mc.abs().mean(-1, keepdim=True)
+    for c in (1.5, 2.5):
+        mc = float((g_mc.abs() > c * a_mc).float().mean())
+        assert abs(mc - clipped_ste_frozen_fraction_gaussian(c)) < 0.003, (c, mc)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        FusedQATG128Linear(128, 8, clip_mult=1.5)
+    assert any(issubclass(w_.category, RuntimeWarning) for w_ in caught), "clip_mult=1.5 must warn"
+    upd = {}
+    for dt in (torch.bfloat16, torch.float32):
+        torch.manual_seed(4)
+        lay = FusedQATG128Linear(256, 64, master_dtype=dt)
+        opt = torch.optim.Adam(lay.parameters(), lr=1e-4)
+        xb = torch.randn(64, 256, dtype=torch.bfloat16)
+        before = lay.weight.detach().clone()
+        lay(xb).float().pow(2).mean().backward()
+        opt.step()
+        upd[dt] = float((lay.weight.detach() != before).float().mean())
+    assert upd[torch.float32] > 0.95 and upd[torch.bfloat16] < upd[torch.float32], upd
+    print(f"[6] Clip gate erfc(c/sqrt(pi)): 1.5 -> {clipped_ste_frozen_fraction_gaussian(1.5):.3f}, 2.5 -> "
+          f"{clipped_ste_frozen_fraction_gaussian(2.5):.3f} (MC-matched; c<2.5 warns) | Adam step updates: "
+          f"bf16 master {100 * upd[torch.bfloat16]:.1f}%, fp32 master {100 * upd[torch.float32]:.1f}%")
     print("[+] PASS: In-SRAM BLOCK_K=128 Fused STE QAT forward, backward, and Clipped STE verified.")
 
 

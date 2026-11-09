@@ -338,11 +338,17 @@ void shim_spoof_nvos54_packet(NVOS54_PARAMETERS* nvos) {
         memcpy(&name_flags, nvos->params, sizeof(uint32_t));
         if (name_flags == 0U) {
             char* name_str = (char*)nvos->params + 4;
-            if (strstr(name_str, "3090") || strstr(name_str, "3080")) {
+            // docs/12 4.17: the 64-byte name buffer is not guaranteed NUL-terminated, so search a bounded,
+            // terminated copy instead of calling strstr on the raw buffer (which could read past it).
+            char name_copy[65];
+            memcpy(name_copy, name_str, 64);
+            name_copy[64] = '\0';
+            const char* name_scan = name_copy;
+            if (strstr(name_scan, "3090") || strstr(name_scan, "3080")) {
                 snprintf(name_str, 64, "NVIDIA RTX A6000");
-            } else if (strstr(name_str, "4090")) {
+            } else if (strstr(name_scan, "4090")) {
                 snprintf(name_str, 64, "NVIDIA RTX 6000 Ada Generation");
-            } else if (strstr(name_str, "5090")) {
+            } else if (strstr(name_scan, "5090")) {
                 snprintf(name_str, 64, "NVIDIA RTX PRO 6000 Blackwell");
             }
         }

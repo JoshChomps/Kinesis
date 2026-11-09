@@ -6,6 +6,7 @@
 #include "hardware_and_sandbox.hpp"
 #include "sub2bit_gemm_and_smart_cache.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -432,6 +433,72 @@ int main() {
                     eps, budget_skips_w1, err_w1, budget_skips_w2, err_w2);
         std::printf("    legacy tau=0.85 heuristic on the same data: max err %.3e (> eps, loud single row dropped) | shape check -> PASS\n",
                     err_tau);
+    }
+
+    // 9. Regressions for docs/12 4.12 (non-finite activations) and 4.14 (W2 convention)
+    {
+        const W1TmacLutPanelSet lut = pack_w1_tmac_lut_panels(w1_panels);
+        const size_t Mn = 3;
+        std::vector<float> a_nf(Mn * K);
+        for (size_t i = 0; i < Mn * K; ++i) a_nf[i] = A_buf[i];
+        for (size_t k = 0; k < 128; ++k) a_nf[0 * K + k] = 0.0f;   // row 0: NaN in an otherwise all-zero group
+        a_nf[0 * K + 5] = NAN;
+        a_nf[1 * K + 7] = NAN;                                     // row 1: NaN in a live group
+        a_nf[2 * K + 9] = INFINITY;                                // row 2: +Inf in a live group
+        TensorView<const float> A_nf(a_nf.data(), Shape{static_cast<int64_t>(Mn), static_cast<int64_t>(K)});
+        std::vector<float> c_t(Mn * N), c_s(Mn * N), c_x(Mn * N);
+        TensorView<float> Ct(c_t.data(), Shape{static_cast<int64_t>(Mn), static_cast<int64_t>(N)});
+        TensorView<float> Cs(c_s.data(), Shape{static_cast<int64_t>(Mn), static_cast<int64_t>(N)});
+        TensorView<float> Cx(c_x.data(), Shape{static_cast<int64_t>(Mn), static_cast<int64_t>(N)});
+        execute_tmac_lut_w1_gemm(A_nf, lut, Ct, 0.0f, false);
+        execute_tmac_lut_w1_gemm(A_nf, lut, Cs, 0.0f, true);
+        SmartTieredCache exact_cache(w1_panels.num_panels, 0, 0.0f, 1);
+        exact_cache.execute_smart_w1_gemm(A_nf, w1_panels, Cx, /*force_exact=*/true);
+        size_t class_mismatch = 0, nonfinite_out = 0;
+        auto cls = [](float v) { return std::isnan(v) ? 2 : (std::isinf(v) ? (v > 0 ? 3 : 4) : 0); };
+        for (size_t i = 0; i < Mn * N; ++i) {
+            class_mismatch += (cls(c_t[i]) != cls(c_x[i])) + (cls(c_s[i]) != cls(c_x[i]));
+            nonfinite_out += !std::isfinite(c_t[i]);
+        }
+        UHA_VERIFY(class_mismatch == 0);         // NaN/+Inf/-Inf/finite pattern identical to the exact FP32 path
+        UHA_VERIFY(nonfinite_out == Mn * N);     // every output of every poisoned row is non-finite
+
+        // One Inf must not make the sieve skip the row's finite groups (mean energy used to become +Inf)
+        std::vector<float> a_inf(1 * K, 1.0f), c_inf(N, 0.0f);
+        a_inf[3] = INFINITY;
+        TensorView<const float> A_inf(a_inf.data(), Shape{1, static_cast<int64_t>(K)});
+        TensorView<float> C_inf(c_inf.data(), Shape{1, static_cast<int64_t>(N)});
+        const TmacRunStats st_inf = execute_tmac_lut_w1_gemm(A_inf, lut, C_inf, 0.85f, false);
+        UHA_VERIFY(st_inf.groups_skipped == 0);
+
+        // W2: independent BitNet b1.58 absmean reference (gamma = bf16(max(mean|w|, 1e-6)), round-half-even, clip)
+        const W2GotoBlasPanelSet w2p = pack_w2_gotoblas_panels(B_view);
+        size_t trit_diff = 0, scale_diff = 0;
+        for (size_t n = 0; n < N; ++n) {
+            const size_t p = n / kNr8, c = n % kNr8;
+            for (size_t g = 0; g < w2p.groups_per_col; ++g) {
+                const size_t k0 = g * kGroupSizeG128, k1 = std::min(K, k0 + kGroupSizeG128);
+                double asum = 0.0;
+                for (size_t k = k0; k < k1; ++k) asum += std::fabs(B_view(static_cast<int64_t>(k), static_cast<int64_t>(n)));
+                const float gamma = bf16_bits_to_fp32(fp32_to_bf16_bits(std::max(static_cast<float>(asum / double(k1 - k0)), 1e-6f)));
+                const float got = bf16_bits_to_fp32(w2p.packed_scales_bf16[(p * w2p.groups_per_col + g) * kNr8 + c]);
+                scale_diff += (got != gamma);
+                for (size_t k = k0; k < k1; ++k) {
+                    const float r = std::nearbyint(B_view(static_cast<int64_t>(k), static_cast<int64_t>(n)) / got);
+                    const int want = static_cast<int>(std::clamp(r, -1.0f, 1.0f));
+                    const int code = static_cast<int>((w2p.packed_trits[p * K + k] >> (2 * c)) & 3u) - 1;
+                    trit_diff += (want != code);
+                }
+            }
+        }
+        // The scale may differ from the double-precision reference only by fp32 summation order, i.e. at most a few
+        // groups by one bf16 ulp; trits are compared against the packer's own scale and must match exactly.
+        UHA_VERIFY(trit_diff == 0 && scale_diff * 50 <= N * w2p.groups_per_col);
+        std::printf("[9] Non-finite activations & W2 absmean convention (docs/12 4.12, 4.14):\n");
+        std::printf("    T-MAC (AVX2 + scalar) NaN/Inf output pattern vs exact FP32 path: %zu mismatches | Inf row sieve skips = %zu\n",
+                    class_mismatch, st_inf.groups_skipped);
+        std::printf("    W2 vs independent BitNet b1.58 absmean reference: trit mismatches = %zu, scale ulp diffs = %zu/%zu -> PASS\n",
+                    trit_diff, scale_diff, N * w2p.groups_per_col);
     }
 
     return 0;

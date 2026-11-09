@@ -4,7 +4,7 @@ File: run_all_tests.py
 Master Build, Verification, and Hygiene Protocol Runner for Unified Hardware Accel (UHA).
 
 Compiles all 8 C11, C++20, and CUDA/PTX host-emulated test binaries with strict warnings
-(-Wall -Wextra) and executes all 17 functional verification suites + repository hygiene audit (18 suites total).
+(-Wall -Wextra) and executes all 21 functional verification suites + repository hygiene audit (22 suites total).
 """
 
 import argparse
@@ -15,6 +15,10 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
+# F21 / GCC PR 54412 (docs/12 4.11): on mingw make the assembler encode every aligned vector move unaligned, so no
+# YMM spill can fault on the 16-byte Windows x64 stack at any optimisation level.
+MINGW_AVX2 = ["-Wa,-muse-unaligned-vector-move"] if os.name == "nt" else []
 
 
 @dataclass
@@ -72,7 +76,7 @@ SUITES: List[VerificationSuite] = [
     VerificationSuite(
         suite_id="B2",
         workstream="WS-B (SMSP Roofline)",
-        name="Cycle-Level SMSP Pipeline, Swizzle<3,3,3> & Stream-K Simulator",
+        name="Analytical SMSP Roofline (single-source FLOP accounting), Swizzle<3,3,3> & Stream-K Model",
         build_cmd=None,
         run_cmd=[sys.executable, "sim_harness/smsp_roofline_sim.py"],
     ),
@@ -100,7 +104,7 @@ SUITES: List[VerificationSuite] = [
         workstream="WS-C (Tiled-CBC CUDA)",
         name="32-Lane Warp-Butterfly Row-Max Holder & Tile L1 Sieve (__device__)",
         build_cmd=[
-            "g++", "-std=c++20", "-O2", "-mavx2", "-mfma", "-Wall", "-Wextra",
+            "g++", "-std=c++20", "-O2", "-mavx2", "-mfma", *MINGW_AVX2, "-Wall", "-Wextra",
             "-DSTANDALONE_VERIFY", "-x", "c++",
             "structural_filters/tiled_cbc_sieve.cu",
             "-o", "structural_filters/test_tiled_cbc.exe",
@@ -148,6 +152,18 @@ SUITES: List[VerificationSuite] = [
         run_cmd=["./hetero_runtime/test_chorus_amx.exe"],
     ),
     VerificationSuite(
+        suite_id="E4",
+        workstream="WS-E (Chorus Fallback)",
+        name="Single-Threaded SPSC Ring + Portable Aligned Allocator (non-Win/Linux path)",
+        build_cmd=[
+            "gcc", "-std=c11", "-O3", "-Wall", "-Wextra",
+            "-DSTANDALONE_VERIFY", "-DUHA_CHORUS_FORCE_SINGLE_THREAD", "-DUHA_CHORUS_FORCE_GENERIC_ALLOC",
+            "hetero_runtime/chorus_amx_moe.c",
+            "-o", "hetero_runtime/test_chorus_fallback.exe", "-lm",
+        ],
+        run_cmd=["./hetero_runtime/test_chorus_fallback.exe"],
+    ),
+    VerificationSuite(
         suite_id="E2",
         workstream="WS-E (Governor C11)",
         name="C11 Closed-Loop Thermal/Clock/PCIe Admission Governor",
@@ -170,7 +186,7 @@ SUITES: List[VerificationSuite] = [
         workstream="WS-F (Kinesis Unified)",
         name="AVX2 T-MAC 256b LUT, GotoBLAS W1/W2 GEMM & LFU/LRU Smart Cache",
         build_cmd=[
-            "g++", "-std=c++20", "-O3", "-mavx2", "-mfma", "-Wall", "-Wextra", "-I.",
+            "g++", "-std=c++20", "-O3", "-mavx2", "-mfma", *MINGW_AVX2, "-Wall", "-Wextra", "-I.",
             "kinesis_unified/test_kinesis_unified.cpp",
             "-o", "kinesis_unified/test_kinesis_unified.exe",
         ],
@@ -184,11 +200,18 @@ SUITES: List[VerificationSuite] = [
         run_cmd=[sys.executable, "kinesis_unified/kinesis_bridge.py"],
     ),
     VerificationSuite(
+        suite_id="F4",
+        workstream="WS-F (F21 Build Matrix)",
+        name="YMM Stack-Alignment Build Matrix (-O0 / -O3 -fno-inline / -O3, PR 54412)",
+        build_cmd=None,
+        run_cmd=[sys.executable, "kinesis_unified/verify_f21_build_matrix.py"],
+    ),
+    VerificationSuite(
         suite_id="F3",
         workstream="WS-F (CPU Roofline)",
         name="Empirical Host CPU GFLOPS, Cache Residency & Bandwidth Benchmark",
         build_cmd=[
-            "g++", "-std=c++20", "-O3", "-mavx2", "-mfma", "-Wall", "-Wextra", "-I.",
+            "g++", "-std=c++20", "-O3", "-mavx2", "-mfma", *MINGW_AVX2, "-Wall", "-Wextra", "-I.",
             "kinesis_unified/bench_cpu_roofline.cpp",
             "-o", "kinesis_unified/bench_cpu_roofline.exe",
         ],

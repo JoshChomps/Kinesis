@@ -140,7 +140,7 @@ All **7 Critical (P0)** hardware/ISA correctness bugs, **6 High (P1)** architect
 | Test Suite / Binary | Command Executed | Key Post-Fix Hardware & Numerical Metrics | Status |
 | :--- | :--- | :--- | :--- |
 | **Workstream 1A: PTX & BF162 Emulator** | `./sim_harness/ptx_bf162_emu.exe` | `16,777,216` W1 states & `18,874,368` W2 states (with exact `0.0f` at $q=1$ across all scales) & `128` HMMA lanes: **0 bit errors** | **PASS** |
-| **Workstream 1B: Cycle-Accurate SMSP Roofline** | `python sim_harness/smsp_roofline_sim.py` | 32x32 unlocked `SassWait = 50.76%` (`162.2 TF`) -> 64x64 Fused W1A16 `SassWait = 6.40%` (**`309.9 TF`** on AD102) | **PASS** |
+| **Workstream 1B: Analytical SMSP Roofline** | `python sim_harness/smsp_roofline_sim.py` | 32x32 unlocked `SassWait = 13.08%` (`287.3 TF`) -> 64x64 Fused W1A16 `SassWait = 3.31%` (**`320.4 TF`** on AD102). Re-run 2026-11-08 after the FLOP-accounting fix (docs/12 4.7); the earlier `50.76%` / `162.2 TF` and `6.40%` / `309.9 TF` came from a 2x error in `t_mma`. | **PASS** |
 | **Workstream 2A: Userspace cuBLAS / NVRM Shim** | `./compiler_unlock/test_cublas_shim.exe` | `cuGetProcAddress_v2` recursion guard + `NV2080_CTRL_CMD_BUS_GET_PCI_INFO` (`0x20801801`) spoof (`0x2684 -> 0x26B1`) | **PASS** |
 | **Workstream 2B: Unlocked Triton Autotuner** | `python compiler_unlock/unlocked_gemm.py` | All 6 configs $\le 101,376\text{ B}$ (`98,304 B = 97.0%`), $I_{\text{warp}} \in [21.3, 32.0]$, **0 bit mismatches** | **PASS** |
 | **Workstream 3: SpinQuant Cayley-SGD & Packer** | `python fused_w1_hadacore/spinquant_packer.py` | $\|R^T R - I\|_\infty = 1.192 \times 10^{-6}$, kurtosis `25.00 -> 1.82` (Kronecker `25.00 -> 3.65 -> 2.44`), W1 & W2 bit errors = **0 / 8,192** | **PASS** |

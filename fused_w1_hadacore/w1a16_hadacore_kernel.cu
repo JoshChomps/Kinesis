@@ -303,6 +303,15 @@ __device__ __forceinline__ void hadacore_kronecker_h32_m16k32_in_regs(
 // is never masked by 63 quiet rows. For each m16 slice mi, registers {0, 2} belong to row r_top
 // and registers {1, 3} belong to row r_bot across the 4 lanes t = lane_id & 3 (group_id = lane_id >> 2).
 // Intra-row L1 sums reduce across xor offsets {1, 2}; inter-row maxima reduce across xor offsets {4, 8, 16}.
+// NaN-sticky maximum (docs/12 4.12): fmaxf and `x > max` both drop a NaN, which used to let a NaN activation
+// reach a skipped tile whenever tau_sieve > 0. A NaN in either operand wins here, and the final gate uses
+// !(x <= tau), so a poisoned K32 slice is always executed.
+// NOTE: this gate is an activation-energy threshold (no weight-scale factor, row L1 summed in bf16), not an error
+// bound; the guaranteed-budget sieve is SmartTieredCache::plan_panel_sieve (docs/12 4.13).
+__device__ __forceinline__ float w1a16_nan_max(float a, float b) {
+    return (a != a) ? a : ((b != b) ? b : ((b > a) ? b : a));
+}
+
 __device__ __forceinline__ int warp_sieve_k32_active(
     const uint32_t a_frag[2][4][4],
     const float tau_sieve
@@ -357,21 +366,17 @@ __device__ __forceinline__ int warp_sieve_k32_active(
         row_bot_l1 += __shfl_xor_sync(0xFFFFFFFFU, row_bot_l1, 1);
         row_bot_l1 += __shfl_xor_sync(0xFFFFFFFFU, row_bot_l1, 2);
 
-        const float mi_max = (row_top_l1 > row_bot_l1) ? row_top_l1 : row_bot_l1;
-        if (mi_max > group_max_row_l1) {
-            group_max_row_l1 = mi_max;
-        }
+        const float mi_max = w1a16_nan_max(row_top_l1, row_bot_l1);
+        group_max_row_l1 = w1a16_nan_max(group_max_row_l1, mi_max);
     }
     // Max-reduce across the 8 row-groups (group_id = 0..7) via xor offsets {4, 8, 16}
     #pragma unroll
     for (int offset = 4; offset <= 16; offset <<= 1) {
         const float other = __shfl_xor_sync(0xFFFFFFFFU, group_max_row_l1, offset);
-        if (other > group_max_row_l1) {
-            group_max_row_l1 = other;
-        }
+        group_max_row_l1 = w1a16_nan_max(group_max_row_l1, other);
     }
     const float rowmax_mean_abs = group_max_row_l1 * (1.0f / 32.0f);
-    return (rowmax_mean_abs > tau_sieve) ? 1 : 0; // warp-uniform after the xor-butterfly reduction
+    return !(rowmax_mean_abs <= tau_sieve) ? 1 : 0; // warp-uniform after the xor-butterfly reduction; NaN keeps
 }
 
 // ==============================================================================

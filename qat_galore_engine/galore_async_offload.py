@@ -22,7 +22,7 @@ class GaLoreState8Bit:
     proj_scale: torch.Tensor   # fp32 [m, 1]
     exp_avg_q: torch.Tensor    # int8 [r, n]
     exp_avg_scale: torch.Tensor
-    exp_avg_sq_q: torch.Tensor # uint8 [r, n]
+    exp_avg_sq_q: torch.Tensor # uint8 [r, n], 8-bit log code of sqrt(V) (quantize_sqrt_v_log8_sr)
     exp_avg_sq_scale: torch.Tensor
     transpose: bool            # True when original weight had shape [m, n] with m > n
     next_svd_step: int = 0     # step at which the projector is next refreshed (supports lazy adaptive gaps)
@@ -41,14 +41,72 @@ def dequantize_signed_int8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
 
 def quantize_unsigned_uint8(t: torch.Tensor, round_up: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    round_up=True rounds towards +inf so every positive input dequantizes to a value >= itself and never to 0.
-    Used for sqrt(V): rounding a small sqrt(V) down to 0 next to a large row maximum would make the next
-    step m / (0 + eps) explode. Rounding up only shrinks steps (conservative).
+    Linear per-row uint8 quantizer (kept for general use). NOT used for the second moment any more: applying
+    it with round_up=True to sqrt(V) every step compounded the round-up error into a ratchet (docs/12 4.6,
+    stored/true sqrt(V) about 10x after 3000 steps). The second moment now uses quantize_sqrt_v_log8_sr.
     """
     scale = (t.clamp(min=0.0).amax(dim=-1, keepdim=True) / 255.0).clamp(min=1e-16)
     scaled = t.clamp(min=0.0) / scale
     q = torch.clamp(torch.ceil(scaled) if round_up else torch.round(scaled), 0.0, 255.0).to(torch.uint8)
     return q, scale
+
+
+# Second-moment code density: KAPPA codes per octave of sqrt(V). Code 255 is the per-row maximum and code 1 is
+# 2^(-254/KAPPA) = 1.7e-5 of it (9.5 decades of dynamic range in V). Chosen by sweep (docs/14 F-B): 12 is
+# noisier, 20+ starts hitting the floor on lognormal gradient spreads, which reintroduces upward bias.
+SQRT_V_LOG8_KAPPA = 16
+
+
+def quantize_sqrt_v_log8_sr(sqrt_v: torch.Tensor, kappa: int = SQRT_V_LOG8_KAPPA) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    8-bit logarithmic code for sqrt(V) with stochastic rounding that is UNBIASED IN V (docs/12 4.6 fix).
+
+    Code c = 0 means exactly 0. Code c in [1, 255] decodes to  s * 2^((c - 255)/kappa),  s = row max of sqrt(V).
+
+    Why this and not the previous linear uint8 + ceil:
+      * The state is dequantized, updated (V <- b2 V + (1-b2) g^2) and re-quantized every step, so any
+        per-step bias compounds. With ceil the error obeys e_{t+1} <= sqrt(b2) e_t + q, steady state
+        q/(1 - sqrt(b2)), about 2000 quanta at b2 = 0.999.
+      * Rounding to nearest does not help: with b2 = 0.999 the per-step relative change of V is about 1e-3,
+        far below half a code step, so RTN freezes V except on large gradient spikes, which only move it up.
+      * Unbiased stochastic rounding in V fixes the mean exactly. For V between adjacent levels
+        L_lo^2 <= V <= L_hi^2, pick L_hi with p = (V - L_lo^2) / (L_hi^2 - L_lo^2), else L_lo, so
+        E[Q(V)^2 | V] = V. Then E[V_hat_{t+1}] = b2 E[V_hat_t] + (1 - b2) g_t^2, the same linear recursion
+        as the exact V. By induction from V_hat_0 = V_0 = 0, E[V_hat_t] = V_t for every t. There is no
+        compounding: the per-step errors are martingale differences, not a drift.
+      * The log spacing is what keeps that noise small. On a linear grid, coordinates far below the row
+        max sit within a few quanta of 0, so the relative noise is huge (measured: 30-50x spread). On a
+        log grid the relative step is the same everywhere, 2^(2/kappa) - 1 = 9% in V. The measured
+        steady-state spread of sqrt(V_hat)/sqrt(V) is 0.82..1.20 (5th..95th percentile) for rank-1,
+        lognormal and Student-t(3) gradients, against 2.5x..50x for ceil.
+      * Zero is excluded for V > 0: values below code 1 are clamped up to code 1, so no coordinate with
+        nonzero history decodes to 0. That keeps the original goal of round_up: never m / (0 + eps) with
+        |m| <= ((1-b1)/sqrt(1-b2)) sqrt(V). The only bias left is this floor, 1.7e-5 of the row max in
+        sqrt(V), and it is a constant floor, not a ratchet.
+
+    Memory is unchanged: 1 byte per coordinate plus one fp32 scale per row.
+    """
+    sv = torch.nan_to_num(sqrt_v.to(torch.float32), nan=0.0, posinf=0.0).clamp(min=0.0)
+    scale = sv.amax(dim=-1, keepdim=True).clamp(min=1e-30)
+    x = sv / scale                                           # in [0, 1]
+    floor_x = 2.0 ** (-254.0 / kappa)
+    xc = x.clamp(min=floor_x)
+    # level index e in [-254, 0] with 2^(e/kappa) <= xc < 2^((e+1)/kappa)
+    e = torch.floor(torch.log2(xc) * kappa).clamp(min=-254.0, max=0.0)
+    lo = torch.exp2(e / kappa)
+    hi = torch.exp2(torch.clamp(e + 1.0, max=0.0) / kappa)
+    v, v_lo, v_hi = xc * xc, lo * lo, hi * hi
+    p_up = torch.where(v_hi > v_lo, (v - v_lo) / (v_hi - v_lo), torch.zeros_like(v)).clamp(0.0, 1.0)
+    e_q = torch.where(torch.rand_like(v) < p_up, torch.clamp(e + 1.0, max=0.0), e)
+    code = (e_q + 255.0).clamp(1.0, 255.0)
+    code = torch.where(x > 0.0, code, torch.zeros_like(code))
+    return code.to(torch.uint8), scale
+
+
+def dequantize_sqrt_v_log8(q: torch.Tensor, scale: torch.Tensor, kappa: int = SQRT_V_LOG8_KAPPA) -> torch.Tensor:
+    c = q.to(torch.float32)
+    val = scale * torch.exp2((c - 255.0) / kappa)
+    return torch.where(q > 0, val, torch.zeros_like(val))
 
 
 def copy_to_param_stochastic(param_data: torch.Tensor, value_fp32: torch.Tensor) -> None:
@@ -222,11 +280,11 @@ class LayerWise8BitGaLoreEngine:
     @torch.no_grad()
     def _reproject_moments(self, st: GaLoreState8Bit, rot: torch.Tensor, dev: torch.device) -> None:
         m_old = dequantize_signed_int8(st.exp_avg_q.to(dev), st.exp_avg_scale.to(dev))
-        sv_old = dequantize_unsigned_uint8(st.exp_avg_sq_q.to(dev), st.exp_avg_sq_scale.to(dev))
+        sv_old = dequantize_sqrt_v_log8(st.exp_avg_sq_q.to(dev), st.exp_avg_sq_scale.to(dev))
         m_new = rot @ m_old
         v_new = (rot * rot) @ (sv_old * sv_old)
         q_m, sc_m = quantize_signed_int8(m_new)
-        q_sv, sc_sv = quantize_unsigned_uint8(torch.sqrt(v_new.clamp(min=0.0)), round_up=True)
+        q_sv, sc_sv = quantize_sqrt_v_log8_sr(torch.sqrt(v_new.clamp(min=0.0)))
         st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
         st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
 
@@ -279,7 +337,7 @@ class LayerWise8BitGaLoreEngine:
         m_t = dequantize_signed_int8(
             st.exp_avg_q.to(grad.device), st.exp_avg_scale.to(grad.device)
         )
-        sqrt_v_prev = dequantize_unsigned_uint8(
+        sqrt_v_prev = dequantize_sqrt_v_log8(
             st.exp_avg_sq_q.to(grad.device), st.exp_avg_sq_scale.to(grad.device)
         )
         v_t = sqrt_v_prev * sqrt_v_prev
@@ -291,7 +349,7 @@ class LayerWise8BitGaLoreEngine:
 
         # Quantize updated moments (M_t and sqrt(V_t)) to 8-bit before transferring to Host RAM
         q_m, sc_m = quantize_signed_int8(m_t)
-        q_sv, sc_sv = quantize_unsigned_uint8(sqrt_v_t, round_up=True)
+        q_sv, sc_sv = quantize_sqrt_v_log8_sr(sqrt_v_t)
         st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
         st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
 
@@ -504,11 +562,49 @@ def main() -> None:
     cal_90 = drift_cal[0.90]
     lazy_svd_90 = int(cal_90["svd_calls"])
     assert cal_90["svd_reduction_pct"] >= 40.0, cal_90
-    assert cal_90["weight_delta_cos_sim"] >= 0.98, cal_90
+    # Threshold re-calibrated with the unbiased sqrt(V) store (docs/12 4.6 fix). The old ceil store inflated V,
+    # which shrank every Adam step and made the lazy and fixed-interval trajectories look closer (0.9810). With
+    # correct-size steps the lazy schedule's stale subspace costs slightly more: 0.9792 on 4 seed pairs, while
+    # the stochastic-rounding noise floor (same schedule, different seed) is 0.9998, so the change is
+    # systematic, not noise. 0.975 keeps a margin above the measured value.
+    assert cal_90["weight_delta_cos_sim"] >= 0.975, cal_90
     assert drift_cal[0.85]["svd_calls"] <= drift_cal[0.90]["svd_calls"] <= drift_cal[0.95]["svd_calls"] <= base_svd
     print(f"[Q] int4 projector rel err {rel4:.3f} (bias {bias:.4f}) | subspace-iter energy {100*energy_it/energy_svd:.2f}% of SVD "
           f"| O15 Lazy-SVD (tau=0.90): {lazy_svd_90}/{base_svd} SVDs (-{cal_90['svd_reduction_pct']:.1f}%), "
           f"trajectory cos_sim={cal_90['weight_delta_cos_sim']:.4f}")
+
+    # (d) docs/12 4.6 regression: the stored second moment must track the true EMA over a long horizon.
+    #     3000 steps of the exact store/load/update loop the engine runs, gradient scale spread over 3 decades
+    #     across columns. The old linear uint8 + ceil store ends at a median sqrt(V) ratio of about 10.5x
+    #     (about 54x on the smallest columns); the log8 SR store must stay unbiased in V and tight in sqrt(V).
+    torch.manual_seed(11)
+    r_v, n_v, b2_v = 16, 512, 0.999
+    colscale = torch.logspace(-3, 0, n_v)
+    q_v, sc_v = torch.zeros((r_v, n_v), dtype=torch.uint8), torch.ones((r_v, 1))
+    q_c, sc_c = torch.zeros((r_v, n_v), dtype=torch.uint8), torch.ones((r_v, 1))
+    v_true = torch.zeros(r_v, n_v)
+    v_ratio_acc = torch.zeros(r_v, n_v)
+    for t in range(1, 3001):
+        g = torch.randn(r_v, n_v) * colscale
+        v_true = b2_v * v_true + (1 - b2_v) * g * g
+        v_new = b2_v * dequantize_sqrt_v_log8(q_v, sc_v) ** 2 + (1 - b2_v) * g * g
+        q_v, sc_v = quantize_sqrt_v_log8_sr(v_new.sqrt())
+        v_old = b2_v * dequantize_unsigned_uint8(q_c, sc_c) ** 2 + (1 - b2_v) * g * g
+        q_c, sc_c = quantize_unsigned_uint8(v_old.sqrt(), round_up=True)
+        if t > 1000:
+            v_ratio_acc += dequantize_sqrt_v_log8(q_v, sc_v) ** 2 / v_true
+    ratio_new = dequantize_sqrt_v_log8(q_v, sc_v) / v_true.sqrt()
+    ratio_old = dequantize_unsigned_uint8(q_c, sc_c) / v_true.sqrt()
+    mean_v_bias = float((v_ratio_acc / 2000.0).mean())
+    med_new, med_old = float(ratio_new.median()), float(ratio_old.median())
+    p05, p95 = float(ratio_new.quantile(0.05)), float(ratio_new.quantile(0.95))
+    small_new = float(ratio_new[:, :32].median())
+    assert abs(mean_v_bias - 1.0) < 0.02, mean_v_bias
+    assert 0.95 < med_new < 1.05 and 0.95 < small_new < 1.05 and p05 > 0.7 and p95 < 1.4, (med_new, small_new, p05, p95)
+    assert med_old > 5.0, med_old  # negative control: the old store really does ratchet
+    assert int((dequantize_sqrt_v_log8(q_v, sc_v) == 0).sum()) == 0  # zero excluded for V > 0
+    print(f"[V] sqrt(V) store over 3000 steps (docs/12 4.6): log8-SR median {med_new:.3f} (p05 {p05:.3f}, p95 {p95:.3f}, "
+          f"small cols {small_new:.3f}), E[V_hat/V] {mean_v_bias:.4f} | old ceil-uint8 median {med_old:.2f}x")
 
     table = compute_32b_qat_memory_table()
     galore_budget = table["Layer-Wise 8-Bit GaLore (r=512, T=200) + Async DMA"]

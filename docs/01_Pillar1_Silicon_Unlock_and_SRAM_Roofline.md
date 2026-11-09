@@ -16,7 +16,7 @@ On NVIDIA Turing (`TU102`), Ampere (`GA10x`), and Ada Lovelace (`AD10x`), SM ins
 | :--- | :--- | :--- | :--- | :--- |
 | **`NV_PFUSE_FEAT_OVR_PLM`** (`FEAT_PLM`) | `0x00823804` | `0x88000000` / `0xF0000000` (Level 2/3 write-only) | `0xFFFFFFFF` | **Feature Override Privilege-Level Mask (PLM):** Controls read/write access permissions for `SS0`/`SS1`. Setting PLM to `0xFFFFFFFF` enables Level-0 (Host CPU / BAR0 MMIO) write access during pre-boot initialization before `FWSEC-FRTS` or the driver locks down the bus. |
 | **`NV_PFUSE_FEAT_READOUT_1`** (`FEAT_READOUT_1`) | `0x00823818` | `0x11111111` (Divisor 1 = Half-Rate) | `0x00000000` (Divisor 0 = Full-Rate) | **Effective Feature Speed Readout:** Reflects the post-arbitration effective speed selector state (`fuse_hard_lock \| override_divisor`). Used to verify effective silicon issue rate in hardware. |
-| **`NV_PFUSE_FEAT_OVR_SM_SPD_0`** (`SS0` / `GU_SS0_UNLOCK`) | `0x0082381C` | `0x99999999` (Half-speed on GeForce) | `0x88888888` | **Speed Selector 0 (`SS0`):** Eight 4-bit nibbles controlling functional unit issue-rate divisors across SM sub-partitions (`SMSP`s): `FFMA`, `FMLA16`, `FMLA32` (`HMMA.16816.F32` FP16/BF16 -> FP32, `HMMA.1688.F32` TF32), and lower `IMLA0..3` slots (note: FP64 DP rate is governed separately by `NV_PFUSE_OPT_FP64_SPEED_SELECT`). In each 4-bit nibble: bit `3` (`0x8`) = Override Enable, bits `2:0` = Speed Divisor (`0` = Full Speed $\tau = 8\text{ cycles/SMSP}$; `1` = Half Speed $\tau = 16\text{ cycles/SMSP}$, so `0x9 = 0b1001`). Writing `0x88888888` sets `Override_Enable = 1, Divisor = 0` across all 8 pipeline slots. |
+| **`NV_PFUSE_FEAT_OVR_SM_SPD_0`** (`SS0` / `GU_SS0_UNLOCK`) | `0x0082381C` | `0x99999999` (Half-speed on GeForce) | `0x88888888` | **Speed Selector 0 (`SS0`):** Eight 4-bit nibbles controlling functional unit issue-rate divisors across SM sub-partitions (`SMSP`s): `FFMA`, `FMLA16`, `FMLA32` (`HMMA.16816.F32` FP16/BF16 -> FP32, `HMMA.1688.F32` TF32), and lower `IMLA0..3` slots (note: FP64 DP rate is governed separately by `NV_PFUSE_OPT_FP64_SPEED_SELECT`). In each 4-bit nibble: bit `3` (`0x8`) = Override Enable, bits `2:0` = Speed Divisor (`0` = Full Speed $\tau = 16$; `1` = Half Speed $\tau = 32$ cycles per `HMMA.16816` per SMSP, i.e. 8 / 16 cycles per 2,048-FLOP half-instruction; so `0x9 = 0b1001`). Writing `0x88888888` sets `Override_Enable = 1, Divisor = 0` across all 8 pipeline slots. |
 | **`NV_PFUSE_FEAT_OVR_SM_SPD_1`** (`SS1` / `GU_SS1_UNLOCK`) | `0x00823820` | `0x00000009` or `0x00000000` | `0x00000008` | **Speed Selector 1 (`SS1`):** 4-bit nibble (`[3:0]`) governing the upper `IMLA4` / Tensor Core pipeline slot. Writing `0x8` (`0b1000`) enables the override at full speed (`Divisor = 0`). |
 
 ### B. SEC2 Falcon Heavy-Secure (HS) Privilege Elevation ("A Canary in the Crypto Mine")
@@ -56,15 +56,28 @@ For the Tensor Core pipeline to remain compute-bound ($T_{\text{MMA}}(\tau) \ge 
 
 $$\mathcal{I}_{\text{warp}} = \frac{\text{FLOPs}_{\text{warp}}}{\text{Bytes}_{\text{warp, SRAM}}} = \frac{2 \cdot W_M \cdot W_N \cdot 16}{32(W_M + W_N)} = \frac{W_M W_N}{W_M + W_N}\text{ FLOPs/Byte}$$
 
-| Architectural / Warp-Tile Metric | Locked State ($\tau = 16\text{ cycles}$) | Unlocked State ($\tau = 8\text{ cycles}$) | Physical & Microarchitectural Consequence |
+> [!NOTE]
+> FLOP accounting corrected 2026-11-08 (docs/12 4.7, docs/14 section 8). $\tau$ is the interval between
+> `HMMA.16816` issues on one SMSP. One such instruction is $W_{\text{HMMA}} = 4096$ FLOPs, so an SM does
+> $4 \cdot 4096 / \tau$ FLOPs/cycle. The published GeForce FP32-accumulate rate (512 FLOPs/cycle/SM, 165 TF on
+> AD102) therefore means $\tau = 32$ locked and $\tau = 16$ unlocked. This table previously used $\tau = 16 / 8$
+> with 4,096 FLOPs per instruction, which double-counted throughput relative to its own first row and halved every
+> $T_{\text{MMA}}$ below. The ridge points (4.0 / 8.0 FLOPs/Byte) were right; the $T_{\text{MMA}}$ entries and the
+> margins were not.
+
+| Architectural / Warp-Tile Metric | Locked State ($\tau = 32\text{ cycles}$) | Unlocked State ($\tau = 16\text{ cycles}$) | Physical & Microarchitectural Consequence |
 | :--- | :--- | :--- | :--- |
-| **SM Tensor Core Throughput (`HMMA.16816.F32`)** | $512\text{ FLOPs/cycle/SM}$ | $1,024\text{ FLOPs/cycle/SM}$ | Hardware issue interval per SMSP halves from 16 to 8 cycles. |
+| **SM Tensor Core Throughput (`HMMA.16816.F32`)** | $512\text{ FLOPs/cycle/SM}$ | $1,024\text{ FLOPs/cycle/SM}$ | Hardware issue interval per SMSP halves from 32 to 16 cycles. |
 | **SM SRAM Read Bandwidth ($32 \times 4\text{ B}$)** | $128\text{ Bytes/cycle/SM}$ | $128\text{ Bytes/cycle/SM}$ | Physical SRAM crossbar bandwidth remains fixed. |
 | **Conflict-Free Ridge Point ($\beta_{\text{conflict}} = 1.0$)** | $4.0\text{ FLOPs/Byte}$ | $8.0\text{ FLOPs/Byte}$ | Minimum operational intensity doubles on unlocked silicon. |
-| **Warp Tile $32 \times 32$ ($\mathcal{I}_{\text{warp}} = 16.0\text{ FLOP/B}$)** | $T_{\text{MMA}} = 32 N_w$, $T_{\text{SRAM}} = 16 N_w \beta$ | $T_{\text{MMA}} = 16 N_w$, $T_{\text{SRAM}} = 16 N_w \beta$ | Compute-bound when locked ($2:1$ margin); stalls immediately on any bank conflict or `cp.async` delay when unlocked ($1:1$ margin). |
-| **Warp Tile $64 \times 32$ ($\mathcal{I}_{\text{warp}} = 21.3\text{ FLOP/B}$)** | $T_{\text{MMA}} = 64 N_w$, $T_{\text{SRAM}} = 24 N_w \beta$ | $T_{\text{MMA}} = 32 N_w$, $T_{\text{SRAM}} = 24 N_w \beta$ | Only a $1.33\times$ compute-to-SRAM ratio when unlocked; vulnerable to `cp.async` scoreboard stalls. |
-| **Warp Tile $64 \times 64$ ($\mathcal{I}_{\text{warp}} = 32.0\text{ FLOP/B}$)** | $T_{\text{MMA}} = 128 N_w$, $T_{\text{SRAM}} = 32 N_w \beta$ | $T_{\text{MMA}} = 64 N_w$, $T_{\text{SRAM}} = 32 N_w \beta$ | Restores the full $2.0:1$ compute-to-SRAM margin required to saturate unlocked Tensor Cores. |
-| **Warp Tile $128 \times 64$ ($\mathcal{I}_{\text{warp}} = 42.7\text{ FLOP/B}$)** | $T_{\text{MMA}} = 256 N_w$, $T_{\text{SRAM}} = 48 N_w \beta$ | $T_{\text{MMA}} = 128 N_w$, $T_{\text{SRAM}} = 48 N_w \beta$ | Yields $2.67:1$ compute-to-SRAM ratio, requiring $\sim 218$ registers/thread. |
+| **Warp Tile $32 \times 32$ ($\mathcal{I}_{\text{warp}} = 16.0\text{ FLOP/B}$)** | $T_{\text{MMA}} = 64 N_w$, $T_{\text{SRAM}} = 16 N_w \beta$ | $T_{\text{MMA}} = 32 N_w$, $T_{\text{SRAM}} = 16 N_w \beta$ | Compute-bound in both states: $4:1$ locked, $2:1$ unlocked. Even the modelled $\beta = 1.18$ bank-conflict factor leaves $1.69\times$ unlocked (previously reported as a $0.85\times$ stall, an artifact of the FLOP error). |
+| **Warp Tile $64 \times 32$ ($\mathcal{I}_{\text{warp}} = 21.3\text{ FLOP/B}$)** | $T_{\text{MMA}} = 128 N_w$, $T_{\text{SRAM}} = 24 N_w \beta$ | $T_{\text{MMA}} = 64 N_w$, $T_{\text{SRAM}} = 24 N_w \beta$ | $5.33:1$ locked, $2.67:1$ unlocked ($2.38\times$ at the modelled $\beta = 1.12$). |
+| **Warp Tile $64 \times 64$ ($\mathcal{I}_{\text{warp}} = 32.0\text{ FLOP/B}$)** | $T_{\text{MMA}} = 256 N_w$, $T_{\text{SRAM}} = 32 N_w \beta$ | $T_{\text{MMA}} = 128 N_w$, $T_{\text{SRAM}} = 32 N_w \beta$ | $8:1$ locked, $4:1$ unlocked. |
+| **Warp Tile $128 \times 64$ ($\mathcal{I}_{\text{warp}} = 42.7\text{ FLOP/B}$)** | $T_{\text{MMA}} = 512 N_w$, $T_{\text{SRAM}} = 48 N_w \beta$ | $T_{\text{MMA}} = 256 N_w$, $T_{\text{SRAM}} = 48 N_w \beta$ | $10.67:1$ locked, $5.33:1$ unlocked, requiring $\sim 218$ registers/thread. |
+
+The margin in every row equals $\mathcal{I}_{\text{warp}} / (\text{ridge} \cdot \beta)$ with ridge $= 4$ (locked) or $8$ (unlocked)
+FLOPs/Byte, which is a quick consistency check. `smsp_roofline_sim.py` now asserts that the FLOP rate implied by
+$T_{\text{MMA}}$ equals `peak_tflops` for every row, so the two cannot drift apart again.
 
 ### Conflict-Free `ldmatrix.x4` 128-Byte XOR Swizzling (`Swizzle<3, 3, 3>` in 16-bit elements / CuTe `Swizzle<3, 4, 3>` in bytes)
 

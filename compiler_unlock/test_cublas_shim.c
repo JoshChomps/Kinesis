@@ -252,6 +252,23 @@ int main(void) {
     shim_spoof_nvos54_packet(&nvos);
     assert((pci_params.pciDeviceId >> 16) == 0x2230U);
     assert(pci_params.pciExtDeviceId == 0x2230U);
+
+    // docs/12 4.17 regression: GET_NAME_STRING scans only the 64-byte name field, even when it is not NUL-terminated.
+    //   (a) 64 non-NUL bytes, with "4090" only in the bytes AFTER the field: must not match (the old strstr read past)
+    //   (b) "4090" inside the field: must be rewritten
+    {
+        unsigned char name_params[4 + 64 + 16];
+        memset(name_params, 0, sizeof(name_params));                 // flags = 0 (ASCII)
+        memset(name_params + 4, 'X', 64);                            // unterminated 64-byte name field
+        memcpy(name_params + 4 + 64, "4090\0", 5);                   // bait just past the field
+        NVOS54_PARAMETERS nvos_name = {1, 2, 0x20800110U, 0, name_params, 68U, 0};
+        shim_spoof_nvos54_packet(&nvos_name);
+        assert(name_params[4] == 'X' && name_params[4 + 63] == 'X'); // untouched: bait outside the field ignored
+        memcpy(name_params + 4 + 20, "4090", 4);
+        shim_spoof_nvos54_packet(&nvos_name);
+        assert(strcmp((const char*)name_params + 4, "NVIDIA RTX 6000 Ada Generation") == 0);
+        printf("[+] GET_NAME_STRING bounded scan: bait past the 64-byte field ignored, in-field match rewritten.\n");
+    }
     shim_set_mock_caller_is_cublas(0);
 
     printf("[+] PASS: cuGetProcAddress_v2 & O2 caller-aware NVOS54 ioctl spoofing verified.\n");

@@ -633,8 +633,30 @@ int main(void) {
     verify_compounding_bf16_error_budget_o13();
     printf("[5] O13 2-stage Kronecker H_32 compounding BF16 rounding error budget (<0.6%% rel L2 vs. FP64): PASS\n");
 
+    // [6] docs/12 4.12 regression: warp_sieve_k32_active must keep a K32 slice that contains one NaN or Inf
+    //     activation at tau_sieve > 0 (the old `x > max` / `mean > tau` comparisons dropped NaN), and must still
+    //     skip the same slice when it is genuinely silent (control).
+    {
+        static const uint32_t poison[3] = {0x00000000U, 0x7FC00000U, 0x00007F80U}; // silent, bf16 NaN, bf16 +Inf
+        int results[3] = {-1, -1, -1};
+        for (int which = 0; which < 3; ++which) {
+            static uint32_t frag[32][2][4][4];
+            memset(frag, 0, sizeof(frag));
+            frag[13][1][2][3] = poison[which];
+            int lane_res[32];
+            host_launch_grid_cta(dim3(1, 1, 1), 32, [&]() {
+                const int lane = threadIdx.x;
+                lane_res[lane] = warp_sieve_k32_active(frag[lane], 0.25f);
+            });
+            for (int lane = 1; lane < 32; ++lane) assert(lane_res[lane] == lane_res[0]); // warp-uniform
+            results[which] = lane_res[0];
+        }
+        assert(results[0] == 0 && results[1] == 1 && results[2] == 1);
+        printf("[6] warp_sieve_k32_active non-finite activations (docs/12 4.12): silent -> skip, NaN -> keep, Inf -> keep: PASS\n");
+    }
+
     printf("====================================================================\n");
-    printf("ALL 44 HOST CTA/WARP KERNEL VERIFICATION CASES PASSED (0 ERRORS)\n");
+    printf("ALL 45 HOST CTA/WARP KERNEL VERIFICATION CASES PASSED (0 ERRORS)\n");
     printf("====================================================================\n");
     return 0;
 }

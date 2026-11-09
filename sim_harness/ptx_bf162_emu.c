@@ -128,8 +128,17 @@ static inline uint32_t ptx_max_bf162(uint32_t a, uint32_t b) {
     float a_hi = bf16_to_fp32(unpack_bf162_high(a));
     float b_lo = bf16_to_fp32(unpack_bf162_low(b));
     float b_hi = bf16_to_fp32(unpack_bf162_high(b));
-    uint16_t d_lo = (a_lo >= b_lo) ? unpack_bf162_low(a) : unpack_bf162_low(b);
-    uint16_t d_hi = (a_hi >= b_hi) ? unpack_bf162_high(a) : unpack_bf162_high(b);
+    // PTX max.bf16x2 (no .NaN modifier): if exactly one input is NaN the result is the other input; if both are NaN
+    // the result is the canonical NaN 0x7FFF (docs/12 4.17: the old `a >= b ? a : b` returned b whenever b was NaN).
+    uint16_t d_lo, d_hi;
+    if (a_lo != a_lo && b_lo != b_lo) d_lo = 0x7FFFU;
+    else if (a_lo != a_lo)            d_lo = unpack_bf162_low(b);
+    else if (b_lo != b_lo)            d_lo = unpack_bf162_low(a);
+    else                              d_lo = (a_lo >= b_lo) ? unpack_bf162_low(a) : unpack_bf162_low(b);
+    if (a_hi != a_hi && b_hi != b_hi) d_hi = 0x7FFFU;
+    else if (a_hi != a_hi)            d_hi = unpack_bf162_high(b);
+    else if (b_hi != b_hi)            d_hi = unpack_bf162_high(a);
+    else                              d_hi = (a_hi >= b_hi) ? unpack_bf162_high(a) : unpack_bf162_high(b);
     return pack_bf162(d_lo, d_hi);
 }
 
@@ -691,6 +700,20 @@ int main(void) {
     printf("| Quest Page Bounding + FLUTE prmt.b32 LUT     | %16d | %10d | PASS   |\n",
            17, quest_errors);
     printf("+----------------------------------------------+------------------+------------+--------+\n");
+
+    // docs/12 4.17 regression: max.bf16x2 NaN semantics (one NaN -> the other operand, both NaN -> 0x7FFF)
+    {
+        const uint32_t qnan = 0x7FC0U, two = 0x4000U, neg1 = 0xBF80U;
+        int max_errors = 0;
+        max_errors += (ptx_max_bf162(pack_bf162(two, qnan), pack_bf162(qnan, neg1)) != pack_bf162(two, neg1));
+        max_errors += (ptx_max_bf162(pack_bf162(qnan, two), pack_bf162(neg1, qnan)) != pack_bf162(neg1, two));
+        max_errors += (ptx_max_bf162(pack_bf162(qnan, qnan), pack_bf162(qnan, qnan)) != pack_bf162(0x7FFFU, 0x7FFFU));
+        max_errors += (ptx_max_bf162(pack_bf162(two, neg1), pack_bf162(neg1, two)) != pack_bf162(two, two));
+        printf("| max.bf16x2 NaN semantics (PTX ISA)           | %16d | %10d | %s   |\n", 4, max_errors,
+               max_errors == 0 ? "PASS" : "FAIL");
+        printf("+----------------------------------------------+------------------+------------+--------+\n");
+        if (max_errors != 0) return 1;
+    }
 
     return 0;
 }

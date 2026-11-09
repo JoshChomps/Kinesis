@@ -23,6 +23,11 @@ def tiled_cbc_sieve_gemm(
     Executes Y = X_rot @ W^T in blocks of (BLOCK_M, BLOCK_K = 128) with dynamic
     Tiled-CBC subspace gating based on per-tile row-maximum Holder L1 norm
     E_k = max_{m in tile} mean_{k in tile} |X[m, k]| > tau_sieve (fixes O9).
+
+    tau_sieve is an ACTIVATION-ENERGY threshold: it has no weight-scale factor, so it is not an output-error
+    budget (docs/12 3.6 / 4.13). The guaranteed `<= eps` sieve is the C++ SmartTieredCache error budget.
+    Non-finite tiles are always executed: the gate is `not (E_k <= tau)`, so a NaN energy keeps its tile and the
+    NaN propagates to the output exactly as in the dense GEMM (docs/12 4.12).
     """
     M, K = x_rot_bf16.shape
     N, K_w = w_dequant_bf16.shape
@@ -48,7 +53,7 @@ def tiled_cbc_sieve_gemm(
                 e_k = float(x_tile.abs().mean(dim=-1).amax().item())
             else:
                 e_k = float(x_tile.abs().mean().item())
-            if e_k > tau_sieve:
+            if not (e_k <= tau_sieve):   # NaN-safe: a NaN energy keeps the tile
                 w_tile = w_dequant_bf16[:, k_start:k_end].to(torch.float32)
                 y_out[m_start:m_end, :] += x_tile @ w_tile.T
                 executed_tiles += 1
@@ -96,6 +101,17 @@ def main() -> None:
     print(f"[4] O9 Single-Outlier-Row Gate       : RowMax Executed={int(stats_rowmax['executed_tiles'])}/1 | Mean-L1 Executed={int(stats_mean['executed_tiles'])}/1")
     assert int(stats_rowmax["executed_tiles"]) == 1 and int(stats_mean["executed_tiles"]) == 0
     assert float(y_out_rowmax[13].abs().max().item()) > 0.0
+    # [5] docs/12 4.12 regression: one NaN in an otherwise silent tile must reach the output, exactly like the dense
+    #     GEMM (the tile used to be skipped, giving 64/64 finite rows where dense gives NaN in that row).
+    x_nan = torch.zeros((64, 256), dtype=torch.bfloat16)
+    x_nan[:, 128:] = 1.0
+    x_nan[21, 7] = float("nan")
+    y_nan, st_nan = tiled_cbc_sieve_gemm(x_nan, w_bf16[:, :256], tau_sieve=0.5)
+    y_nan_dense = (x_nan.float() @ w_bf16[:, :256].float().T)
+    same_pattern = bool(torch.equal(torch.isnan(y_nan.float()), torch.isnan(y_nan_dense)))
+    print(f"[5] NaN in a silent tile (4.12)      : executed {int(st_nan['executed_tiles'])}/2 tiles | "
+          f"NaN rows sieve/dense = {int(torch.isnan(y_nan.float()).any(1).sum())}/{int(torch.isnan(y_nan_dense).any(1).sum())}")
+    assert int(st_nan["executed_tiles"]) == 2 and same_pattern
     print("[+] PASS: Tiled-CBC dynamic subspace energy sieve and O9 row-max Holder bound verified.")
 
 

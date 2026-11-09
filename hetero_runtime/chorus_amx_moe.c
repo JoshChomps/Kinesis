@@ -37,7 +37,16 @@
 
 #define UHA_RING_ALLOC_MMAP_1GB   (1U << 0)
 #define UHA_RING_ALLOC_PAGELOCKED (1U << 1)
+#define UHA_RING_ALLOC_MANUAL_ALIGN (1U << 2)   // generic fallback: over-allocated malloc, original pointer stored below
 #define UHA_RING_SLOTS_SHIFT      16U
+#define UHA_RING_MAX_SLOTS        0xFFFFU       // slot count is stored in bits [31:16] of alloc_via_mmap
+
+// Verification switches (host only): exercise the non-Win/Linux code paths on any host (docs/12 4.3 / 4.15).
+//   UHA_CHORUS_FORCE_SINGLE_THREAD : no worker thread; the producer drives the consumer inline.
+//   UHA_CHORUS_FORCE_GENERIC_ALLOC : use the portable over-allocated aligned allocator.
+#if defined(UHA_CHORUS_FORCE_SINGLE_THREAD) || (!defined(_WIN32) && !defined(__linux__))
+#define UHA_CHORUS_SINGLE_THREADED 1
+#endif
 
 typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
     // Cache Line 0: Producer (GPU CE / Host launch callback)
@@ -57,6 +66,14 @@ typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
     uint16_t         input_hidden_bf16[UHA_MOE_MAX_BATCH_TOKENS * UHA_MOE_DEFAULT_HIDDEN_DIM];  // 128 KB max
     uint16_t         output_hidden_bf16[UHA_MOE_MAX_BATCH_TOKENS * UHA_MOE_DEFAULT_HIDDEN_DIM]; // 128 KB max
 } HeteroMoERingSlot;
+
+// docs/12 4.4: the slot count is packed into 16 bits on free. With the 1 GB cap this can never truncate as long as
+// 1 GB / sizeof(slot) <= 65535 (today: 1073741824 / 263296 = 4078). If the slot ever shrinks below 16 KiB this
+// fails at compile time instead of silently freeing the wrong length.
+_Static_assert(HUGE_PAGE_1GB / sizeof(HeteroMoERingSlot) <= UHA_RING_MAX_SLOTS,
+               "ring slot count no longer fits the 16-bit tag in alloc_via_mmap; widen the tag");
+_Static_assert(sizeof(HeteroMoERingSlot) % UHA_CPU_CACHELINE_BYTES == 0,
+               "slot size must be a multiple of the cache line so every slot stays 64-byte aligned");
 
 // Configure AMX Tile Control Register (TILECFG) for 16x16x32 BF16->FP32 Matmul
 typedef struct __attribute__((packed)) {
@@ -119,6 +136,7 @@ HeteroMoERingSlot* allocate_pinned_1gb_ring(size_t num_slots) {
     }
     size_t bytes = num_slots * sizeof(HeteroMoERingSlot);
     if (bytes > HUGE_PAGE_1GB) return NULL;
+    if (num_slots > UHA_RING_MAX_SLOTS) return NULL;   // runtime twin of the static assert (docs/12 4.4)
     uint32_t slot_count_tag = ((uint32_t)num_slots & 0xFFFFU) << UHA_RING_SLOTS_SHIFT;
 #if defined(__linux__) && defined(MAP_HUGETLB)
     void* ptr = (bytes > HUGE_PAGE_1GB) ? MAP_FAILED : mmap(
@@ -141,22 +159,41 @@ HeteroMoERingSlot* allocate_pinned_1gb_ring(size_t num_slots) {
     }
 #endif
     HeteroMoERingSlot* fallback = NULL;
-#if defined(_WIN32)
+    uint32_t alloc_kind = 0U;
+#if defined(_WIN32) && !defined(UHA_CHORUS_FORCE_GENERIC_ALLOC)
     fallback = (HeteroMoERingSlot*)_aligned_malloc(bytes, UHA_CPU_CACHELINE_BYTES);
     if (fallback != NULL) {
         memset(fallback, 0, bytes);
     }
-#elif defined(__linux__) || defined(__unix__)
+#elif (defined(__linux__) || defined(__unix__)) && !defined(UHA_CHORUS_FORCE_GENERIC_ALLOC)
     void* aligned_ptr = NULL;
     if (posix_memalign(&aligned_ptr, UHA_CPU_CACHELINE_BYTES, bytes) == 0 && aligned_ptr != NULL) {
         memset(aligned_ptr, 0, bytes);
         fallback = (HeteroMoERingSlot*)aligned_ptr;
     }
 #else
-    fallback = (HeteroMoERingSlot*)calloc(num_slots, sizeof(HeteroMoERingSlot));
+    // Portable 64-byte aligned allocation (docs/12 4.15). calloc only guarantees alignof(max_align_t) (16 B), which
+    // is less than the struct's aligned(64): the old code returned a misaligned ring, so _Atomic accesses through it
+    // were UB and the cache-line split was lost. This path is taken on macOS/BSD-without-__unix__ and any other
+    // host. Over-allocate, round up to the cache line, and keep the original pointer in the word just below.
+    {
+        const size_t a = (size_t)UHA_CPU_CACHELINE_BYTES;
+        if (bytes <= SIZE_MAX - a - sizeof(void*)) {
+            unsigned char* raw = (unsigned char*)malloc(bytes + a + sizeof(void*));
+            if (raw != NULL) {
+                uintptr_t base = (uintptr_t)(raw + sizeof(void*));
+                uintptr_t aligned = (base + (uintptr_t)(a - 1U)) & ~(uintptr_t)(a - 1U);
+                ((void**)aligned)[-1] = raw;
+                memset((void*)aligned, 0, bytes);
+                fallback = (HeteroMoERingSlot*)aligned;
+                alloc_kind = UHA_RING_ALLOC_MANUAL_ALIGN;
+            }
+        }
+    }
 #endif
     if (fallback != NULL) {
-        uint32_t flags = slot_count_tag;
+        assert(((uintptr_t)fallback % UHA_CPU_CACHELINE_BYTES) == 0U);
+        uint32_t flags = slot_count_tag | alloc_kind;
 #if defined(__linux__)
         if (mlock((void*)fallback, bytes) == 0) {
             flags |= UHA_RING_ALLOC_PAGELOCKED;
@@ -192,6 +229,18 @@ void free_pinned_1gb_ring(HeteroMoERingSlot* ring) {
         return;
     }
 #endif
+    if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_MANUAL_ALIGN) {
+        // The portable allocator can still be page-locked when forced on Linux/Windows: unlock before freeing.
+        if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) {
+#if defined(__linux__)
+            (void)munlock((void*)ring, bytes);
+#elif defined(_WIN32)
+            (void)VirtualUnlock((LPVOID)ring, bytes);
+#endif
+        }
+        free(((void**)ring)[-1]);
+        return;
+    }
 #if defined(__linux__)
     if (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) {
         (void)munlock((void*)ring, bytes);
@@ -333,27 +382,14 @@ typedef struct {
     uint64_t           target_dispatches;
     _Atomic uint64_t   completed_dispatches;
     _Atomic int        stop_requested;
+    uint64_t           consumer_next_seq;   // single-threaded mode: next sequence the inline consumer will process
 } ChorusAmxWorkerContext;
 
-static void chorus_amx_worker_loop(ChorusAmxWorkerContext* ctx) {
-    (void)amx_init_tiles_bf16();
-    float tile_acc[16 * 16];
-
-    for (uint64_t seq = 1; seq <= ctx->target_dispatches; ++seq) {
-        const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)ctx->num_slots);
-        HeteroMoERingSlot* slot = &ctx->ring[slot_idx];
-
-        // Spin-wait with acquire barrier until producer publishes sequence number `seq`
-        while (atomic_load_explicit(&slot->gpu_ready_seq, memory_order_acquire) < seq) {
-            if (atomic_load_explicit(&ctx->stop_requested, memory_order_relaxed)) {
-                amx_release_tiles();
-                return;
-            }
-#if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
-#endif
-        }
-
+// Processes one published dispatch `seq` (the caller has already observed gpu_ready_seq >= seq with acquire).
+static void chorus_amx_process_slot(ChorusAmxWorkerContext* ctx, uint64_t seq, float* tile_acc) {
+    const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)ctx->num_slots);
+    HeteroMoERingSlot* slot = &ctx->ring[slot_idx];
+    {
         const int K = (int)slot->hidden_dim;
         const int M = (slot->num_tokens <= 16U) ? (int)slot->num_tokens : 16;
         if (K > 0 && K <= (int)UHA_MOE_DEFAULT_HIDDEN_DIM && (K & 31) == 0) {
@@ -372,11 +408,58 @@ static void chorus_amx_worker_loop(ChorusAmxWorkerContext* ctx) {
         atomic_store_explicit(&slot->cpu_done_seq, seq, memory_order_release);
         atomic_fetch_add_explicit(&ctx->completed_dispatches, 1ULL, memory_order_release);
     }
+}
+
+#if !defined(UHA_CHORUS_SINGLE_THREADED)
+static void chorus_amx_worker_loop(ChorusAmxWorkerContext* ctx) {
+    (void)amx_init_tiles_bf16();
+    float tile_acc[16 * 16];
+
+    for (uint64_t seq = 1; seq <= ctx->target_dispatches; ++seq) {
+        const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)ctx->num_slots);
+        HeteroMoERingSlot* slot = &ctx->ring[slot_idx];
+
+        // Spin-wait with acquire barrier until producer publishes sequence number `seq`
+        while (atomic_load_explicit(&slot->gpu_ready_seq, memory_order_acquire) < seq) {
+            if (atomic_load_explicit(&ctx->stop_requested, memory_order_relaxed)) {
+                amx_release_tiles();
+                return;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        chorus_amx_process_slot(ctx, seq, tile_acc);
+    }
 
     amx_release_tiles();
 }
+#endif
 
-#if defined(_WIN32)
+// Single-threaded consumer step (docs/12 4.3). Processes every dispatch the producer has already published and
+// returns without waiting. The producer calls it whenever it would otherwise block on cpu_done_seq.
+// Liveness: at sequence s > n (n = num_slots) the producer needs cpu_done_seq[slot] >= s - n. It has published
+// 1..s-1, so this call advances the consumer to s - 1 >= s - n and the wait terminates; the drain loop is the
+// same argument with s = total + 1. The old code ran the whole consumer only after the producer loop, so the
+// producer blocked forever at s = n + 1.
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+static void chorus_amx_consume_ready(ChorusAmxWorkerContext* ctx) {
+    float tile_acc[16 * 16];
+    while (ctx->consumer_next_seq <= ctx->target_dispatches) {
+        const uint64_t seq = ctx->consumer_next_seq;
+        HeteroMoERingSlot* slot = &ctx->ring[(size_t)((seq - 1ULL) % (uint64_t)ctx->num_slots)];
+        if (atomic_load_explicit(&slot->gpu_ready_seq, memory_order_acquire) < seq) {
+            return;   // not published yet
+        }
+        chorus_amx_process_slot(ctx, seq, tile_acc);
+        ctx->consumer_next_seq = seq + 1ULL;
+    }
+}
+#endif
+
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+// no worker thread entry points in single-threaded mode
+#elif defined(_WIN32)
 static unsigned __stdcall chorus_amx_win32_thread_entry(void* arg) {
     chorus_amx_worker_loop((ChorusAmxWorkerContext*)arg);
     return 0U;
@@ -504,8 +587,12 @@ int main(void) {
     ctx.target_dispatches = total_dispatches;
     atomic_init(&ctx.completed_dispatches, 0ULL);
     atomic_init(&ctx.stop_requested, 0);
+    ctx.consumer_next_seq = 1ULL;
 
-#if defined(_WIN32)
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+    (void)amx_init_tiles_bf16();
+    printf("[i] Single-threaded ring mode: producer drives the consumer inline (docs/12 4.3)\n");
+#elif defined(_WIN32)
     uintptr_t th = _beginthreadex(NULL, 0, chorus_amx_win32_thread_entry, &ctx, 0, NULL);
     assert(th != 0);
 #elif defined(__linux__)
@@ -524,7 +611,9 @@ int main(void) {
         if (seq > (uint64_t)num_slots) {
             const uint64_t prev_seq = seq - (uint64_t)num_slots;
             while (atomic_load_explicit(&slot->cpu_done_seq, memory_order_acquire) < prev_seq) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+                chorus_amx_consume_ready(&ctx);
+#elif defined(__x86_64__) || defined(_M_X64)
                 _mm_pause();
 #endif
             }
@@ -552,16 +641,15 @@ int main(void) {
         atomic_store_explicit(&slot->gpu_ready_seq, seq, memory_order_release);
     }
 
-#if !defined(_WIN32) && !defined(__linux__)
-    chorus_amx_worker_loop(&ctx);
-#endif
 
     // Drain and verify the final `num_slots` in-flight dispatches
     for (uint64_t seq = total_dispatches - (uint64_t)num_slots + 1ULL; seq <= total_dispatches; ++seq) {
         const size_t slot_idx = (size_t)((seq - 1ULL) % (uint64_t)num_slots);
         HeteroMoERingSlot* slot = &ring[slot_idx];
         while (atomic_load_explicit(&slot->cpu_done_seq, memory_order_acquire) < seq) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+            chorus_amx_consume_ready(&ctx);
+#elif defined(__x86_64__) || defined(_M_X64)
             _mm_pause();
 #endif
         }
@@ -576,7 +664,9 @@ int main(void) {
         }
     }
 
-#if defined(_WIN32)
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+    amx_release_tiles();
+#elif defined(_WIN32)
     WaitForSingleObject((HANDLE)th, INFINITE);
     CloseHandle((HANDLE)th);
 #elif defined(__linux__)
@@ -592,9 +682,16 @@ int main(void) {
            offsetof(HeteroMoERingSlot, gpu_ready_seq),
            offsetof(HeteroMoERingSlot, cpu_done_seq),
            (ring[0].alloc_via_mmap & UHA_RING_ALLOC_PAGELOCKED) ? 1U : 0U);
+    printf("    Ring base %% 64 = %u (%s allocator)\n", (unsigned)((uintptr_t)ring % 64U),
+           (ring[0].alloc_via_mmap & UHA_RING_ALLOC_MANUAL_ALIGN) ? "portable over-aligned" : "platform");
+    assert(((uintptr_t)ring % 64U) == 0U);
     printf("[2] AMX 16x16x32 VNNI & TDPBF16PS FTZ  : Uniform Err=%d | VNNI Err=%d | Denormal FTZ Err=%d\n",
            errors, vnni_errors, ftz_errors);
+#if defined(UHA_CHORUS_SINGLE_THREADED)
+    printf("[3] Single-Threaded SPSC Ring (inline) : Completed=%llu/%llu | Payload Err=%d | Final Delta_Q=%llu\n",
+#else
     printf("[3] Multi-Threaded SPSC Ring Worker    : Completed=%llu/%llu | Payload Err=%d | Final Delta_Q=%llu\n",
+#endif
            (unsigned long long)final_completed,
            (unsigned long long)total_dispatches,
            ring_thread_errors,

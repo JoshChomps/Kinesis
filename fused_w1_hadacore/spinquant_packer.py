@@ -308,6 +308,10 @@ def main() -> None:
     x[:, 17] *= 14.0
 
     R1, k_before, k_after = optimize_stiefel_rotation(x, steps=20, lr=0.25)
+    # docs/12 4.16: the initial rotation alone already flattens most of the kurtosis, so `k_after < k_before`
+    # would pass even with a broken optimiser. Measure the 0-step kurtosis of the same initial rotation and require
+    # the Cayley-SGD steps themselves to improve on it.
+    _, _, k_init_rot = optimize_stiefel_rotation(x, steps=0, lr=0.25)
     orth_err = float(torch.max(torch.abs(R1.T @ R1 - torch.eye(K))).item())
 
     w = torch.randn((N, K), dtype=torch.float32)
@@ -330,10 +334,12 @@ def main() -> None:
     w2_bit_errors = int((unpacked_w2 != ref_w2).sum().item())
 
     print(f"[1] Stiefel Manifold Orthogonality Error ||R^T R - I||_inf : {orth_err:.3e}")
-    print(f"[2] Activation Kurtosis Reduction (Outlier Flattening)     : {k_before:.2f} -> {k_after:.2f}")
+    print(f"[2] Activation Kurtosis Reduction (Outlier Flattening)     : {k_before:.2f} -> {k_init_rot:.2f} (initial rotation) "
+          f"-> {k_after:.2f} (after 20 Cayley-SGD steps)")
     print(f"[3] Interleaved 16-Bit Split W1 & W2 Bit Mismatches        : W1={bit_errors}, W2={w2_bit_errors} (across {N*K} weights)")
     assert orth_err < 1e-5
     assert k_after < k_before
+    assert k_after < k_init_rot - 0.25, (k_init_rot, k_after)   # the optimiser itself must contribute
     assert bit_errors == 0 and w2_bit_errors == 0
     print("[+] PASS: Stiefel Cayley-SGD rotation and Interleaved lop3.b32 bit-packing verified.")
 
