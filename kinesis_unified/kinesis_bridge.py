@@ -692,8 +692,23 @@ def run_kinesis_bridge_verification() -> None:
         M_w1, N_w1, K_w1, ctypes.c_float(0.0), None, None,
     )
     assert rc_short_in == -3, rc_short_in
+    # docs/12 4.23: a packed input whose length does not match (K, N) is rejected (-4), not decoded with the
+    # wrong panel stride. K = 128 activations against K = 256 panels used to return garbage with status 0.
+    rc_k_mismatch = bridge._lib.uha_kinesis_smart_w1_gemm(
+        ctypes.cast(a_w1[:, : K_w1 // 2].contiguous().data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        ctypes.cast(bits_u8.data_ptr(), c_u8), bits_u8.numel(),
+        ctypes.cast(scales_i16.data_ptr(), c_u16), scales_i16.numel(),
+        ctypes.cast(torch.empty((M_w1, N_w1)).data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        M_w1, N_w1, K_w1 // 2, ctypes.c_float(0.0), None, None,
+    )
+    assert rc_k_mismatch == -4, rc_k_mismatch
+    try:
+        bridge.smart_w1_gemm(a_w1[:, : K_w1 // 2], bits_u8, scales_i16, N=N_w1)
+        raise AssertionError("K mismatch must raise")
+    except RuntimeError:
+        pass
     print("[5] C ABI Size Contract (docs/12 4.5)           : K=160 rejected (-1), short out/in buffers -> -3, "
-          "sentinel intact | PASS")
+          "sentinel intact, K mismatch -> -4 (4.23) | PASS")
 
     # [6] docs/12 4.14 regression: the CPU W2 GotoBLAS packer and the GPU (spinquant) W2 packer must produce the
     # same dequantized ternary weights for the same input, so a W2 tile decodes identically on either tier.

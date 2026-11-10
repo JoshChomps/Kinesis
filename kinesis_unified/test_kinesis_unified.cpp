@@ -223,12 +223,19 @@ int main() {
     std::printf("[5] Sub-2-Bit GotoBLAS Panel Packers (W1 1.125 bpw & W2 2.125 bpw) + GPU Layout Bridge:\n");
     std::printf("    Descriptor Sizes: Shape = %zu B, Strides = %zu B, TensorView = %zu B (2x64B Cache Lines)\n",
                 sizeof(Shape), sizeof(Strides), sizeof(TensorView<float>));
-    std::printf("    W1 (1.125 bpw): %zu B -> %zu B (%.2fx vs FP32, %.2fx vs FP16) | AVX2 Err = %.2e\n",
+    // docs/12 4.22: name the kernel path that was actually built. With -mavx2 but no -mfma the header falls back
+    // to the scalar kernels, and this line used to print "AVX2 Err" for a scalar-vs-scalar comparison.
+#if defined(KINESIS_UNIFIED_HAS_AVX2)
+    const char* kernel_path = "AVX2+FMA";
+#else
+    const char* kernel_path = "SCALAR (AVX2 kernels NOT built)";
+#endif
+    std::printf("    W1 (1.125 bpw): %zu B -> %zu B (%.2fx vs FP32, %.2fx vs FP16) | %s Err = %.2e\n",
                 w1_panels.fp32_equivalent_bytes(), w1_panels.compressed_bytes(),
-                comp_ratio, comp_ratio / 2.0, max_w1_unpack_err);
-    std::printf("    W2 (2.125 bpw): %zu B -> %zu B (%.2fx vs FP32, %.2fx vs FP16) | AVX2 Err = %.2e | GPU Bridge Mismatches = %zu -> PASS\n\n",
+                comp_ratio, comp_ratio / 2.0, kernel_path, max_w1_unpack_err);
+    std::printf("    W2 (2.125 bpw): %zu B -> %zu B (%.2fx vs FP32, %.2fx vs FP16) | %s Err = %.2e | GPU Bridge Mismatches = %zu -> PASS\n\n",
                 w2_panels.fp32_equivalent_bytes(), w2_panels.compressed_bytes(),
-                w2_comp_ratio, w2_comp_ratio / 2.0, max_w2_unpack_err, layout_bit_mismatches);
+                w2_comp_ratio, w2_comp_ratio / 2.0, kernel_path, max_w2_unpack_err, layout_bit_mismatches);
 
     // 6. Verify Smart CPU + Single-GPU Tiered Cache with Predictive Tiled-CBC Energy Sieve & LFU Eviction
     for (size_t m = 0; m < M; ++m) {
@@ -512,6 +519,67 @@ int main() {
                     class_mismatch, st_inf.groups_skipped);
         std::printf("    W2 vs independent BitNet b1.58 absmean reference: trit mismatches = %zu, scale ulp diffs = %zu/%zu -> PASS\n",
                     trit_diff, scale_diff, N * w2p.groups_per_col);
+    }
+
+    // [10] docs/12 4.21: non-finite inputs in the SmartTieredCache sieves and the W2 packer.
+    {
+        const size_t Mq = 4, Kq = 512, Nq = 16;
+        std::vector<float> aq(Mq * Kq), wq(Kq * Nq), c_ex(Mq * Nq), c_sv(Mq * Nq);
+        uint32_t lcg = 0x2468ACE1U;
+        auto next = [&]() { lcg = lcg * 1664525U + 1013904223U; return (static_cast<float>(lcg >> 8) / 8388608.0f) - 1.0f; };
+        for (auto& v : aq) v = next();
+        for (auto& v : wq) v = 0.05f * next();
+        TensorView<const float> Wq(wq.data(), Shape{static_cast<int64_t>(Kq), static_cast<int64_t>(Nq)});
+        const W1GotoBlasPanelSet Pq = pack_w1_gotoblas_panels(Wq);
+        TensorView<float> Cex(c_ex.data(), Shape{static_cast<int64_t>(Mq), static_cast<int64_t>(Nq)});
+        TensorView<float> Csv(c_sv.data(), Shape{static_cast<int64_t>(Mq), static_cast<int64_t>(Nq)});
+
+        // (a) legacy tau sieve: one Inf activation must not prune the finite groups. tau = 0.5 on activations of
+        //     equal energy prunes nothing, with or without the Inf (it used to prune 6 of 8 tiles).
+        aq[0 * Kq + 3] = INFINITY;
+        TensorView<const float> Aq(aq.data(), Shape{static_cast<int64_t>(Mq), static_cast<int64_t>(Kq)});
+        SmartTieredCache ex_a(Pq.num_panels, 0), tau_a(Pq.num_panels, 0, 0.5f);
+        ex_a.execute_smart_w1_gemm(Aq, Pq, Cex);
+        tau_a.execute_smart_w1_gemm(Aq, Pq, Csv);
+        const size_t tau_pruned = tau_a.telemetry().tiles_pruned_by_energy_sieve;
+        size_t tau_diff = 0;
+        for (size_t m = 1; m < Mq; ++m)
+            for (size_t n = 0; n < Nq; ++n) tau_diff += (c_ex[m * Nq + n] != c_sv[m * Nq + n]);
+        UHA_VERIFY(tau_pruned == 0 && tau_diff == 0);
+
+        // (b) error-budget sieve: a group whose weight scale is NaN must be kept, so the NaN reaches the output.
+        std::vector<float> wn = wq, an(Mq * Kq, 0.0f);
+        for (size_t k = 0; k < 128; ++k) wn[k * Nq + 0] = NAN;
+        for (size_t m = 0; m < Mq; ++m) {
+            an[m * Kq + 5] = 1e-6f;                                    // tiny activation in the NaN-weight group
+            for (size_t k = 128; k < Kq; ++k) an[m * Kq + k] = next();
+        }
+        TensorView<const float> Wn(wn.data(), Shape{static_cast<int64_t>(Kq), static_cast<int64_t>(Nq)});
+        TensorView<const float> An(an.data(), Shape{static_cast<int64_t>(Mq), static_cast<int64_t>(Kq)});
+        const W1GotoBlasPanelSet Pn = pack_w1_gotoblas_panels(Wn);
+        SmartTieredCache ex_b(Pn.num_panels, 0), bud_b(Pn.num_panels, 0);
+        bud_b.set_error_budget(1e-3f);
+        ex_b.execute_smart_w1_gemm(An, Pn, Cex);
+        bud_b.execute_smart_w1_gemm(An, Pn, Csv);
+        size_t nan_pattern_diff = 0;
+        for (size_t i = 0; i < Mq * Nq; ++i) nan_pattern_diff += (std::isnan(c_ex[i]) != std::isnan(c_sv[i]));
+        UHA_VERIFY(std::isnan(c_ex[0]) && nan_pattern_diff == 0);
+
+        // (c) W2 packer: +Inf / -Inf weights keep their sign, a NaN weight packs as 0 (code 1).
+        std::vector<float> wi = wq;
+        wi[7 * Nq + 2] = INFINITY;
+        wi[9 * Nq + 3] = -INFINITY;
+        wi[11 * Nq + 4] = NAN;
+        TensorView<const float> Wi(wi.data(), Shape{static_cast<int64_t>(Kq), static_cast<int64_t>(Nq)});
+        const W2GotoBlasPanelSet Pi = pack_w2_gotoblas_panels(Wi);
+        const unsigned c_pos = (Pi.packed_trits[7] >> (2 * 2)) & 3u;
+        const unsigned c_neg = (Pi.packed_trits[9] >> (2 * 3)) & 3u;
+        const unsigned c_nan = (Pi.packed_trits[11] >> (2 * 4)) & 3u;
+        UHA_VERIFY(c_pos == 2u && c_neg == 0u && c_nan == 1u);
+        std::printf("[10] Non-finite sieve and packer inputs (docs/12 4.21):\n");
+        std::printf("    tau sieve with one Inf: pruned %zu tiles, finite-row diffs %zu | NaN-scale group kept under eps budget: "
+                    "NaN pattern diffs %zu | W2 codes +Inf/-Inf/NaN = %u/%u/%u (want 2/0/1) -> PASS\n",
+                    tau_pruned, tau_diff, nan_pattern_diff, c_pos, c_neg, c_nan);
     }
 
     return 0;

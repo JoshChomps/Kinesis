@@ -39,6 +39,47 @@ def dequantize_signed_int8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return q.to(torch.float32) * scale
 
 
+def quantize_signed_int8_sr(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    int8 store for the first moment with unbiased stochastic rounding (docs/12 4.26). Round-to-nearest has a dead
+    zone: a coordinate below 1/254 of its row maximum is stored as 0 every step, so it never accumulates momentum
+    (21% of coordinates with a three-decade column spread) and its Adam numerator stays at (1 - beta1) * g.
+    floor(x / scale + U[0, 1)) has E[q * scale] = x, so E[M_hat_t] follows the exact EMA recursion, the same
+    argument as quantize_sqrt_v_log8_sr. Same memory: 1 byte per coordinate plus one fp32 scale per row.
+    """
+    scale = (t.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-12)
+    q = torch.clamp(torch.floor(t / scale + torch.rand_like(t)), -127.0, 127.0).to(torch.int8)
+    return q, scale
+
+
+def moment_rotation(p_new_stored: torch.Tensor, p_old_stored: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Change of coordinates for the low-rank moments on a projector refresh (docs/12 4.26).
+
+    The moments are stored in the coordinates of the STORED (quantized) projector: c_old = P_old^T g, and after
+    the refresh the engine projects with the stored new projector, c_new = P_new^T g. Neither is orthonormal
+    (int4: ||P^T P - I|| about 0.04). For g in span(P_old), with the thin QR P_old = Q R:
+        g = Q R^-T c_old,   so   c_new = (P_new^T Q R^-T) c_old.
+    The earlier code used P_new^T Q, i.e. it treated c_old as Q^T g, which is off by R^T (3.4% for int4).
+
+    Returns (rot, lost):
+      rot  [r, r]: c_new = rot @ c_old for gradients in the old span.
+      lost [r]:    fraction of each new direction that lies outside the old span, in [0, 1]. The old moments
+                   carry no information about that part.
+    """
+    q_qr, r_qr = torch.linalg.qr(p_old_stored, mode="reduced")
+    overlap = p_new_stored.T @ q_qr                                  # [r, r], rows = new directions
+    new_norm_sq = p_new_stored.pow(2).sum(dim=0).clamp(min=1e-24)    # [r]
+    lost = (1.0 - overlap.pow(2).sum(dim=1) / new_norm_sq).clamp(0.0, 1.0)
+    diag = torch.diagonal(r_qr).abs()
+    if float(diag.min()) > 1e-6 * float(diag.max().clamp(min=1e-30)):
+        # X R^T = overlap  ->  X = overlap R^-T   (R^T is lower triangular)
+        rot = torch.linalg.solve_triangular(r_qr.T, overlap, upper=False, left=False)
+    else:
+        rot = overlap                                                # rank-deficient stored projector: best effort
+    return rot, lost
+
+
 def quantize_unsigned_uint8(t: torch.Tensor, round_up: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Linear per-row uint8 quantizer (kept for general use). NOT used for the second moment any more: applying
@@ -198,6 +239,7 @@ class LayerWise8BitGaLoreEngine:
         max_proj_gap: int = 1600,
         subspace_iters: int = 0,
         reproject_moments: bool = True,
+        refresh_v_fill: bool = True,
     ) -> None:
         assert proj_bits in (4, 8)
         self.proj_bits = proj_bits
@@ -209,6 +251,16 @@ class LayerWise8BitGaLoreEngine:
         # gradient, so M_new = (P_new^T P_old) M_old is exact. V holds squares and has no exact transform;
         # V_new = (P_new^T P_old)^2 V_old (elementwise square) is exact when the old coordinates are uncorrelated.
         self.reproject_moments = reproject_moments
+        # docs/12 4.26: the part of a new direction that lies outside the old span has no second-moment history,
+        # while bias correction (driven by the global step) is already about 1. Left at zero, V restarts from
+        # (1 - beta2) g^2 against a momentum that recovers in about 1 / (1 - beta1) steps, and the step peaks at
+        # 3.45x its steady size for tens of steps. With refresh_v_fill the missing mass is seeded with the current
+        # projected gradient in the same bias state as the rest of V: V += lost * (1 - beta2^t) * r_new^2, so that
+        # after the global bias correction the new directions see sqrt(V_hat) = |r_new|, as a first Adam step does.
+        # (Seeding the full r_new^2 instead is wrong while 1 - beta2^t is still small: the correction then shrinks
+        # the step, 0.5x at t = 300.)
+        # False reproduces the old behaviour (kept as the negative control of the regression test).
+        self.refresh_v_fill = refresh_v_fill
         self.svd_calls = 0
         self.refresh_calls = 0
         self.rank = rank
@@ -221,6 +273,10 @@ class LayerWise8BitGaLoreEngine:
         self.states: Dict[torch.nn.Parameter, GaLoreState8Bit] = {}
         self.hooks = []
         self.peak_transient_grad_bytes = 0
+        # docs/12 4.26: full-size tensors alive at the peak of one layer step (param.grad, its FP32 copy, the
+        # full update, the FP32 weight copy, and for BF16 masters the int32 temporaries of the stochastic write).
+        # peak_transient_grad_bytes above counts param.grad only and understates the transient by this ratio.
+        self.peak_transient_step_bytes = 0
 
         for _, module in model.named_modules():
             if hasattr(module, "weight") and isinstance(module.weight, torch.nn.Parameter):
@@ -259,9 +315,11 @@ class LayerWise8BitGaLoreEngine:
             # Immediately free full-rank gradient tensor before preceding layer's backward pass
             p.grad = None
 
-        if hasattr(param, "register_post_accumulate_grad_hook"):
-            h = param.register_post_accumulate_grad_hook(_post_grad_hook)
-            self.hooks.append(h)
+        if not hasattr(param, "register_post_accumulate_grad_hook"):
+            # Without the hook nothing ever steps the parameter; fail loudly instead of training nothing.
+            raise RuntimeError("LayerWise8BitGaLoreEngine needs torch >= 2.1 (register_post_accumulate_grad_hook)")
+        h = param.register_post_accumulate_grad_hook(_post_grad_hook)
+        self.hooks.append(h)
 
     def _store_projector(self, st: GaLoreState8Bit, p_mat: torch.Tensor) -> None:
         # Quantize on device first so only 1 byte (int8) or 0.5 byte (int4) per element crosses PCIe
@@ -278,12 +336,16 @@ class LayerWise8BitGaLoreEngine:
         return dequantize_signed_int8(st.proj_q.to(device), st.proj_scale.to(device))
 
     @torch.no_grad()
-    def _reproject_moments(self, st: GaLoreState8Bit, rot: torch.Tensor, dev: torch.device) -> None:
+    def _reproject_moments(self, st: GaLoreState8Bit, rot: torch.Tensor, dev: torch.device,
+                           lost: torch.Tensor = None, r_new: torch.Tensor = None) -> None:
         m_old = dequantize_signed_int8(st.exp_avg_q.to(dev), st.exp_avg_scale.to(dev))
         sv_old = dequantize_sqrt_v_log8(st.exp_avg_sq_q.to(dev), st.exp_avg_sq_scale.to(dev))
         m_new = rot @ m_old
         v_new = (rot * rot) @ (sv_old * sv_old)
-        q_m, sc_m = quantize_signed_int8(m_new)
+        if self.refresh_v_fill and lost is not None and r_new is not None:
+            bias2 = 1.0 - (self.betas[1] ** st.step)       # bias state of the stored V (st.step updates so far)
+            v_new = v_new + (lost * bias2).unsqueeze(1) * (r_new * r_new)
+        q_m, sc_m = quantize_signed_int8_sr(m_new)
         q_sv, sc_sv = quantize_sqrt_v_log8_sr(torch.sqrt(v_new.clamp(min=0.0)))
         st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
         st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
@@ -318,11 +380,13 @@ class LayerWise8BitGaLoreEngine:
                 if subspace_cosine_similarity(p_old_orth, p_mat) >= self.cos_sim_threshold:
                     st.update_proj_gap = min(st.update_proj_gap * 2, self.max_proj_gap)
             st.next_svd_step = st.step + st.update_proj_gap
-            if self.reproject_moments and has_prev and p_old_orth is not None:
-                self._reproject_moments(st, p_mat.T @ p_old_orth, dev)
             self._store_projector(st, p_mat)
             # Use the exact value that will be re-read next step so both paths see the same quantized projector
             p_mat = self._load_projector(st, dev)
+            if self.reproject_moments and has_prev:
+                # Both projectors as STORED: the moments live in those coordinates (docs/12 4.26).
+                rot, lost = moment_rotation(p_mat, p_old)
+                self._reproject_moments(st, rot, dev, lost, p_mat.T @ grad)
         else:
             p_mat = self._load_projector(st, dev)
 
@@ -348,7 +412,7 @@ class LayerWise8BitGaLoreEngine:
         sqrt_v_t = torch.sqrt(v_t)
 
         # Quantize updated moments (M_t and sqrt(V_t)) to 8-bit before transferring to Host RAM
-        q_m, sc_m = quantize_signed_int8(m_t)
+        q_m, sc_m = quantize_signed_int8_sr(m_t)
         q_sv, sc_sv = quantize_sqrt_v_log8_sr(sqrt_v_t)
         st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
         st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
@@ -368,6 +432,13 @@ class LayerWise8BitGaLoreEngine:
         if self.weight_decay > 0.0:
             w_fp32.mul_(1.0 - self.lr * self.weight_decay)
         w_fp32.add_(full_update, alpha=-step_size)
+        live = param.grad.numel() * param.grad.element_size() + full_update.numel() * 4 + w_fp32.numel() * 4
+        if param.grad.dtype != torch.float32:
+            live += grad.numel() * 4                       # FP32 copy of the gradient
+        if param.data.dtype == torch.bfloat16:
+            live += 3 * w_fp32.numel() * 4                 # noise, bits + noise, rounded (int32 each)
+        if live > self.peak_transient_step_bytes:
+            self.peak_transient_step_bytes = live
         copy_to_param_stochastic(param.data, w_fp32)
 
 
@@ -392,6 +463,11 @@ def compute_32b_qat_memory_table(n_gpus: int = 2) -> Dict[str, Dict[str, float]]
 
     Host-staged bytes (GaLore's ~24 GB of master-weight HugePages and the ~2.42 GB of 8-bit optimizer
     moments streamed over PCIe) are NOT counted as VRAM: they live in host pinned memory, not on the GPU.
+
+    CAVEAT (docs/12 4.26): the 0.45 GB weight-gradient row is a stated assumption that covers one layer's
+    gradient buffer. The reference engine in this file holds more than that at the peak of a layer step
+    (LayerWise8BitGaLoreEngine.peak_transient_step_bytes, 11x the BF16 gradient for a BF16 master as written);
+    a device implementation has to update in place to stay inside this row. The table does not model that.
     """
     rows = {
         "Standard BF16 AdamW": {
@@ -567,6 +643,8 @@ def main() -> None:
     # correct-size steps the lazy schedule's stale subspace costs slightly more: 0.9792 on 4 seed pairs, while
     # the stochastic-rounding noise floor (same schedule, different seed) is 0.9998, so the change is
     # systematic, not noise. 0.975 keeps a margin above the measured value.
+    # Re-measured after docs/12 4.26 (stochastic first-moment store, bias-aware refresh V fill): 0.9786 to 0.9791
+    # on 4 seeds, so the threshold stands.
     assert cal_90["weight_delta_cos_sim"] >= 0.975, cal_90
     assert drift_cal[0.85]["svd_calls"] <= drift_cal[0.90]["svd_calls"] <= drift_cal[0.95]["svd_calls"] <= base_svd
     print(f"[Q] int4 projector rel err {rel4:.3f} (bias {bias:.4f}) | subspace-iter energy {100*energy_it/energy_svd:.2f}% of SVD "
@@ -606,8 +684,78 @@ def main() -> None:
     print(f"[V] sqrt(V) store over 3000 steps (docs/12 4.6): log8-SR median {med_new:.3f} (p05 {p05:.3f}, p95 {p95:.3f}, "
           f"small cols {small_new:.3f}), E[V_hat/V] {mean_v_bias:.4f} | old ceil-uint8 median {med_old:.2f}x")
 
+    # (e) docs/12 4.26: step size across a refresh into an orthogonal subspace. Constant gradient in subspace A
+    #     for 300 steps, then subspace B; a refresh falls on step 300. With refresh_v_fill the step must not
+    #     overshoot its steady size and must recover it; the old behaviour (control) peaks above 2.5x.
+    def _flip_peak(v_fill: bool) -> float:
+        torch.manual_seed(3)
+        lin = torch.nn.Linear(64, 32, bias=False)
+        w_prev = lin.weight.detach().clone()
+        LayerWise8BitGaLoreEngine(torch.nn.Sequential(lin), rank=4, update_proj_gap=100, lr=1e-3,
+                                  weight_decay=0.0, refresh_v_fill=v_fill)
+        qa, _ = torch.linalg.qr(torch.randn(32, 8))
+        rg = torch.randn(4, 64)
+        norms = []
+        for t in range(400):
+            (lin.weight * ((qa[:, :4] if t < 300 else qa[:, 4:]) @ rg)).sum().backward()
+            norms.append(float((lin.weight.detach() - w_prev).norm()))
+            w_prev = lin.weight.detach().clone()
+        return max(norms[300:]) / (sum(norms[250:300]) / 50.0)
+    peak_fill, peak_old = _flip_peak(True), _flip_peak(False)
+    assert 0.8 < peak_fill < 1.3, peak_fill
+    assert peak_old > 2.5, peak_old
+
+    # (f) docs/12 4.26: first-moment store. Constant-sign gradients with a three-decade column spread; the columns
+    #     below the round-to-nearest dead zone (under 0.3% of the row maximum) must keep their momentum on average.
+    torch.manual_seed(0)
+    col_m = torch.logspace(-3, 0, 512)
+    small = col_m < 3e-3
+    m_true = torch.zeros(16, 512)
+    q_sr, s_sr = torch.zeros(16, 512, dtype=torch.int8), torch.ones(16, 1)
+    q_rn, s_rn = torch.zeros(16, 512, dtype=torch.int8), torch.ones(16, 1)
+    acc_sr, acc_rn, acc_true = 0.0, 0.0, 0.0
+    for t in range(300):
+        g_m = col_m * (1.0 + 0.1 * torch.randn(16, 512))
+        m_true = 0.9 * m_true + 0.1 * g_m
+        q_sr, s_sr = quantize_signed_int8_sr(0.9 * dequantize_signed_int8(q_sr, s_sr) + 0.1 * g_m)
+        q_rn, s_rn = quantize_signed_int8(0.9 * dequantize_signed_int8(q_rn, s_rn) + 0.1 * g_m)
+        if t >= 200:
+            acc_sr += float(dequantize_signed_int8(q_sr, s_sr)[:, small].sum())
+            acc_rn += float(dequantize_signed_int8(q_rn, s_rn)[:, small].sum())
+            acc_true += float(m_true[:, small].sum())
+    m_ratio_sr, m_ratio_rn = acc_sr / acc_true, acc_rn / acc_true
+    assert 0.9 < m_ratio_sr < 1.1, m_ratio_sr
+    assert m_ratio_rn < 0.2, m_ratio_rn     # negative control: round-to-nearest loses the small columns
+
+    # (g) docs/12 4.26: moment change of coordinates between two STORED int4 projectors of the same subspace.
+    torch.manual_seed(2)
+    u_g, _ = torch.linalg.qr(torch.randn(256, 16))
+    o_g, _ = torch.linalg.qr(torch.randn(16, 16))
+
+    def _stored_int4(pm: torch.Tensor) -> torch.Tensor:
+        d = dequantize_int4(*quantize_int4_stochastic(pm), 16)
+        return d / d.norm(dim=0, keepdim=True)
+    p_old_s, p_new_s = _stored_int4(u_g), _stored_int4(u_g @ o_g)
+    g_g = p_old_s @ torch.randn(16, 64)                       # gradient inside the old stored span
+    c_old, c_new = p_old_s.T @ g_g, p_new_s.T @ g_g
+    rot_g, lost_g = moment_rotation(p_new_s, p_old_s)
+    q_g, r_g = torch.linalg.qr(p_old_s)
+    rot_err = float((rot_g @ c_old - c_new).norm() / c_new.norm())
+    rot_err_old = float(((p_new_s.T @ q_g) @ (q_g.T @ g_g) - c_new).norm() / c_new.norm())  # exact for Q coords ...
+    rot_err_legacy = float(((p_new_s.T @ (q_g * torch.sign(torch.diagonal(r_g)))) @ c_old - c_new).norm() / c_new.norm())
+    assert rot_err < 1e-4, rot_err
+    assert rot_err_old < 1e-4                                 # ... but the stored coordinates are c_old, not Q^T g
+    assert rot_err_legacy > 5e-3, rot_err_legacy              # negative control: the old formula on stored coords
+
     table = compute_32b_qat_memory_table()
     galore_budget = table["Layer-Wise 8-Bit GaLore (r=512, T=200) + Async DMA"]
+    step_ratio = engine.peak_transient_step_bytes / max(1, engine.peak_transient_grad_bytes)
+    assert engine.peak_transient_step_bytes > engine.peak_transient_grad_bytes
+    print(f"[R] Refresh into a new subspace (4.26): peak step {peak_fill:.2f}x steady with V fill | {peak_old:.2f}x without "
+          f"(control) | int8 M small-column mean: SR {m_ratio_sr:.3f}, RTN {m_ratio_rn:.3f} (control) | int4 moment "
+          f"rotation err {rot_err:.1e} (old formula {rot_err_legacy:.1e})")
+    print(f"[T] Layer-step transient (4.26): {engine.peak_transient_step_bytes} B live vs {engine.peak_transient_grad_bytes} B "
+          f"of param.grad ({step_ratio:.1f}x); the 0.45 GB table row covers the gradient buffer only")
 
     print(f"[1] 3-Layer Fused STE + 8-Bit GaLore Loss Trajectory : {losses[0]:.4f} -> {losses[-1]:.4f}")
     print(f"[2] Retained Full-Model Gradient Buffers Post-Backward: 0 Bytes (all freed in-flight)")

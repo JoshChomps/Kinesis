@@ -48,17 +48,25 @@
 #define UHA_CHORUS_SINGLE_THREADED 1
 #endif
 
-typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
-    // Cache Line 0: Producer (GPU CE / Host launch callback)
-    _Atomic uint64_t gpu_ready_seq;
-    uint8_t          pad_producer[UHA_CPU_CACHELINE_BYTES - sizeof(_Atomic uint64_t)];
+// Per-dispatch completion status, written by the consumer before it releases the slot (docs/12 4.27).
+#define UHA_SLOT_STATUS_OK        0U
+#define UHA_SLOT_STATUS_BAD_DIM   1U   // hidden_dim is not a valid K for the expert weights: output NOT written
+#define UHA_SLOT_STATUS_NO_AMX    2U   // the worker could not initialise AMX tile state: output NOT written
 
-    // Cache Line 1: Consumer (Host AMX worker threads) + Dispatch Metadata
-    _Atomic uint64_t cpu_done_seq;
+typedef struct __attribute__((aligned(UHA_CPU_CACHELINE_BYTES))) {
+    // Cache Line 0: Producer (GPU CE / Host launch callback). Everything the producer writes per dispatch lives
+    // here. num_tokens and hidden_dim used to sit on the consumer line (docs/12 4.27), so every dispatch had the
+    // producer dirtying the line that holds cpu_done_seq.
+    _Atomic uint64_t gpu_ready_seq;
     uint32_t         num_tokens;                    // M_active (e.g., 1..16 during speculative decode)
     uint32_t         hidden_dim;                    // D (e.g., 4096)
-    uint32_t         alloc_via_mmap;                // Bits [1:0]: mmap/pagelock flags; Bits [31:16]: ring slot count
-    uint8_t          pad_consumer[UHA_CPU_CACHELINE_BYTES - sizeof(_Atomic uint64_t) - 3 * sizeof(uint32_t)];
+    uint32_t         alloc_via_mmap;                // Bits [2:0]: allocator flags; Bits [31:16]: ring slot count
+    uint8_t          pad_producer[UHA_CPU_CACHELINE_BYTES - sizeof(_Atomic uint64_t) - 3 * sizeof(uint32_t)];
+
+    // Cache Line 1: Consumer (Host AMX worker threads)
+    _Atomic uint64_t cpu_done_seq;
+    uint32_t         status;                        // UHA_SLOT_STATUS_*, valid once cpu_done_seq reaches the dispatch
+    uint8_t          pad_consumer[UHA_CPU_CACHELINE_BYTES - sizeof(_Atomic uint64_t) - sizeof(uint32_t)];
 
     // Cache Line 2+: Payload Buffers
     uint32_t         expert_ids[UHA_MOE_MAX_BATCH_TOKENS][UHA_MOE_TOP_K_EXPERTS];
@@ -395,6 +403,8 @@ typedef struct {
     _Atomic uint64_t   completed_dispatches;
     _Atomic int        stop_requested;
     uint64_t           consumer_next_seq;   // single-threaded mode: next sequence the inline consumer will process
+    int                expert_k;            // K the w_1bit / scales_bf16 buffers were packed for (docs/12 4.27)
+    int                amx_unavailable;     // set by the worker when amx_init_tiles_bf16() fails
 } ChorusAmxWorkerContext;
 
 // Processes one published dispatch `seq` (the caller has already observed gpu_ready_seq >= seq with acquire).
@@ -404,7 +414,19 @@ static void chorus_amx_process_slot(ChorusAmxWorkerContext* ctx, uint64_t seq, f
     {
         const int K = (int)slot->hidden_dim;
         const int M = (slot->num_tokens <= 16U) ? (int)slot->num_tokens : 16;
-        if (K > 0 && K <= (int)UHA_MOE_DEFAULT_HIDDEN_DIM && (K & 31) == 0) {
+        // docs/12 4.27: hidden_dim comes from the producer, the weight buffers were packed for ctx->expert_k. A slot
+        // with a larger K used to index w_1bit / scales_bf16 past their end; any other mismatch decoded the wrong
+        // stride. A rejected dispatch is still released (so the producer does not hang) but carries a status and
+        // leaves output_hidden_bf16 untouched. The same holds when AMX tile state is unavailable: the tile
+        // instructions would raise SIGILL, so nothing is computed.
+        uint32_t status = UHA_SLOT_STATUS_OK;
+        if (ctx->amx_unavailable) {
+            status = UHA_SLOT_STATUS_NO_AMX;
+        } else if (!(K > 0 && K <= (int)UHA_MOE_DEFAULT_HIDDEN_DIM && (K & 31) == 0) || K != ctx->expert_k) {
+            status = UHA_SLOT_STATUS_BAD_DIM;
+        }
+        slot->status = status;
+        if (status == UHA_SLOT_STATUS_OK) {
             amx_gemm_1bit_expert_tile(tile_acc, slot->input_hidden_bf16, ctx->w_1bit, ctx->scales_bf16, K);
 
             // Apply router gate weight expert_weights[m][0] and store BF16 result into slot->output_hidden_bf16
@@ -424,7 +446,11 @@ static void chorus_amx_process_slot(ChorusAmxWorkerContext* ctx, uint64_t seq, f
 
 #if !defined(UHA_CHORUS_SINGLE_THREADED)
 static void chorus_amx_worker_loop(ChorusAmxWorkerContext* ctx) {
-    (void)amx_init_tiles_bf16();
+    // Tile configuration is per thread. If the kernel refuses XTILEDATA the AMX build has no other kernel to run,
+    // so every dispatch is released with UHA_SLOT_STATUS_NO_AMX instead of executing a tile instruction (SIGILL).
+    if (amx_init_tiles_bf16() != 0) {
+        ctx->amx_unavailable = 1;
+    }
     float tile_acc[16 * 16];
 
     for (uint64_t seq = 1; seq <= ctx->target_dispatches; ++seq) {
@@ -634,9 +660,11 @@ int main(void) {
     atomic_init(&ctx.completed_dispatches, 0ULL);
     atomic_init(&ctx.stop_requested, 0);
     ctx.consumer_next_seq = 1ULL;
+    ctx.expert_k = K;
+    ctx.amx_unavailable = 0;
 
 #if defined(UHA_CHORUS_SINGLE_THREADED)
-    (void)amx_init_tiles_bf16();
+    if (amx_init_tiles_bf16() != 0) ctx.amx_unavailable = 1;
     printf("[i] Single-threaded ring mode: producer drives the consumer inline (docs/12 4.3)\n");
 #elif defined(_WIN32)
     uintptr_t th = _beginthreadex(NULL, 0, chorus_amx_win32_thread_entry, &ctx, 0, NULL);
@@ -719,6 +747,44 @@ int main(void) {
     pthread_join(th, NULL);
 #endif
 
+    // docs/12 4.27 regression (worker has exited, the ring is idle, so the slot is driven directly):
+    //   (a) hidden_dim = 2 * expert_k is rejected with BAD_DIM, the dispatch is still released, and the output
+    //       buffer keeps its sentinel (the old code read w_1bit and scales_bf16 past their end for this K);
+    //   (b) an AMX-unavailable worker releases with NO_AMX and writes nothing;
+    //   (c) a valid dispatch reports OK.
+    int status_errors = 0;
+    {
+        float tile_tmp[16 * 16];
+        HeteroMoERingSlot* slot = &ring[0];
+        const uint64_t done_before = atomic_load(&ctx.completed_dispatches);
+        for (int i = 0; i < 16 * 16; ++i) slot->output_hidden_bf16[i] = 0x5A5AU;
+        slot->num_tokens = 16U;
+        slot->hidden_dim = (uint32_t)(2 * K);
+        chorus_amx_process_slot(&ctx, 101ULL, tile_tmp);
+        status_errors += (slot->status != UHA_SLOT_STATUS_BAD_DIM);
+        status_errors += (atomic_load(&slot->cpu_done_seq) != 101ULL);
+        for (int i = 0; i < 16 * 16; ++i) status_errors += (slot->output_hidden_bf16[i] != 0x5A5AU);
+
+        slot->hidden_dim = (uint32_t)K;
+        ctx.amx_unavailable = 1;
+        chorus_amx_process_slot(&ctx, 103ULL, tile_tmp);
+        status_errors += (slot->status != UHA_SLOT_STATUS_NO_AMX);
+        for (int i = 0; i < 16 * 16; ++i) status_errors += (slot->output_hidden_bf16[i] != 0x5A5AU);
+        ctx.amx_unavailable = 0;
+
+        chorus_amx_process_slot(&ctx, 105ULL, tile_tmp);
+        status_errors += (slot->status != UHA_SLOT_STATUS_OK);
+        status_errors += (slot->output_hidden_bf16[0] == 0x5A5AU);
+        status_errors += (atomic_load(&ctx.completed_dispatches) != done_before + 3ULL);
+        atomic_store(&ctx.completed_dispatches, done_before);
+        // restore the last ring dispatch's sequence numbers for the Delta_Q check below
+        atomic_store(&slot->cpu_done_seq, atomic_load(&slot->gpu_ready_seq));
+    }
+    assert(offsetof(HeteroMoERingSlot, num_tokens) < UHA_CPU_CACHELINE_BYTES);    // producer metadata on line 0
+    assert(offsetof(HeteroMoERingSlot, hidden_dim) < UHA_CPU_CACHELINE_BYTES);
+    assert(offsetof(HeteroMoERingSlot, status) >= UHA_CPU_CACHELINE_BYTES &&
+           offsetof(HeteroMoERingSlot, status) < 2 * UHA_CPU_CACHELINE_BYTES);    // consumer status on line 1
+
     uint64_t final_completed = atomic_load_explicit(&ctx.completed_dispatches, memory_order_acquire);
     uint64_t last_slot_idx = (total_dispatches - 1ULL) % (uint64_t)num_slots;
     uint64_t delta_q = atomic_load(&ring[last_slot_idx].gpu_ready_seq) - atomic_load(&ring[last_slot_idx].cpu_done_seq);
@@ -744,6 +810,9 @@ int main(void) {
            (unsigned long long)delta_q);
     assert(errors == 0 && vnni_errors == 0 && ftz_errors == 0 && order_errors == 0);
     assert(final_completed == total_dispatches && ring_thread_errors == 0 && delta_q == 0ULL);
+    printf("[4] Slot validation (docs/12 4.27)      : bad hidden_dim -> BAD_DIM, no AMX -> NO_AMX, output untouched | Errors=%d\n",
+           status_errors);
+    assert(status_errors == 0);
 
     amx_release_tiles();
     free_pinned_1gb_ring(ring);

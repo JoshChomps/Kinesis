@@ -114,6 +114,40 @@ static inline uint32_t host_cvt_f32x2_to_bf162(float f0, float f1) {
     return ((uint32_t)lo) | (((uint32_t)hi) << 16);
 }
 
+// Correctly rounded a * b + c in BF16 with ONE rounding (docs/12 4.24). The previous form, bf16_rn(fmaf(a, b, c)),
+// rounds twice (exact -> FP32 -> BF16): when the FP32 result lands exactly on a BF16 tie that the exact value only
+// approaches (a tie-valued product plus an addend below the FP32 ulp), the second rounding goes to even instead of
+// toward the addend. 562 of 65,536 sampled operand triples differed. Method: the product of two BF16 values has a
+// 16-bit significand, so it is exact in double; the sum p + c is formed with round-to-odd (TwoSum error term, then
+// force the sticky bit), and a round-to-odd double (53 bits >= 8 + 2) rounds to the same BF16 value as the exact
+// sum (Boldo and Melquiond, "Emulation of FMA and correctly rounded sums", 2008). Non-finite operands keep the
+// IEEE result of fmaf.
+static inline uint16_t host_bf16_fma_once(float a, float b, float c) {
+    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) {
+        return host_f32_to_bf16_rn(fmaf(a, b, c));
+    }
+    const double p = (double)a * (double)b;
+    const double cd = (double)c;
+    double hi = p + cd;
+    if (hi == 0.0) {
+        return host_f32_to_bf16_rn((float)hi);            // exact zero: the IEEE sign of the sum is the sign fma returns
+    }
+    const double bb = hi - p;
+    const double err = (p - (hi - bb)) + (cd - bb);   // TwoSum: p + cd == hi + err exactly
+    if (err != 0.0) {
+        uint64_t hb;
+        memcpy(&hb, &hi, sizeof(hb));
+        if ((hb & 1ULL) == 0ULL) {
+            hi = nextafter(hi, (err > 0.0) ? INFINITY : -INFINITY);   // the odd neighbour on the side of the exact sum
+        }
+    }
+    int e = 0;
+    (void)frexp(hi, &e);
+    const int ulp_exp = (e - 8 < -133) ? -133 : (e - 8);              // BF16 quantum: normal e - 8, subnormal 2^-133
+    const double q = nearbyint(ldexp(hi, -ulp_exp));                  // the single round-to-nearest-even
+    return host_f32_to_bf16_rn((float)ldexp(q, ulp_exp));                           // exact in FP32 and BF16 (or overflows to Inf)
+}
+
 static inline uint32_t host_ptx_fma_rn_bf16x2(uint32_t a, uint32_t b, uint32_t c) {
     float a_lo = host_bf16_to_f32((uint16_t)(a & 0xFFFFU));
     float a_hi = host_bf16_to_f32((uint16_t)(a >> 16));
@@ -122,8 +156,8 @@ static inline uint32_t host_ptx_fma_rn_bf16x2(uint32_t a, uint32_t b, uint32_t c
     float c_lo = host_bf16_to_f32((uint16_t)(c & 0xFFFFU));
     float c_hi = host_bf16_to_f32((uint16_t)(c >> 16));
 
-    uint16_t r_lo = host_f32_to_bf16_rn(fmaf(a_lo, b_lo, c_lo));
-    uint16_t r_hi = host_f32_to_bf16_rn(fmaf(a_hi, b_hi, c_hi));
+    uint16_t r_lo = host_bf16_fma_once(a_lo, b_lo, c_lo);
+    uint16_t r_hi = host_bf16_fma_once(a_hi, b_hi, c_hi);
     return ((uint32_t)r_lo) | (((uint32_t)r_hi) << 16);
 }
 

@@ -444,8 +444,13 @@ struct W2GotoBlasPanelSet {
                     if (n_base + c < out.N) {
                         const float v = W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c));
                         // std::nearbyint under the default FE_TONEAREST mode is round-half-even, matching torch.round
-                        const float scaled = (scales_f32[c] > 0.0f) ? std::nearbyint(v / scales_f32[c]) : 0.0f;
-                        const int tr = std::clamp(static_cast<int>(scaled), -1, 1);
+                        // Non-finite ratio (docs/12 4.21): an Inf weight gives an Inf scale and Inf/Inf = NaN, and casting
+                        // NaN or Inf to int is undefined (x86 returns INT_MIN, which packed +Inf as -1). Clamp in float
+                        // first, and for a non-finite ratio keep the sign of the weight (NaN weight -> 0).
+                        const float ratio = (scales_f32[c] > 0.0f) ? (v / scales_f32[c]) : 0.0f;
+                        const int tr = std::isfinite(ratio)
+                                           ? static_cast<int>(std::clamp(std::nearbyint(ratio), -1.0f, 1.0f))
+                                           : ((v > 0.0f) ? 1 : ((v < 0.0f) ? -1 : 0));
                         q_code = static_cast<uint16_t>(tr + 1);
                     }
                     word_code |= static_cast<uint16_t>(q_code << (2 * c));
@@ -1223,6 +1228,7 @@ private:
         group_energy_sum_.assign(num_groups, 0.0f);
         group_row_max_l1_.assign(num_groups, 0.0f);
         float total = 0.0f;
+        size_t finite_groups = 0;
         for (size_t g = 0; g < num_groups; ++g) {
             const size_t k_base = g * kGroupSizeG128;
             const size_t k_end = std::min(K, k_base + kGroupSizeG128);
@@ -1238,9 +1244,14 @@ private:
             }
             group_energy_sum_[g] = sum;
             group_row_max_l1_[g] = row_max;
-            total += sum;
+            // docs/12 4.21: a non-finite group is excluded from the mean (one Inf used to make the legacy
+            // threshold infinite, which skipped every finite group), exactly as the T-MAC kernel does (4.12).
+            if (std::isfinite(sum)) {
+                total += sum;
+                ++finite_groups;
+            }
         }
-        mean_energy_ = (num_groups > 0) ? total / static_cast<float>(num_groups) : 0.0f;
+        mean_energy_ = (finite_groups > 0 && std::isfinite(total)) ? total / static_cast<float>(finite_groups) : 0.0f;
     }
 
     // Fills skip_[g] for panel p according to the active sieve policy (see class comment).
@@ -1253,11 +1264,16 @@ private:
             order_.resize(num_groups);
             for (size_t g = 0; g < num_groups; ++g) {
                 float smax = 0.0f;
+                bool scale_nonfinite = false;
                 for (size_t c = 0; c < n_valid; ++c) {
-                    smax = std::max(smax, std::fabs(bf16_bits_to_fp32(scales_bf16[(p * num_groups + g) * kNr8 + c])));
+                    const float sc = std::fabs(bf16_bits_to_fp32(scales_bf16[(p * num_groups + g) * kNr8 + c]));
+                    // docs/12 4.21: std::max(smax, NaN) returns smax, so a NaN scale used to vanish from the
+                    // bound and its group was skipped (finite output where the exact path gives NaN).
+                    scale_nonfinite |= !std::isfinite(sc);
+                    smax = std::max(smax, sc);
                 }
                 const float e = group_row_max_l1_[g];
-                bound_[g] = std::isinf(e) ? e : smax * e;
+                bound_[g] = (std::isinf(e) || scale_nonfinite) ? std::numeric_limits<float>::infinity() : smax * e;
                 if (!std::isfinite(bound_[g])) bound_[g] = std::numeric_limits<float>::infinity();
             }
             std::iota(order_.begin(), order_.end(), size_t{0});

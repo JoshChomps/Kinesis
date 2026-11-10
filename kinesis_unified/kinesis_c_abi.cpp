@@ -20,7 +20,13 @@
  * and output matrices are sized by the (M, N, K) arguments the caller derives from its own tensor
  * shapes, so they need no separate capacity.
  *
- * Status codes: 0 OK, -1 invalid argument, -2 C++ exception, -3 buffer capacity too small.
+ * Packed INPUTS to the three GEMM entry points must have EXACTLY the element count of the (K, N) layout
+ * (docs/12 4.23). A packed panel set does not carry its own K, and the panel stride is K: activations with
+ * K = 128 run against K = 256 panels used to pass the `>=` check and return garbage with status 0. A length
+ * mismatch now returns UHA_KINESIS_ERR_SHAPE (-4).
+ *
+ * Status codes: 0 OK, -1 invalid argument, -2 C++ exception, -3 buffer capacity too small,
+ *               -4 packed input length does not match the (K, N) layout.
  */
 
 #include <cstddef>
@@ -44,6 +50,7 @@ using namespace kinesis::unified;
 namespace {
 
 constexpr int UHA_KINESIS_ERR_CAPACITY = -3;
+constexpr int UHA_KINESIS_ERR_SHAPE = -4;
 
 // Saturating multiply: a product that would wrap size_t is reported as SIZE_MAX, which no real buffer
 // can satisfy, so a hostile (K, N) fails the capacity check instead of wrapping to a small number.
@@ -268,6 +275,9 @@ UHA_KINESIS_API int uha_kinesis_smart_w1_gemm(
     if (packed_bits_len < panel_k_elems(K, N) || packed_scales_len < panel_scale_elems(K, N)) {
         return UHA_KINESIS_ERR_CAPACITY;
     }
+    if (packed_bits_len != panel_k_elems(K, N) || packed_scales_len != panel_scale_elems(K, N)) {
+        return UHA_KINESIS_ERR_SHAPE;
+    }
     try {
         W1GotoBlasPanelSet panels;
         panels.K = K;
@@ -318,6 +328,9 @@ UHA_KINESIS_API int uha_kinesis_smart_w2_gemm(
     if (packed_trits_len < panel_k_elems(K, N) || packed_scales_len < panel_scale_elems(K, N)) {
         return UHA_KINESIS_ERR_CAPACITY;
     }
+    if (packed_trits_len != panel_k_elems(K, N) || packed_scales_len != panel_scale_elems(K, N)) {
+        return UHA_KINESIS_ERR_SHAPE;
+    }
     try {
         W2GotoBlasPanelSet panels;
         panels.K = K;
@@ -367,6 +380,9 @@ UHA_KINESIS_API int uha_kinesis_tmac_lut_w1_gemm(
     }
     if (nibbles_len < tmac_nibble_elems(K, N) || scales_len < panel_scale_elems(K, N)) {
         return UHA_KINESIS_ERR_CAPACITY;
+    }
+    if (nibbles_len != tmac_nibble_elems(K, N) || scales_len != panel_scale_elems(K, N)) {
+        return UHA_KINESIS_ERR_SHAPE;
     }
     try {
         W1TmacLutPanelSet tmac;

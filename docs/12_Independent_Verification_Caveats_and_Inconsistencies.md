@@ -498,6 +498,87 @@ simulator now has `fragment_prefetch` and an assumed `LDMATRIX_LATENCY_CYCLES = 
 no-prefetch case (32x32 unlocked 25.22%) and asserts that with prefetch the term changes nothing. docs/01 states
 what the table measures.
 
+### 4.21 Defects (fifth pass, 2026-11-09): non-finite inputs in the CPU sieves and the W2 packers
+**FIXED (2026-11-10).** Three paths mishandled NaN / Inf, each reproduced before the fix:
+* `SmartTieredCache` legacy tau sieve: one Inf activation made the mean group energy infinite, so the threshold
+  was infinite and every finite group was pruned (6 of 8 tiles, error 2.37 on the finite rows). The T-MAC kernel
+  had this fix since 4.12; the cache did not. Non-finite groups are now excluded from the mean.
+* `SmartTieredCache` error-budget sieve: `std::max(smax, NaN)` returns `smax`, so a NaN weight scale vanished from
+  the bound and its group was skipped (finite output where the exact path gives NaN). A non-finite scale now gives
+  an infinite bound.
+* W2 packers (C++ and Python): an Inf weight gives an Inf scale, Inf / Inf = NaN, and the NaN reached a
+  float-to-integer cast (undefined; x86 returns INT_MIN, which packed +Inf as -1). A non-finite ratio now packs
+  the sign of the weight, and a NaN weight packs 0.
+Regressions: F1 [10] (a), (b), (c) and B4 [8].
+
+### 4.22 Test label (fifth pass): "AVX2 Err" printed for a scalar build
+**FIXED (2026-11-10).** Built with `-mavx2` but without `-mfma`, the header falls back to the scalar kernels (it
+warns, 4.11), yet F1 [5] still printed `AVX2 Err = 0.00e+00`. The line now names the kernel path that was built.
+Still true and not changed: at `-O3 -fno-inline` without `-Wa,-muse-unaligned-vector-move` the compiler emits two
+aligned YMM spill reloads in `execute_smart_w1_gemm` / `execute_smart_w2_gemm` (one of two runs segfaulted). No
+source change removes compiler-generated spills; the assembler flag is the fix, and F4 covers it.
+
+### 4.23 Defect (fifth pass): the C ABI accepted a K mismatch
+**FIXED (2026-11-10).** A packed panel set does not carry its K and the panel stride is K. Activations with K = 128
+run against K = 256 panels passed the `>=` capacity check and returned garbage (error 2.2) with status 0. The three
+GEMM entry points now require the packed inputs to have exactly the (K, N) element count and return -4 otherwise.
+A sweep of 520 (K, N) shapes found no divergence between the Python and C++ size formulas. Regression: F2 [5].
+
+### 4.24 Defect (fifth pass, latent): `fma.rn.bf16x2` emulation rounded twice
+**FIXED (2026-11-10).** `ptx_bf162_emu.c` and `w1a16_host_cta_shim.hpp` computed `bf16_rn(fmaf(a, b, c))`: exact
+to FP32, then FP32 to BF16. When the product is exactly a BF16 tie and the addend is below the FP32 ulp, the
+second rounding goes to even instead of toward the addend; 562 of 65,536 sampled operand triples differed from a
+single rounding. It was latent: the unpack calls are exact, and the H_2 constant 0x3F35 cannot produce a tie
+product. The emulation now forms the exact product in double, adds with round-to-odd, and rounds once to BF16.
+Regression: B1 (three hand-derived tie cases, one subnormal product, and a 32,768-case sweep against integer
+arithmetic).
+
+### 4.25 Defect (fifth pass): unrotated QAT with an FP32 master did not match the packer
+**FIXED (2026-11-10).** `FusedQATG128Linear(master_dtype=float32)` rounds the master to BF16 before taking the
+scale and sign, but the packer takes its scale from the FP32 values: 876 of 32,768 groups (2.7% of weights)
+unpacked to a different scale than the layer trained with. The layer now exposes `packer_input_weight()` (the
+BF16-rounded master), which matches the packer on every weight. The clip gate now uses the same BF16-rounded
+weight as the forward (56 of 2,048 groups had a different alpha), and the Triton kernels round their inputs to
+BF16 in registers (not run on this host). Regression: D1 [8].
+
+### 4.26 Defects (fifth pass): GaLore refresh and moment stores
+**FIXED (2026-11-10)**, except the memory table row, which is a caveat.
+* Step size after a refresh into a new subspace: the new directions have no second-moment history while the
+  global bias correction is already large, so the step peaked at 3.06x its steady size for tens of steps. The
+  missing mass is now seeded as `lost * (1 - beta2^t) * r_new^2`. Measured peak 0.89x steady.
+* First-moment store: int8 round-to-nearest stored 0 for every coordinate below 1/254 of its row maximum (21% of
+  coordinates with a three-decade column spread). It now uses unbiased stochastic rounding.
+* Moment rotation: the moments live in the coordinates of the stored (quantized) projector, which is not
+  orthonormal; the rotation used the QR factor Q as if it were, off by 3.6% for the int4 projector. The rotation
+  is now `P_new^T Q R^-T` on the stored projectors (error 2e-7).
+* Transient memory: `peak_transient_grad_bytes` counts `param.grad` only. The engine now also reports
+  `peak_transient_step_bytes` (13x for a BF16 master). The 0.45 GB row of the 32B table is unchanged and now
+  carries a caveat: it covers one gradient buffer, not the reference engine's temporaries.
+The O15 trajectory figure was re-measured after these changes: 0.9786 to 0.9791 on 4 seeds, threshold unchanged.
+Regression: D2 [R] and [T].
+
+### 4.27 Defects (fifth pass): Chorus worker trusted the slot
+**FIXED (2026-11-10).** `hidden_dim` comes from the producer, the weight buffers were packed for one K, and the
+two were never compared: a larger K indexed `w_1bit` and `scales_bf16` past their end. The worker context now
+carries `expert_k`, and a mismatch is released with `status = BAD_DIM` and no output written. The return value of
+`amx_init_tiles_bf16()` was ignored; on an AMX build where the kernel refuses tile state the worker would have
+executed a tile instruction (SIGILL). It now releases every dispatch with `status = NO_AMX`. `num_tokens` and
+`hidden_dim`, which the producer writes, moved from the consumer cache line to the producer line. The AMX path
+itself is still not run on silicon. Regression: E1 and E4 [4].
+
+### 4.28 Reported, not changed (fifth pass)
+* The fused kernel's sieve (`warp_sieve_k32_active`) is an activation-energy threshold. The sound Holder mask in
+  `tiled_cbc_sieve.cu` is called only by its own test, and the Python reference gates a different quantity
+  (max over rows of a K = 128 sum, the device sums four K = 32 row maxima).
+* `lserve_sparse_attn.py`: the 0.70 cosine of test [5] is from a different tensor than the 0.99 of test [6]; the
+  same-data control [7] is 0.857. With a needle at 1x the query norm the profiler picks the right heads in 5 of
+  20 seeds, because the centroid bound's slack exceeds the needle score.
+* `smsp_roofline_sim.py`: every row is compute-bound (margin at least 1.69x); the stall column equals
+  `(T_sram / 4) / (T_mma + T_sram / 4)` in every row, the stage-refill term never binds, and three of five rows
+  have warps x warp tile different from the block. The 2x figure is an input (TAU_UNLOCKED).
+* Binary STE loss on a small regression falls to its minimum near step 50 and then rises (0.10 to 0.29 by step
+  400), with or without gradient through the scale; the 60-step check in D1 [7] cannot see it.
+
 ## 6. Coverage summary
 
 This pass reviewed the full host-verifiable surface of the repository, file by file:

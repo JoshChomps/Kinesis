@@ -76,8 +76,11 @@ if HAS_TRITON:
             k_rem = K - k * BLOCK_K
             x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < k_rem)
             w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_rem)
-            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
-            w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)  # Shape: [BLOCK_N, 128] in BF16
+            # .to(bfloat16) is a no-op for BF16 inputs. For FP32 masters (master_dtype=float32, docs/12 4.25) it is
+            # the same rounding the host reference applies; without it the kernel took alpha and the sign from the
+            # unrounded FP32 weight and fed tl.dot mixed dtypes. NOT RUN on this host (no Triton / CUDA here).
+            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.bfloat16)
+            w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.bfloat16)  # Shape: [BLOCK_N, 128] in BF16
             # On-the-fly g128 absmean scale calculation inside registers/SRAM
             w_fp32 = w_tile.to(tl.float32)
             alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
@@ -119,8 +122,8 @@ if HAS_TRITON:
             n_rem = N - n * BLOCK_N
             dy_mask = (offs_m[:, None] < M) & (offs_n[None, :] < n_rem)
             w_mask = (offs_n[:, None] < n_rem) & (offs_k[None, :] < K)
-            dy_tile = tl.load(dy_ptrs, mask=dy_mask, other=0.0)
-            w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0)  # Shape: [BLOCK_N, 128] - complete g128 groups
+            dy_tile = tl.load(dy_ptrs, mask=dy_mask, other=0.0).to(tl.bfloat16)
+            w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.bfloat16)  # [BLOCK_N, 128] - complete g128 groups
             w_fp32 = w_tile.to(tl.float32)
             alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
             w_quant = tl.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
@@ -220,7 +223,9 @@ class FusedQATG128Function(torch.autograd.Function):
         for k0 in range(0, K_w, 128):
             blk = dy_t @ x[:, k0:k0 + 128].to(torch.float32)
             if ctx.clip_mult > 0.0:
-                w_abs = w[:, k0:k0 + 128].to(torch.float32).abs()
+                # The gate uses the BF16-rounded master, the same value the forward takes alpha and the sign from
+                # (docs/12 4.25: with an FP32 master the raw weight gave a different alpha in 56 of 2,048 groups).
+                w_abs = w[:, k0:k0 + 128].to(torch.bfloat16).to(torch.float32).abs()
                 alpha_g = (w_abs.sum(dim=-1, keepdim=True) * (1.0 / 128.0)).to(torch.bfloat16).to(torch.float32)
                 blk.masked_fill_(~(w_abs <= ctx.clip_mult * alpha_g), 0.0)
             dw[:, k0:k0 + 128] = blk.to(w.dtype)
@@ -236,7 +241,13 @@ class FusedQATG128Linear(torch.nn.Module):
     (SGD) of weight updates per step. bf16 masters are only correct when the parameter is written with
     stochastic rounding, as LayerWise8BitGaLoreEngine does (copy_to_param_stochastic). For training with a
     plain torch optimizer, pass master_dtype=torch.float32. The forward rounds w to bf16 before computing the
-    scale and sign either way, so the quantized forward and the packer convention are unchanged.
+    scale and sign either way.
+
+    Deployment (docs/12 4.25): the packer must be given packer_input_weight(), the BF16-rounded master. Packing
+    the raw FP32 master is NOT equivalent: the packer takes its scale from the FP32 values, and 876 of 32,768
+    groups (2.7% of weights) then unpack to a different scale than this layer trained with. With BF16 masters
+    the two are the same tensor. The agreement between this layer's FP32 group sum and the packer's FP64 mean
+    is measured (0 mismatches over 65,536 groups), not proven for every input.
     """
 
     def __init__(self, in_features: int, out_features: int, clip_mult: float = 0.0, device=None,
@@ -251,6 +262,11 @@ class FusedQATG128Linear(torch.nn.Module):
         self.weight = torch.nn.Parameter(
             (torch.randn((out_features, in_features), device=device, dtype=torch.float32) * 0.02).to(master_dtype)
         )
+
+    @torch.no_grad()
+    def packer_input_weight(self) -> torch.Tensor:
+        """FP32 copy of the BF16-rounded master: the tensor to hand to quantize_and_pack_w1_g128_interleaved."""
+        return self.weight.detach().to(torch.bfloat16).to(torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
@@ -286,7 +302,11 @@ def quantize_g128_deploy_convention(w_rot: torch.Tensor, fmt: str) -> torch.Tens
     if fmt == "w1":
         w_hat = torch.where(g >= 0, s, -s)
     elif fmt == "w2":
-        w_hat = torch.clamp(torch.round(g / s), -1.0, 1.0) * s
+        # Non-finite ratio (docs/12 4.21): Inf / Inf = NaN would otherwise reach an integer cast in the packer.
+        ratio = g / s
+        trit = torch.where(torch.isfinite(ratio), torch.clamp(torch.round(ratio), -1.0, 1.0),
+                           torch.sign(torch.nan_to_num(g, nan=0.0)))
+        w_hat = trit * s
     else:
         raise ValueError(f"fmt must be 'w1' or 'w2', got {fmt!r}")
     return w_hat.reshape(N, K).to(torch.bfloat16)
@@ -511,6 +531,29 @@ def main() -> None:
               f"forward vs deployed {ym} | loss {l0:.4f} -> {l1:.4f} | zeros {100 * zf:.1f}%")
     print(f"    Negative control: unrotated vs rotated sign agreement {agree:.3f} (chance), so the old QAT basis "
           f"did not transfer")
+    # [8] docs/12 4.25: an FP32-master layer deploys through packer_input_weight(). W_hat is read back from the
+    #     layer itself (forward of the identity gives W_hat^T exactly), then compared with the packer's unpack.
+    torch.manual_seed(31)
+    lay32 = FusedQATG128Linear(256, 2048, master_dtype=torch.float32)
+    with torch.no_grad():
+        w_hat_layer = lay32(torch.eye(256, dtype=torch.bfloat16)).T.contiguous()
+    w_ok = pack["w1"][1](*pack["w1"][0](lay32.packer_input_weight()))
+    w_raw = pack["w1"][1](*pack["w1"][0](lay32.weight.detach()))
+    mis_ok, mis_raw = int((w_hat_layer != w_ok).sum()), int((w_hat_layer != w_raw).sum())
+    assert mis_ok == 0, mis_ok
+    assert mis_raw > 0, "negative control: packing the raw FP32 master should disagree with the trained W_hat"
+    # Clip gate and forward now share one alpha: the gate decision recomputed from the BF16-rounded master.
+    layc = FusedQATG128Linear(256, 512, clip_mult=CLIP_MULT_SAFE_MIN, master_dtype=torch.float32)
+    xg = torch.randn(64, 256, dtype=torch.bfloat16)
+    layc(xg).float().sum().backward()
+    wb = layc.weight.detach().to(torch.bfloat16).float().view(512, 2, 128)
+    a_fwd = (wb.abs().sum(-1, keepdim=True) * (1.0 / 128.0)).to(torch.bfloat16).float()
+    gate_ref = (wb.abs() <= CLIP_MULT_SAFE_MIN * a_fwd).view(512, 256)
+    gate_got = layc.weight.grad != 0
+    gate_mis = int((gate_got & ~gate_ref).sum())      # a nonzero gradient where the forward's alpha gates it off
+    assert gate_mis == 0, gate_mis
+    print(f"[8] FP32 master deploy (4.25): W_hat vs packer(packer_input_weight) {mis_ok} mismatches | raw FP32 master "
+          f"{mis_raw} (control) | clip gate vs forward alpha {gate_mis}")
     print("[+] PASS: In-SRAM BLOCK_K=128 Fused STE QAT forward, backward, and Clipped STE verified.")
 
 

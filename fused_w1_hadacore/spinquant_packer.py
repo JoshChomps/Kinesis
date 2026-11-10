@@ -278,7 +278,11 @@ def quantize_and_pack_w2_ternary_interleaved(
     scales_bf16 = absmean_scale_bf16(w_groups, floor=1e-6)
     scales_f32 = scales_bf16.to(torch.float32).unsqueeze(-1)
 
-    w_ternary = torch.clamp(torch.round(w_groups / scales_f32), -1.0, 1.0).to(torch.int64)
+    # Non-finite ratio (docs/12 4.21): an Inf weight gives an Inf scale and Inf / Inf = NaN, and NaN -> int64 is
+    # undefined. Keep the sign of the weight instead (NaN weight -> 0), the same rule as the C++ packer.
+    ratio = w_groups / scales_f32
+    w_ternary = torch.where(torch.isfinite(ratio), torch.clamp(torch.round(ratio), -1.0, 1.0),
+                            torch.sign(torch.nan_to_num(w_groups, nan=0.0))).to(torch.int64)
     q_codes = (w_ternary + 1).view(N, K // 16, 8, 2)  # values in {0, 1, 2}
     even_q = q_codes[:, :, :, 0]
     odd_q = q_codes[:, :, :, 1]
@@ -404,6 +408,15 @@ def main() -> None:
     sub_want = (ks * (2.0 ** -133)).to(torch.bfloat16).to(torch.float64)
     assert torch.equal(sub_got, sub_want), "subnormal FP64 -> BF16 double-rounding regression"
     print(f"[7] Unified round_f64_to_bf16_rne: 0/{sub_traps.numel()} subnormal double-rounding traps missed -> PASS")
+
+    # [8] docs/12 4.21: non-finite weights pack to the sign of the weight (+Inf -> +1, -Inf -> -1, NaN -> 0).
+    w_nf = torch.randn(1, 128)
+    w_nf[0, 3], w_nf[0, 4], w_nf[0, 5] = float("inf"), float("-inf"), float("nan")
+    p_nf, _ = quantize_and_pack_w2_ternary_interleaved(w_nf)
+    word0 = int(p_nf[0, 0]) & 0xFFFFFFFF
+    codes = [(word0 >> (2 * (k // 2) + 16 * (k % 2))) & 3 for k in (3, 4, 5)]
+    assert codes == [2, 0, 1], codes
+    print(f"[8] W2 packer non-finite weights (+Inf, -Inf, NaN) -> codes {codes} (want [2, 0, 1]) -> PASS")
 
 
 if __name__ == "__main__":
