@@ -35,7 +35,7 @@ from spinquant_packer import (  # noqa: E402
     quantize_and_pack_w2_ternary_interleaved,
     unpack_w2_ternary_lop3_reference,
 )
-from fused_qat_ste import FusedQATG128Linear  # noqa: E402
+from fused_qat_ste import FusedQATG128Linear, DeployBasisQATLinear  # noqa: E402
 from galore_async_offload import LayerWise8BitGaLoreEngine  # noqa: E402
 from lserve_sparse_attn import (  # noqa: E402
     quantize_kv_pages_int4_hadamard,
@@ -167,6 +167,18 @@ def run_e2e_transformer_pipeline() -> None:
     cpp_vs_py_w1_err = float((y_hot_cpp_w1 - y_hot_fp32_lop3_ref).abs().max().item())
     assert cpp_vs_py_w1_err < 1e-5, f"Native C++20 W1 vs Python lop3 reference error too high: {cpp_vs_py_w1_err}"
 
+    # QAT -> deploy cross-check (docs/12 4.10): a deploy-basis QAT layer holding these master weights must produce
+    # exactly the W_hat the Python packers and the native C++ W1 packer deploy, with the same R_kron.
+    qat_mis = {}
+    for fmt, w_src, w_dep in (("w1", w_hot_fp32, w1_dequant_bf16), ("w2", w_shared_fp32, w2_dequant_bf16)):
+        lay = DeployBasisQATLinear(D_model, N_ffn, fmt=fmt, rotation=r_kron)
+        with torch.no_grad():
+            lay.weight.copy_(w_src)
+        qat_mis[fmt] = int((lay.deploy_weight() != w_dep).sum())
+        if fmt == "w1":
+            qat_mis["w1_cpp"] = int((lay.deploy_weight() != w1_dequant_bridged).sum())
+    assert all(v == 0 for v in qat_mis.values()), qat_mis
+
     # -------------------------------------------------------------------------
     # Stage 3 (Pillar 4 + Pillar 5B): Closed-Loop Chorus MoE Routing & Row-Max Tiled-CBC Sieve
     # -------------------------------------------------------------------------
@@ -242,7 +254,8 @@ def run_e2e_transformer_pipeline() -> None:
     )
     print(
         f"[2] Pillar 1+2 Kronecker R_P(x)H_16 & lop3.b32  : Kurtosis {k_init:.2f} -> {k_h16:.2f} -> {k_kron:.2f} | "
-        f"Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f} | CppW1Err={cpp_vs_py_w1_err:.2e}"
+        f"Absorbed RelErr={rot_rel_err:.4e} | W1/W2 GT Cos={w1_gt_cos:.4f}/{w2_gt_cos:.4f} | CppW1Err={cpp_vs_py_w1_err:.2e} | QAT-vs-packer mismatches W1/W2/W1cpp="
+        f"{qat_mis['w1']}/{qat_mis['w2']}/{qat_mis['w1_cpp']}"
     )
     print(
         f"[3] Pillar 4+5B Chorus Governor & RowMax Sieve  : Route={gov_decision['execution_target']} | "

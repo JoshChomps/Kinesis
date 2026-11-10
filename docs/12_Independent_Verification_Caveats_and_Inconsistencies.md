@@ -190,6 +190,8 @@ docstring says "cycle-accurate", which oversells what is an analytical contentio
 heuristic stage-refill latencies; the arithmetic is sound but the label should read "analytical".
 
 ### 3.12 CPUID L2/L3 discovery accepts cache-type 2 (instruction)
+**FIXED (2026-11-09, docs/14 section 8.6).** L2 and L3 now accept only type 1 (data) or type 3 (unified), as L1D did.
+
 `query_deterministic_caches` classifies an L2 or L3 entry when `cache_type == 2 || cache_type == 3`,
 where type 2 is an instruction cache and type 3 is unified. On real x86 parts L2 and L3 are reported
 as unified (type 3), so this never mis-sizes in practice (the F3 bench reads L1D=48KB, L2=1280KB,
@@ -347,7 +349,7 @@ appears instead: 2.4% of groups get a scale 1 bf16 ulp off the packer's, and tin
 the opposite sign. Fix plan: docs/14 F-D.
 
 ### 4.10 Convention gap (MED, second pass): QAT trains the wrong basis and has no ternary path
-**OPEN (feature work, docs/14 section 8).** The "0 bytes" print now says it is by construction and not measured; rotated-basis QAT and a ternary QAT forward are not implemented.
+**FIXED (2026-11-09, docs/14 section 8.5).** `DeployBasisQATLinear(fmt="w1"|"w2", rotation=R)` trains in the deploy basis (forward `(x R) W_hat(W R)^T`, STE on `W R`, master kept unrotated) with the packer's exact W1 and W2 rules. D1 [7]: QAT `W_hat` vs the packer's pack -> unpack has 0 mismatches for W1 and W2 under both kernel rotation modes, before and after 60 training steps, and the trained forward equals the deployed forward bit for bit; W2 has about 36% zeros. Control: the old BF16-first scale rule gives 256/16,384 mismatches against the packer. This is a host autograd path; the fused Triton kernels still implement only the unrotated W1 case.
 
 The packer quantizes `W @ R1` but QAT trains unrotated W, and sign agreement between the two is 0.487
 (chance), so QAT results do not transfer to the rotated deploy. QAT also implements binary only: the
@@ -406,7 +408,7 @@ assert fires on that build, and over-aligned `_Atomic` access through it is UB. 
 branch, because `__unix__` is not defined on Apple. It is the same platform set as 4.3. Fix plan: docs/14 F-K.
 
 ### 4.16 Test-coverage gaps (LOW, second pass)
-**PARTLY FIXED (2026-11-08, docs/14 section 8).** The Cayley test now requires improvement over the initial rotation (2.59 -> 1.82). Still open: same-dataset LServe comparison, sieve negative controls, the D1 dW tautology, the D2 table tautology, and a Linux `dladdr` test for the shim.
+**FIXED (2026-11-08/09, docs/14 sections 8 and 8.5)** except the PTX MMA emulator item. Cayley: improvement over the initial rotation (2.59 -> 1.82). LServe C3 [7]: blind vs profiled on the same tensor, 0.857 vs 0.993. C1 [4b]: the legacy mean-L1 gate is now run (mask 0x0, dropping a sub-tile whose true contribution is 16 > tau 10); C2 [4] already ran its legacy path. D1: dW is checked against autograd through the STE construction, for both the plain and the clipped path. D2: the memory table is checked against bytes per parameter and hand-worked peaks (227.40 / 131.40 / 23.63). A4 (new, Linux via WSL): `dladdr` classification 5/5, including that attribute 34 with a real-driver slot value is never remapped. Still as stated: the PTX MMA emulator matches its reference by construction, so it is no evidence of HMMA bit-exactness.
 
 Several suites pass for reasons other than the property they claim to check:
 * **Cayley (B4)**: `k_after < k_before` passes with 0 steps, because the fixed Hadamard init alone gives
@@ -423,13 +425,15 @@ Several suites pass for reasons other than the property they claim to check:
   hardware HMMA bit-exactness.
 
 ### 4.17 Minor items (second pass)
-**PARTLY FIXED (2026-11-08, docs/14 section 8).** `ptx_max_bf162` NaN semantics and the shim `GET_NAME_STRING` bounded scan are fixed with tests. Still open: AMX emulator add order (needs the SDM text checked), LServe outward rounding, and the H_2 gain note.
+**FIXED (2026-11-08/09, docs/14 sections 8 and 8.5)** except the V-transport caveat, which stays a documented limitation. AMX: the bullet below was wrong about the SDM. The SDM Operation pseudocode keeps two FP32 lanes (even and odd products) that start at zero, accumulates each with RNE and DAZ/FTZ, then adds the lane sum to dst once per instruction. Neither the old code nor `(c + a0b0) + a1b1` matched; the emulator now follows the pseudocode, and E1 [2] checks a hand-derived case where the SDM order gives 1.0 and both alternatives give 2.0. Not measured on hardware. LServe: outward-rounded centroids (RNE would break containment in 4,121 of 8,192 page maxima) and 4.625 / 4.125 bpw. H_2 gain documented in the kernel. "Exhaustive" relabelled "sampled".
 
-* The AMX emulator computes `c + (a0b0 + a1b1)`; the SDM is `(c + a0b0) + a1b1`.
+* The AMX emulator computes `c + (a0b0 + a1b1)`; the SDM is `(c + a0b0) + a1b1`. (Corrected in 8.5: the SDM
+  is a two-lane order, which neither expression matches.)
 * `ptx_max_bf162` returns b when b is NaN; PTX max returns the non-NaN operand.
 * `GET_NAME_STRING` calls `strstr` on a buffer that may not be NUL-terminated.
 * The mode-2 H_2 gain is `2*0x3F35^2 = 0.99979`, a -1.07e-4 systematic bias against the packer's exact
-  1/sqrt2. It is below bf16 noise but undocumented.
+  1/sqrt2. It is below bf16 noise but undocumented. (Precisely: amplitude gain 1 - 1.068e-4 per stage, energy
+  gain 1 - 2.136e-4; about 18x below a BF16 half-ulp.)
 * LServe centroids are rounded with RNE rather than outward, and the K payload is 4.625 bpw, not 4.25.
 * The "exhaustive 2^16 noise states" in the emulator are 65,536 pseudo-random patterns.
 * The V transport (3.1) with correlated coordinates has max relative error 1.44; it is not a small
@@ -453,6 +457,27 @@ second pass are maintained outside the repository.
 zero, and absmean never produces them. (c) NOT checked, still open. (d) Not bounded in practice; it
 ratchets (4.6). (e) No missed reordering found. Latent defects: 4.3 confirmed, 4.4 unreachable today,
 4.5 confirmed and reachable.
+
+### 4.19 Defect (found 2026-11-09): g128 scale rounding depended on summation order
+**FIXED (2026-11-09, docs/14 section 8.6).** The new G1 cross-check (deploy-basis QAT vs every packer) found the
+C++ W1 packer and the Python packer disagreeing on one group of 1,024 (128 weights). Both computed
+bf16(mean|w|), but the FP32 sum is not order-defined: the C++ loop sums sequentially and torch pairwise, and near a
+BF16 rounding boundary the two picked adjacent scales. The rule is now: accumulate in FP64, then round once
+directly from FP64 to BF16 (round-half-even, via frexp / nearbyint / ldexp, so there is no FP32 double rounding).
+It is used by the Python W1/W2 packers, the C++ W1/W2 packers and the deploy-basis QAT quantizer. FP64 sums in
+different orders still differ by about 1e-16 relative, so a disagreement now needs the exact mean to sit that
+close to a BF16 tie. Regressions: G1 (QAT vs Python W1, Python W2 and C++ W1: 0/0/0), F2 [7] (C++ vs Python
+scales over 16,384 groups: 0), F1 [9] (W2 scale vs an independent FP64 reference: 0/128, tightened from "a
+few ulp"). The unrotated Triton QAT kernels still compute the scale in FP32 on the GPU and can differ from the
+packer by one BF16 ulp in rare groups; the host deploy-basis path is the bit-exact one.
+
+### 4.18 Model scope (third pass): roofline table omits per-warp `ldmatrix` latency
+**DOCUMENTED + MODELLED (2026-11-09, docs/14 section 8.5).** A third reviewer pointed out that the table models `ldmatrix` as
+crossbar throughput only. The claim that it reported 0.00% SassWait for 32x32 was not reproduced (7.01% / 13.08%),
+and the claim that 8 HMMA per step cannot hide a ~24-cycle latency holds only without fragment prefetch. The
+simulator now has `fragment_prefetch` and an assumed `LDMATRIX_LATENCY_CYCLES = 24`; table [1b] shows the
+no-prefetch case (32x32 unlocked 25.22%) and asserts that with prefetch the term changes nothing. docs/01 states
+what the table measures.
 
 ## 6. Coverage summary
 
@@ -481,7 +506,8 @@ This pass reviewed the full host-verifiable surface of the repository, file by f
 > verdicts (4.7), a marshalling path (4.5, reachable heap overflow), training behaviour (4.8 to 4.10),
 > and NaN handling (4.12). The paragraph is kept as the first pass's record.
 > A fix pass on 2026-11-08 (docs/14 section 8) closed 4.3 to 4.7, 4.11, 4.12, 4.14 and 4.15 in code, with
-> regression tests (22/22 suites). 4.10 and parts of 4.16/4.17 remain open.
+> regression tests (22/22 suites). A third pass on 2026-11-09 (docs/14 section 8.5) closed 4.10 and the rest of
+> 4.16/4.17 except the PTX MMA by-construction note and the V-transport caveat (23/23 suites).
 
 Result of the first independent pass: **no correctness defect** was found in any math, quantization,
 serialization, or marshalling path. Every such path was re-derived and, where runnable, executed

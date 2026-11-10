@@ -31,6 +31,33 @@ def build_block_hadamard_16(head_dim: int, device: torch.device) -> torch.Tensor
     return torch.block_diag(*blocks)
 
 
+def bf16_round_outward(x: torch.Tensor, toward_pos_inf: bool) -> torch.Tensor:
+    """
+    Directed rounding of FP32 to BF16 (docs/12 4.17): toward +inf for page maxima and toward -inf for page
+    minima, so the stored box [k_min, k_max] always contains every key of the page. Plain RNE can move k_max
+    below the true maximum by up to half a BF16 ulp, which makes the "upper bound" score not a bound.
+    """
+    xb = x.to(torch.bfloat16)
+    back = xb.to(torch.float32)
+    if toward_pos_inf:
+        bad = back < x
+        step = torch.full_like(xb, float("inf"))
+    else:
+        bad = back > x
+        step = torch.full_like(xb, float("-inf"))
+    return torch.where(bad, torch.nextafter(xb, step), xb)
+
+
+def kv_payload_bits_per_element(page_size: int, head_dim: int) -> Dict[str, float]:
+    """
+    Stored bits per K or V element (docs/12 4.17): 4-bit code + one BF16 scale per token (16 / D), and for K
+    also the per-page BF16 min and max centroid per channel (2 * 16 / page_size).
+    At page_size = 64, D = 128: K = 4 + 0.125 + 0.5 = 4.625, V = 4.125.
+    """
+    scale_bits = 16.0 / head_dim
+    return {"k": 4.0 + scale_bits + 32.0 / page_size, "v": 4.0 + scale_bits}
+
+
 def quantize_kv_pages_int4_hadamard(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -54,8 +81,8 @@ def quantize_kv_pages_int4_hadamard(
     v_pages = v_rot.view(B, H, num_pages, page_size, D)
 
     # Per-page channel-wise min and max key centroids for upper-bound inner product scoring
-    k_page_min = k_pages.amin(dim=3).to(torch.bfloat16)  # [B, H, num_pages, D]
-    k_page_max = k_pages.amax(dim=3).to(torch.bfloat16)  # [B, H, num_pages, D]
+    k_page_min = bf16_round_outward(k_pages.amin(dim=3), toward_pos_inf=False)  # [B, H, num_pages, D]
+    k_page_max = bf16_round_outward(k_pages.amax(dim=3), toward_pos_inf=True)   # [B, H, num_pages, D]
 
     # Symmetric INT4 quantization per token-page
     k_scale = (k_pages.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-6).to(torch.bfloat16)
@@ -235,12 +262,26 @@ def lserve_sparse_hadamard_attention(
     # Rotate V output back from Hadamard domain: V_rot @ H_16^T = V
     out = (out_rot @ h_mat.T).to(torch.bfloat16)
     avg_active_pages = total_pages_evaluated / float(B * H)
-    kv_compression_ratio = (16.0 / 4.25) * (num_pages / max(1.0, avg_active_pages))
+    # Bandwidth gain from bits actually read vs a dense BF16 K+V read (docs/12 4.17): selected pages carry the
+    # K and V payload (4.625 + 4.125 bpw incl. scales and centroids at 64 x 128); every retrieval head also
+    # reads all pages' min/max centroids to score them, which the K payload figure already counts for the
+    # selected pages, so only the unselected pages' centroids are added.
+    page_size = k_packed_u8.shape[3]
+    bpe = kv_payload_bits_per_element(page_size, D)
+    elems_per_page = page_size * D
+    dense_bits = B * H * num_pages * elems_per_page * 2 * 16.0
+    centroid_bits_per_page = 2 * 16.0 * D
+    read_bits = total_pages_evaluated * elems_per_page * (bpe["k"] + bpe["v"])
+    read_bits += B * int(retr_idx.numel()) * centroid_bits_per_page * num_pages
+    read_bits -= float(active_mask[:, retr_idx].sum()) * centroid_bits_per_page if retr_idx.numel() > 0 else 0.0
+    kv_compression_ratio = dense_bits / read_bits
     return out, {
         "num_pages": float(num_pages),
         "avg_active_pages": avg_active_pages,
         "page_sparsity_pct": (1.0 - avg_active_pages / num_pages) * 100.0,
         "effective_kv_bw_amplification": kv_compression_ratio,
+        "k_bits_per_element": bpe["k"],
+        "v_bits_per_element": bpe["v"],
     }
 
 
@@ -276,7 +317,17 @@ def main() -> None:
 
     print(f"[1] Total KV Pages (64 tokens/page) : {int(stats['num_pages'])}")
     print(f"[2] Active Pages per Head           : {stats['avg_active_pages']:.1f} ({stats['page_sparsity_pct']:.1f}% pages skipped)")
-    print(f"[3] Effective KV Bandwidth Gain     : {stats['effective_kv_bw_amplification']:.2f}x (INT4 Hadamard + Page Sparsity)")
+    print(f"[3] Effective KV Bandwidth Gain     : {stats['effective_kv_bw_amplification']:.2f}x (INT4 Hadamard + Page Sparsity; "
+          f"K {stats['k_bits_per_element']:.3f} / V {stats['v_bits_per_element']:.3f} bpw incl. scales and centroids)")
+    assert abs(stats["k_bits_per_element"] - 4.625) < 1e-12 and abs(stats["v_bits_per_element"] - 4.125) < 1e-12
+    # Outward-rounded centroids contain every rotated key of their page (the score is then a true upper bound).
+    k_rot_chk = (k.float() @ kv_cache["h_mat"]).view(B, H, S_kv // 64, 64, D)
+    assert bool((kv_cache["k_page_min"].float().unsqueeze(3) <= k_rot_chk).all())
+    assert bool((kv_cache["k_page_max"].float().unsqueeze(3) >= k_rot_chk).all())
+    rne_max = k_rot_chk.amax(dim=3).to(torch.bfloat16).float()
+    n_rne_violations = int((rne_max < k_rot_chk.amax(dim=3)).sum())
+    print(f"    Centroid box containment: outward 0 violations | plain RNE would violate {n_rne_violations} "
+          f"of {rne_max.numel()} page maxima")
     print(f"[4] Output Cosine Similarity vs Ref : {cos_sim:.5f}")
     assert cos_sim > 0.98
 
@@ -316,6 +367,19 @@ def main() -> None:
     print(f"[6] Salience-Profiled 50% Streaming Heads (mask={profiled_mask.tolist()}): "
           f"avg active pages {stats_prof['avg_active_pages']:.1f}, cosine vs ref {cos_prof:.5f}")
     assert abs(stats_prof["avg_active_pages"] - expected_avg) < 1e-6 and cos_prof > 0.99
+
+    # [7] Same-dataset control (docs/12 4.16): blind index-based selection on the SAME tensor as [6]. Blind takes
+    # heads 0 and 1 as streaming, so head 1 loses its middle needles; profiled must beat it on identical data.
+    out_blind_real, stats_blind_real = lserve_sparse_hadamard_attention(
+        q, kv_real, top_k_pages=3, sink_pages=1, local_pages=2, streaming_head_ratio=0.5
+    )
+    cos_blind_real = float(torch.nn.functional.cosine_similarity(
+        out_blind_real.float().flatten(), out_real_ref.float().flatten(), dim=0
+    ).item())
+    print(f"[7] Same data as [6], blind 50% heads [0,1]: avg active pages {stats_blind_real['avg_active_pages']:.1f}, "
+          f"cosine vs ref {cos_blind_real:.5f} (profiled {cos_prof:.5f})")
+    assert abs(stats_blind_real["avg_active_pages"] - expected_avg) < 1e-6
+    assert cos_prof > cos_blind_real + 0.01, (cos_prof, cos_blind_real)
     print("[+] PASS: LServe unified sparse + 4-bit Hadamard KV attention and salience head profiler verified.")
 
 

@@ -270,7 +270,12 @@ __device__ __forceinline__ void hadacore_kronecker_h32_m16k32_in_regs(
     hadacore_rotate_m16k16_in_regs(t0, a_in_sub0, h_b0_lo, h_b0_hi, h_b1_lo, h_b1_hi);
     hadacore_rotate_m16k16_in_regs(t1, a_in_sub1, h_b0_lo, h_b0_hi, h_b1_lo, h_b1_hi);
 
-    // Normalized H_2 butterfly factor 1/sqrt(2) ~= 0.70703125 in BF16 (0x3F35). Every output is
+    // Normalized H_2 butterfly factor 1/sqrt(2) ~= 0.70703125 in BF16 (0x3F35, the round-to-nearest BF16 value of
+    // 0.70710678; the next value up, 0x3F36, is 0.7109375). Gain note (docs/12 4.17): each H_2 stage scales
+    // amplitudes by 0.70703125 * sqrt(2) = 1 - 1.068e-4 (energy by 2 * 0.70703125^2 = 1 - 2.136e-4) relative to the
+    // packer's exact 1/sqrt(2). This systematic bias is about 18x below one BF16 half-ulp (2^-9 = 1.95e-3) and is
+    // not compensated; folding 1/0.99989318 into the weight scales would be exact if it ever matters.
+    // Every output is
     // early-clobber ("=&r") so the allocator cannot alias an output with an input that a later
     // instruction in the same asm block still reads.
     #pragma unroll

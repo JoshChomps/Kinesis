@@ -2,7 +2,7 @@
 """
 File: export_full_stack.py
 Complete Zero-Truncation Co-Design Stack Exporter.
-Assembles all modular architectural documentation (docs/00..11) and all source files
+Assembles all modular architectural documentation (docs/00..14) and all source files
 across all workstreams into:
   1. Full_Unlocked_GPU_CoDesign_Stack.md
   2. Full_Unlocked_GPU_CoDesign_Stack.html (Print-ready HTML for 1-click PDF export)
@@ -25,6 +25,9 @@ DOC_FILES = [
     "docs/09_First_Principles_Firmware_Hardware_Code_Review.md",
     "docs/10_Related_Projects_Community_Buzz_and_Wave2_Upgrades.md",
     "docs/11_Adversarial_Review_Status_and_Known_Limitations.md",
+    "docs/12_Independent_Verification_Caveats_and_Inconsistencies.md",
+    "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
+    "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
 ]
 
 SOURCE_FILES = [
@@ -36,10 +39,13 @@ SOURCE_FILES = [
     ("kinesis_unified/kinesis_c_abi.cpp", "cpp"),
     ("kinesis_unified/kinesis_bridge.py", "python"),
     ("kinesis_unified/bench_cpu_roofline.cpp", "cpp"),
+    ("kinesis_unified/verify_f21_build_matrix.py", "python"),
     ("sim_harness/ptx_bf162_emu.c", "c"),
     ("sim_harness/smsp_roofline_sim.py", "python"),
     ("compiler_unlock/libcublas_unlock_shim.c", "c"),
     ("compiler_unlock/test_cublas_shim.c", "c"),
+    ("compiler_unlock/test_shim_dladdr_linux.c", "c"),
+    ("compiler_unlock/verify_shim_dladdr_linux.py", "python"),
     ("compiler_unlock/unlocked_gemm.py", "python"),
     ("fused_w1_hadacore/spinquant_packer.py", "python"),
     ("fused_w1_hadacore/w1a16_hadacore_kernel.cu", "cuda"),

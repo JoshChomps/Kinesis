@@ -306,7 +306,7 @@ static void ptx_mma_m16n8k16_bf16_f32_warp(WarpThreadRegs warp[32]) {
 }
 
 // ==============================================================================
-// 5. Exhaustive Verification Suite
+// 5. Verification Suite (target bits exhaustive; surrounding noise bits sampled)
 // ==============================================================================
 
 int main(void) {
@@ -328,9 +328,10 @@ int main(void) {
     assert(lut_1bit == 0xAEU);
     assert(lut_2bit == 0xEAU);
 
-    // 2. Exhaustive verification of lop3.b32 (0xAE) across all 2^16 adjacent noise states
+    // 2. Verification of lop3.b32 (0xAE) over 65,536 pseudo-random noise patterns (multiplicative hash of a
+    //    16-bit counter over the 30 non-target bits; this samples the 2^30 space, it is NOT exhaustive)
     //    and all 16 pair positions k in [0..15] (16 * 4 * 65,536 = 4,194,304 checks)
-    printf("[2] Exhaustive 1-Bit Binary g128 Unpacker Check (immLut = 0xAE):\n");
+    printf("[2] Sampled 1-Bit Binary g128 Unpacker Check (immLut = 0xAE):\n");
     uint64_t total_w1_tests = 0;
     uint64_t w1_bit_errors = 0;
 
@@ -351,7 +352,7 @@ int main(void) {
                         b_odd  ? pos_ref : neg_ref
                     );
 
-                    // Sweep all 2^16 = 65,536 states across surrounding bit positions
+                    // 65,536 hashed noise patterns over the surrounding bit positions (sampled, not exhaustive)
                     for (uint32_t noise_state = 0; noise_state < 65536U; ++noise_state) {
                         uint32_t noise_word = (noise_state * 0x9E3779B9U) & (~target_mask);
                         uint32_t w_interleaved = target_bits | noise_word;
@@ -366,14 +367,14 @@ int main(void) {
         }
     }
 
-    printf("    Tested States : %llu (all 2^16 noise states x 4 bit pairs x 16 k-shifts x 4 scales)\n",
+    printf("    Tested States : %llu (65,536 hashed noise patterns x 4 bit pairs x 16 k-shifts x 4 scales)\n",
            (unsigned long long)total_w1_tests);
     printf("    Bit Errors    : %llu (rtol = 0, atol = 0)\n\n", (unsigned long long)w1_bit_errors);
     assert(w1_bit_errors == 0);
 
-    // 3. Exhaustive verification of lop3.b32 (0xEA) + 2x fma.rn.bf16x2 across all
-    //    ternary pairs q in {0, 1, 2}^2, all k in [0..7], and all 2^16 surrounding bit states
-    printf("[3] Exhaustive 2-Bit Ternary (BitNet b1.58) Unpacker Check (immLut = 0xEA + fma.rn.bf16x2):\n");
+    // 3. Verification of lop3.b32 (0xEA) + 2x fma.rn.bf16x2 across all ternary pairs q in {0, 1, 2}^2,
+    //    all k in [0..7], and 65,536 hashed (sampled, not exhaustive) surrounding bit patterns
+    printf("[3] Sampled 2-Bit Ternary (BitNet b1.58) Unpacker Check (immLut = 0xEA + fma.rn.bf16x2):\n");
     uint64_t total_w2_tests = 0;
     uint64_t w2_bit_errors = 0;
 
@@ -413,7 +414,7 @@ int main(void) {
         }
     }
 
-    printf("    Tested States : %llu (all 2^16 noise states x 9 ternary pairs x 8 k-shifts x 4 scales)\n",
+    printf("    Tested States : %llu (65,536 hashed noise patterns x 9 ternary pairs x 8 k-shifts x 4 scales)\n",
            (unsigned long long)total_w2_tests);
     printf("    Bit Errors    : %llu (rtol = 0, atol = 0)\n\n", (unsigned long long)w2_bit_errors);
     assert(w2_bit_errors == 0);
@@ -544,6 +545,9 @@ int main(void) {
     //   Stage 2: s0 = bf16_rn(U_0[m][c] * (1/sqrt(2)))
     //            A_kron_ref[m][c]      = bf16_rn(fma(U_1[m][c], +1/sqrt(2), s0))
     //            A_kron_ref[m][16 + c] = bf16_rn(fma(U_1[m][c], -1/sqrt(2), s0))
+    // H_2 gain (docs/12 4.17): 0x3F35 = 0.70703125 is the round-to-nearest BF16 of 1/sqrt(2) = 0.70710678. One H_2
+    // stage scales amplitudes by 0.70703125 * sqrt(2) = 1 - 1.068e-4 and energy by 2 * 0.70703125^2 = 1 - 2.136e-4
+    // against the packer's exact 1/sqrt(2); about 18x below a BF16 half-ulp (2^-9), so it is documented, not compensated.
     const uint32_t h2_pos_bf162 = 0x3F353F35U; // (+0.70703125f, +0.70703125f) ~= +1/sqrt(2) in BF162
     const uint32_t h2_neg_bf162 = 0xBF35BF35U; // (-0.70703125f, -0.70703125f) ~= -1/sqrt(2) in BF162
     float U_ref[2][16][16];

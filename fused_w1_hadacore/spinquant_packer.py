@@ -165,6 +165,31 @@ def optimize_kronecker_stiefel_rotation(
     return r_kron_final, r_p.detach(), init_kurt, fixed_h16_kurt, final_kron_kurt
 
 
+def round_f64_to_bf16_rne(y: torch.Tensor) -> torch.Tensor:
+    """Round FP64 values directly to BF16 (round-half-even), with no intermediate FP32 rounding."""
+    y = y.to(torch.float64)
+    m, e = torch.frexp(y)                         # y = m * 2^e, 0.5 <= |m| < 1
+    q = torch.round(m * 256.0)                    # 8 significant bits, half-to-even, exact in FP64
+    r = torch.ldexp(q, (e - 8).to(torch.float64))  # exact; representable in BF16 (normal range)
+    r = torch.where(torch.isfinite(y), r, y)
+    return r.to(torch.float32).to(torch.bfloat16)  # both conversions exact
+
+
+def absmean_scale_bf16(w_groups: torch.Tensor, floor: float = None) -> torch.Tensor:
+    """
+    BF16 g128 scale = mean|w| over the last dim.
+    Scale rule shared by every packer and the deploy-basis QAT (docs/12 4.19): mean|w| accumulated in FP64, then
+    rounded ONCE, directly from FP64 to BF16 with round-half-even. An FP32 sum is not order-defined (torch sums
+    pairwise, the C++ packer sequentially), and near a BF16 rounding boundary the two orders picked different
+    scales (one group of 1,024 in G1). The FP64 sums still differ by about 1e-16 relative, so the rule can
+    disagree only if the exact mean lies that close to a BF16 tie.
+    """
+    m = w_groups.to(torch.float64).abs().sum(dim=-1) / float(w_groups.shape[-1])
+    if floor is not None:
+        m = m.clamp(min=floor)
+    return round_f64_to_bf16_rne(m)
+
+
 def quantize_and_pack_w1_g128_interleaved(
     weight: torch.Tensor,
     R1: torch.Tensor = None,
@@ -187,7 +212,7 @@ def quantize_and_pack_w1_g128_interleaved(
     assert K % 128 == 0, "K dimension must be a multiple of 128 for g128 quantization"
 
     w_groups = w.view(N, K // 128, 128)
-    scales_bf16 = w_groups.abs().mean(dim=-1).to(torch.bfloat16)
+    scales_bf16 = absmean_scale_bf16(w_groups)
 
     # Binary sign bits: 1 for w >= 0 (+1.0), 0 for w < 0 (-1.0)
     sign_bits = (w >= 0).to(torch.int64).view(N, K // 32, 16, 2)
@@ -249,7 +274,7 @@ def quantize_and_pack_w2_ternary_interleaved(
     assert K % 128 == 0, "K dimension must be a multiple of 128"
 
     w_groups = w.view(N, K // 128, 128)
-    scales_bf16 = w_groups.abs().mean(dim=-1).clamp(min=1e-6).to(torch.bfloat16)
+    scales_bf16 = absmean_scale_bf16(w_groups, floor=1e-6)
     scales_f32 = scales_bf16.to(torch.float32).unsqueeze(-1)
 
     w_ternary = torch.clamp(torch.round(w_groups / scales_f32), -1.0, 1.0).to(torch.int64)
@@ -320,7 +345,7 @@ def main() -> None:
 
     # Direct reference quantization check
     w_rot = w @ R1
-    ref_scales = w_rot.view(N, 1, 128).abs().mean(dim=-1).to(torch.bfloat16)
+    ref_scales = absmean_scale_bf16(w_rot.view(N, 1, 128))
     ref_signs = torch.where(w_rot >= 0, 1.0, -1.0).view(N, 1, 128)
     ref_w1 = (ref_signs * ref_scales.to(torch.float32).unsqueeze(-1)).to(torch.bfloat16).view(N, K)
 

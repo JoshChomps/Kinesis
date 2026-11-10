@@ -29,6 +29,7 @@ kernel_patch:
 
 hetero:
 	$(CC) $(CFLAGS) -pthread -DSTANDALONE_VERIFY -o hetero_runtime/test_chorus_amx hetero_runtime/chorus_amx_moe.c -lm
+	$(CC) $(CFLAGS) -DSTANDALONE_VERIFY -DUHA_CHORUS_FORCE_SINGLE_THREAD -DUHA_CHORUS_FORCE_GENERIC_ALLOC -o hetero_runtime/test_chorus_fallback hetero_runtime/chorus_amx_moe.c -lm
 	$(CC) $(CFLAGS) -o hetero_runtime/test_governor_c hetero_runtime/closed_loop_governor.c
 
 kinesis_unified:
@@ -50,6 +51,7 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	$(PYTHON) sim_harness/smsp_roofline_sim.py
 	./compiler_unlock/test_cublas_shim
 	$(PYTHON) compiler_unlock/unlocked_gemm.py
+	$(PYTHON) compiler_unlock/verify_shim_dladdr_linux.py
 	$(PYTHON) fused_w1_hadacore/spinquant_packer.py
 	$(PYTHON) structural_filters/tiled_cbc_sieve.py
 	$(PYTHON) structural_filters/lserve_sparse_attn.py
@@ -57,6 +59,7 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 	$(PYTHON) qat_galore_engine/galore_async_offload.py
 	./kernel_driver_patch/test_kernel_patch
 	./hetero_runtime/test_chorus_amx
+	./hetero_runtime/test_chorus_fallback
 	./hetero_runtime/test_governor_c
 	$(PYTHON) hetero_runtime/closed_loop_governor.py
 	./kinesis_unified/test_kinesis_unified
@@ -67,5 +70,5 @@ verify: sim shim kernel_patch hetero kinesis_unified cuda_host_verify
 
 clean:
 	rm -f sim_harness/ptx_bf162_emu* compiler_unlock/test_cublas_shim* compiler_unlock/*.so
-	rm -f kernel_driver_patch/test_kernel_patch* hetero_runtime/test_chorus_amx* hetero_runtime/test_governor_c*
+	rm -f kernel_driver_patch/test_kernel_patch* hetero_runtime/test_chorus_amx* hetero_runtime/test_chorus_fallback* hetero_runtime/test_governor_c*
 	rm -f kinesis_unified/test_kinesis_unified* kinesis_unified/bench_cpu_roofline* kinesis_unified/libkinesis_unified* fused_w1_hadacore/*.o structural_filters/*.o

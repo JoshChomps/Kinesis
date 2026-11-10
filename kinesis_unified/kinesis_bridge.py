@@ -715,6 +715,23 @@ def run_kinesis_bridge_verification() -> None:
     w2_cross = int((cpu_deq != gpu_deq).sum().item())
     assert w2_cross == 0, w2_cross
     print(f"[6] W2 CPU GotoBLAS vs GPU spinquant (docs/12 4.14): dequantized mismatches = {w2_cross}/{N_c * K_c} | PASS")
+
+    # [7] docs/12 4.19: the g128 scale rule (FP64 mean, one rounding to BF16) must agree between the C++ W1 packer
+    # and the Python packer on many groups. Control: an FP32 torch mean (the old Python rule) disagrees.
+    torch.manual_seed(13)
+    K_s, N_s = 4096, 512                         # 32 groups x 512 columns = 16,384 scales
+    w_s_nk = torch.randn((N_s, K_s)) * torch.rand((N_s, 1)) * 0.05
+    _, sc_w1_cpu = bridge.pack_w1_panels(w_s_nk.T.contiguous())
+    gs = K_s // 128
+    sc_cpu_f = sc_w1_cpu.view(torch.bfloat16).to(torch.float32)
+    idx = ((torch.arange(N_s) // 8)[:, None] * gs + torch.arange(gs)[None, :]) * 8 + (torch.arange(N_s) % 8)[:, None]
+    cpu_nk = sc_cpu_f[idx]                                        # [N, groups]
+    _, sc_py = quantize_and_pack_w1_g128_interleaved(w_s_nk)
+    scale_rule_diff = int((cpu_nk != sc_py.to(torch.float32)).sum())
+    # The disagreement this fixes is rare (one group in 1,024 in G1, on R_kron-rotated weights); G1's QAT-vs-packer
+    # cross-check is the case that exposed it and stays as its regression.
+    assert scale_rule_diff == 0, scale_rule_diff
+    print(f"[7] g128 scale rule C++ vs Python (docs/12 4.19): {scale_rule_diff}/{N_s * gs} differ | PASS")
     print("\n[+] ALL SUITE F2 NATIVE C++20 BRIDGE & SAFETENSORS CHECKS PASSED.")
 
 

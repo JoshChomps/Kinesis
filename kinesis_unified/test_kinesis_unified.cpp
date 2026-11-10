@@ -480,7 +480,14 @@ int main() {
                 const size_t k0 = g * kGroupSizeG128, k1 = std::min(K, k0 + kGroupSizeG128);
                 double asum = 0.0;
                 for (size_t k = k0; k < k1; ++k) asum += std::fabs(B_view(static_cast<int64_t>(k), static_cast<int64_t>(n)));
-                const float gamma = bf16_bits_to_fp32(fp32_to_bf16_bits(std::max(static_cast<float>(asum / double(k1 - k0)), 1e-6f)));
+                // Independent FP64 -> BF16 rounding: pick the nearer of the two BF16 neighbours (even on a tie).
+                const double mean = std::max(asum / double(k1 - k0), 1e-6);
+                const float f_near = static_cast<float>(mean);
+                uint16_t lo = static_cast<uint16_t>([&] { uint32_t u; std::memcpy(&u, &f_near, 4); return u >> 16; }());
+                if (static_cast<double>(bf16_bits_to_fp32(lo)) > mean) --lo;  // positive values: bits are monotone
+                const uint16_t hi = static_cast<uint16_t>(lo + 1);
+                const double d_lo = mean - bf16_bits_to_fp32(lo), d_hi = bf16_bits_to_fp32(hi) - mean;
+                const float gamma = bf16_bits_to_fp32((d_lo < d_hi || (d_lo == d_hi && (lo & 1u) == 0)) ? lo : hi);
                 const float got = bf16_bits_to_fp32(w2p.packed_scales_bf16[(p * w2p.groups_per_col + g) * kNr8 + c]);
                 scale_diff += (got != gamma);
                 for (size_t k = k0; k < k1; ++k) {
@@ -491,9 +498,8 @@ int main() {
                 }
             }
         }
-        // The scale may differ from the double-precision reference only by fp32 summation order, i.e. at most a few
-        // groups by one bf16 ulp; trits are compared against the packer's own scale and must match exactly.
-        UHA_VERIFY(trit_diff == 0 && scale_diff * 50 <= N * w2p.groups_per_col);
+        // Both sides now use an FP64 mean rounded once to BF16 (docs/12 4.19), so scales must match exactly.
+        UHA_VERIFY(trit_diff == 0 && scale_diff == 0);
         std::printf("[9] Non-finite activations & W2 absmean convention (docs/12 4.12, 4.14):\n");
         std::printf("    T-MAC (AVX2 + scalar) NaN/Inf output pattern vs exact FP32 path: %zu mismatches | Inf row sieve skips = %zu\n",
                     class_mismatch, st_inf.groups_skipped);

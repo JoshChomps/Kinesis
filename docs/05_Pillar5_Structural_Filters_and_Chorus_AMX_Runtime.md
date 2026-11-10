@@ -27,10 +27,10 @@ Linear layers satisfy rotational invariance $Y = X W^\top = (X R)(W R)^\top$ for
 
 ### B. LServe Unified Static + Dynamic Sparse 4-Bit Hadamard KV Attention ([`structural_filters/lserve_sparse_attn.py`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/structural_filters/lserve_sparse_attn.py))
 - Partitions attention heads into **Static Streaming Heads** (attending to $\Lambda$ initial sink pages + $W_{\text{local}}$ local sliding window pages in $O(1)$ time, selected by offline out-of-window vs. in-window salience profiling `profile_streaming_head_mask`, `F15`) and **Dynamic Retrieval Heads**.
-- Groups KV tokens into 64-token pages, rotates $K, V$ via block-diagonal $H_{16}$, stores per-page channel-wise bounding vectors $(k^{\min}_p, k^{\max}_p) \in \mathbb{R}^D$, and quantizes $K, V$ to symmetric INT4 ($4.25\text{ bits/element}$ including per-token BF16 scale).
+- Groups KV tokens into 64-token pages, rotates $K, V$ via block-diagonal $H_{16}$, stores per-page channel-wise bounding vectors $(k^{\min}_p, k^{\max}_p) \in \mathbb{R}^D$, and quantizes $K, V$ to symmetric INT4 ($4.125\text{ bits/element}$ including the per-token BF16 scale; $K$ is $4.625$ once the per-page BF16 min/max centroids are counted). Centroids are rounded outward (min toward $-\infty$, max toward $+\infty$) so the page box contains every key and the score is a true upper bound.
 - **Per-Query Convex Upper-Bound Page Scoring (`P1-5`):** Evaluates the worst-case convex upper-bound inner product across all queries $s \in \{1, \dots, S_q\}$ in the query block against page $p$ so opposing-sign queries never cancel out:
   $$\text{Score}(Q, p) = \max_{1 \le s \le S_q} \sum_{d=1}^{D} \max\left( \widetilde{Q}_{s, d} \cdot k^{\min}_{p, d}, \; \widetilde{Q}_{s, d} \cdot k^{\max}_{p, d} \right)$$
-  Selecting only the top-$K_{\text{dyn}}$ retrieval pages plus static sink/local pages yields a $10.04\times$ modelled KV bandwidth reduction while preserving `0.99313` (`0.99305` at 50% salience-profiled streaming heads) cosine similarity against dense FP32 attention.
+  Selecting only the top-$K_{\text{dyn}}$ retrieval pages plus static sink/local pages yields an $8.90\times$ modelled KV bandwidth reduction (bits actually read: selected pages' K and V payload plus the unselected pages' centroids; the earlier $10.04\times$ used 4.25 bpw and ignored centroid reads) while preserving `0.99313` (`0.99305` at 50% salience-profiled streaming heads) cosine similarity against dense FP32 attention.
 
 ---
 

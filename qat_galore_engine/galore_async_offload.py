@@ -617,9 +617,19 @@ def main() -> None:
     print(f"[5] 32B Model Peak VRAM per GPU (Fused STE + GaLore)  : {galore_budget['peak_per_gpu_2x24gb']:.2f} GB/GPU "
           f"({'Fits' if fits else 'OOM on'} a 24 GiB = {GB_PER_24GIB_CARD:.2f} GB card)")
     assert losses[-1] < losses[0]
-    # Every peak must equal its own component sum / n_gpus (internal consistency, not a measurement)
-    for name, row in table.items():
-        assert abs(row["peak_per_gpu_2x24gb"] - sum(row[k] for k in _COMPONENT_KEYS) / 2.0) < 0.01, name
+    # Cross-check against first principles (docs/12 4.16: the old assert compared each peak with sum/2 of itself).
+    # P = 32e9 parameters. BF16 = 2 B/param, FP32 Adam m+v = 8 B/param, 8-bit m+v = 2 B/param (decimal GB).
+    P_gb = 32e9 / 1e9
+    std, q8, gal = table["Standard BF16 AdamW"], table["8-Bit AdamW (Full Rank)"], galore_budget
+    for row in (std, q8):
+        assert row["master_weights_vram_gb"] == 2 * P_gb and row["quantized_weights_vram_gb"] == 2 * P_gb
+        assert row["weight_gradients_vram_gb"] == 2 * P_gb
+    assert std["optimizer_states_vram_gb"] == 8 * P_gb and q8["optimizer_states_vram_gb"] == 2 * P_gb
+    GALORE_HOST_STAGED_MASTER_GB = 24.0  # stated in the table docstring; resident + host must be the BF16 master
+    assert gal["master_weights_vram_gb"] + GALORE_HOST_STAGED_MASTER_GB == 2 * P_gb
+    # Peaks worked by hand: (64*3 + 256 + 6.8)/2 = 227.40, (64*4 + 6.8)/2 = 131.40, (40 + 0.45 + 6.8)/2 = 23.625 -> 23.63.
+    # The 0.45 GB transient and 6.80 GB activation figures are stated assumptions, not derived here.
+    assert (std["peak_per_gpu_2x24gb"], q8["peak_per_gpu_2x24gb"], gal["peak_per_gpu_2x24gb"]) == (227.40, 131.40, 23.63)
     assert fits, galore_budget["peak_per_gpu_2x24gb"]
     print("[+] PASS: Per-layer 8-bit GaLore post-accumulate hooks and 32B memory budget verified.")
 

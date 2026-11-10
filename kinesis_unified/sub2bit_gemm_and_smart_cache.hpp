@@ -241,6 +241,20 @@ inline void gemm_fp32_register_blocked_4x8(
     return static_cast<uint16_t>(u >> 16);
 }
 
+/**
+ * @brief g128 absmean scale, rounded once from FP64 directly to BF16 (round-half-even).
+ *        Shared rule with spinquant_packer.absmean_scale_bf16 (docs/12 4.19): an FP32 sum is not order-defined,
+ *        and the sequential FP32 sum here picked a different BF16 scale than torch's pairwise sum for one group
+ *        of 1,024 in G1. mean is an FP64 value; the result is exact in BF16 (no FP32 double rounding).
+ */
+[[nodiscard]] inline uint16_t f64_to_bf16_bits_rne(double mean) noexcept {
+    if (!std::isfinite(mean) || mean == 0.0) return fp32_to_bf16_bits(static_cast<float>(mean));
+    int e = 0;
+    const double m = std::frexp(mean, &e);                               // mean = m * 2^e, 0.5 <= |m| < 1
+    const double q = std::nearbyint(m * 256.0);                          // 8 significant bits, ties to even
+    return fp32_to_bf16_bits(static_cast<float>(std::ldexp(q, e - 8)));  // exact in FP32 and in BF16
+}
+
 [[nodiscard]] inline float bf16_bits_to_fp32(uint16_t b) noexcept {
     const uint32_t u = static_cast<uint32_t>(b) << 16;
     float f = 0.0f;
@@ -300,16 +314,18 @@ struct W1GotoBlasPanelSet {
             // Compute absmean BF16 scale per column in this 128-element group
             for (size_t c = 0; c < kNr8; ++c) {
                 float sc = 1.0f;
+                uint16_t sc_bits = fp32_to_bf16_bits(sc);
                 if (n_base + c < out.N) {
-                    float asum = 0.0f;
+                    double asum = 0.0;
                     for (size_t k = k_base; k < k_end; ++k) {
-                        asum += std::fabs(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c)));
+                        asum += std::fabs(static_cast<double>(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c))));
                     }
-                    sc = (k_len > 0) ? (asum / static_cast<float>(k_len)) : 1.0f;
-                    // An all-zero group keeps scale 0 so it contributes exactly 0. (Forcing 1.0 here made
-                    // pruned/zero weight groups output +/- sum(activations) instead of 0.)
+                    // FP64 mean, one rounding to BF16 (docs/12 4.19). An all-zero group keeps scale 0 so it
+                    // contributes exactly 0. (Forcing 1.0 here made pruned/zero weight groups output
+                    // +/- sum(activations) instead of 0.)
+                    sc_bits = f64_to_bf16_bits_rne((k_len > 0) ? (asum / static_cast<double>(k_len)) : 1.0);
                 }
-                out.packed_scales_bf16[(p * out.groups_per_col + g) * kNr8 + c] = fp32_to_bf16_bits(sc);
+                out.packed_scales_bf16[(p * out.groups_per_col + g) * kNr8 + c] = sc_bits;
             }
 
             // Pack 8 sign bits per K-row into 1 contiguous byte for the Nr=8 micro-panel
@@ -404,18 +420,17 @@ struct W2GotoBlasPanelSet {
             float scales_f32[kNr8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
             for (size_t c = 0; c < kNr8; ++c) {
                 if (n_base + c < out.N) {
-                    float asum = 0.0f;
+                    double asum = 0.0;
                     for (size_t k = k_base; k < k_end; ++k) {
-                        asum += std::fabs(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c)));
+                        asum += std::fabs(static_cast<double>(W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c))));
                     }
-                    const float mean_abs = (k_len > 0) ? (asum / static_cast<float>(k_len)) : 0.0f;
+                    const double mean_abs = (k_len > 0) ? (asum / static_cast<double>(k_len)) : 0.0;
                     // BitNet b1.58 absmean (Ma et al. 2024): gamma = mean|W| over the group, W~ = RoundClip(W/gamma,
                     // -1, 1). This is the exact rule the GPU packer (spinquant_packer.quantize_and_pack_w2_ternary_
                     // interleaved) and kernels use: same 1e-6 clamp, bf16-rounded scale, round-half-even division.
                     // The previous conditional-mean scale differed on every group (docs/12 4.14), so a W2 tile
                     // decoded differently on the CPU tier than on the GPU tier.
-                    const float sc = std::max(mean_abs, 1e-6f);
-                    const uint16_t sc_bf16 = fp32_to_bf16_bits(sc);
+                    const uint16_t sc_bf16 = f64_to_bf16_bits_rne(std::max(mean_abs, 1e-6));
                     out.packed_scales_bf16[(p * out.groups_per_col + g) * kNr8 + c] = sc_bf16;
                     scales_f32[c] = bf16_bits_to_fp32(sc_bf16);
                 }

@@ -22,6 +22,9 @@ from typing import List, Dict
 FLOPS_PER_HMMA_16816 = 2 * 16 * 8 * 16    # 4096 FLOP per mma.sync.m16n8k16 (2048 FMA)
 TAU_LOCKED = 32                           # cycles per m16n8k16 per SMSP, GeForce FP32-accumulate (half rate)
 TAU_UNLOCKED = 16                         # ASSUMPTION: the full-rate interval the unlock premise targets
+# ASSUMPTION (stated, not measured on this host): ldmatrix.x4 issue-to-register-ready latency per warp. The crossbar
+# term (bytes / 128 B per cycle) models throughput only; this term models the per-warp register-scoreboard wait.
+LDMATRIX_LATENCY_CYCLES = 24.0
 
 
 @dataclass(frozen=True)
@@ -118,11 +121,20 @@ def simulate_smsp_cycle_accurate(
     cfg: TileConfig,
     tau_cycles: int,
     k_iters: int = 64,
+    fragment_prefetch: bool = True,
+    ldmatrix_latency: float = LDMATRIX_LATENCY_CYCLES,
 ) -> Dict[str, float]:
     """
-    Cycle-accurate discrete-event simulation of 1 SM (4 SMSPs, 32-bank SRAM crossbar,
-    multi-stage cp.async pipeline, ldmatrix unit, and Tensor Core MMA pipe).
-    Simulates k_iters steps of K_step = 16.
+    Discrete-step model of 1 SM (4 SMSPs, 32-bank SRAM crossbar, multi-stage cp.async pipeline,
+    ldmatrix unit, and Tensor Core MMA pipe) over k_iters steps of K_step = 16.
+
+    Two stall sources are modelled:
+      * crossbar throughput: operands for an SMSP arrive staggered across the shared 128 B/cycle crossbar;
+      * ldmatrix register-scoreboard latency per warp (docs/12 4.18). With fragment_prefetch (register
+        double-buffering: the ldmatrix for step k+1 is issued during step k's MMAs, the usual CUTLASS
+        mainloop), the latency is exposed only by the part not covered by the SMSP's MMA work in one step,
+        max(0, L - T_mma_smsp). Without it, a warp waits L before its first MMA and only the other warps on
+        the same SMSP cover it: exposed = max(0, L - (warps_per_smsp - 1) * T_mma_warp).
     """
     hmma_per_warp_step = (cfg.warp_m // 16) * (cfg.warp_n // 8)
     # Analytical cycle equations per K_step = 16 across N_w warps:
@@ -137,6 +149,13 @@ def simulate_smsp_cycle_accurate(
     flops_per_step = cfg.num_warps * 2.0 * cfg.warp_m * cfg.warp_n * 16.0
     implied = flops_per_step / t_mma_step
     assert abs(implied - gpu.flops_per_sm_per_cycle(tau_cycles)) < 1e-9 * implied, (implied, tau_cycles)
+    mma_cycles_per_smsp = t_mma_step
+    warps_per_smsp = max(1, cfg.num_warps // gpu.smsp_per_sm)
+    t_mma_warp = hmma_per_warp_step * tau_cycles
+    if fragment_prefetch:
+        exposed_latency = max(0.0, ldmatrix_latency - mma_cycles_per_smsp)
+    else:
+        exposed_latency = max(0.0, ldmatrix_latency - (warps_per_smsp - 1) * t_mma_warp)
 
     # Discrete-event simulation across k_iters steps with cp.async stage ring buffer
     sram_Crossbar_free_cycle = 0.0
@@ -164,9 +183,8 @@ def simulate_smsp_cycle_accurate(
         # 3. Warps assigned to the 4 SMSPs execute HMMA.16816.F32 instructions
         #    In fused W1A16_F32, ALU unpack (shl.b32 + lop3.b32 + fma.rn.bf16x2) dual-issues
         #    on the INT32/FP16 pipes concurrently with HMMA on the Tensor Core pipe.
-        mma_cycles_per_smsp = t_mma_step
         for s in range(gpu.smsp_per_sm):
-            Operand_ready = ldm_start + (t_sram_step * ((s + 1) / gpu.smsp_per_sm))
+            Operand_ready = ldm_start + (t_sram_step * ((s + 1) / gpu.smsp_per_sm)) + exposed_latency
             if Operand_ready > smsp_free_cycle[s]:
                 stall = Operand_ready - smsp_free_cycle[s]
                 total_smsp_stall_cycles += stall
@@ -309,6 +327,26 @@ def main() -> None:
                 f"{res['achieved_tflops']:>7.1f} TF"
             )
     print("-" * 114)
+    print("    Table [1] is crossbar-throughput margin with ldmatrix fragments double-buffered in registers; the")
+    print(f"    per-warp ldmatrix latency (ASSUMPTION L = {LDMATRIX_LATENCY_CYCLES:.0f} cycles) is then fully covered in every row.")
+    print()
+
+    # docs/12 4.18: per-warp ldmatrix register-scoreboard latency, with and without fragment prefetch.
+    print(f"[1b] ldmatrix latency sensitivity (L = {LDMATRIX_LATENCY_CYCLES:.0f} cycles, ASSUMPTION), AD102:")
+    print("-" * 96)
+    print(f"{'Configuration':<35} | {'State':<8} | {'warps/SMSP':>10} | {'prefetch':>8} | {'no prefetch':>11} | {'TF no-pf':>9}")
+    print("-" * 96)
+    for cfg in warp_tiles:
+        for state_label, tau in [("Locked", TAU_LOCKED), ("Unlocked", TAU_UNLOCKED)]:
+            base = simulate_smsp_cycle_accurate(AD102_RTX_4090, cfg, tau, ldmatrix_latency=0.0)
+            pf = simulate_smsp_cycle_accurate(AD102_RTX_4090, cfg, tau, fragment_prefetch=True)
+            npf = simulate_smsp_cycle_accurate(AD102_RTX_4090, cfg, tau, fragment_prefetch=False)
+            # With prefetch, L <= T_mma per SMSP in every row, so the latency term must change nothing.
+            assert abs(pf["sass_wait_pct"] - base["sass_wait_pct"]) < 1e-12, cfg.label
+            assert npf["sass_wait_pct"] >= pf["sass_wait_pct"] - 1e-12, cfg.label
+            print(f"{cfg.label:<35} | {state_label:<8} | {max(1, cfg.num_warps // 4):>10d} | "
+                  f"{pf['sass_wait_pct']:>7.2f}% | {npf['sass_wait_pct']:>10.2f}% | {npf['achieved_tflops']:>6.1f} TF")
+    print("-" * 96)
     print()
 
     print("[2] Multi-Architecture Unlocked Roofline & Binary g128 (14.22x) DRAM Ridge Shift:")

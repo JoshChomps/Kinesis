@@ -353,19 +353,31 @@ static inline void amx_gemm_1bit_expert_tile(
                 w_vnni_buf[pair * 32 + r * 2 + 1] = b1;
             }
         }
-        // Hardware TDPBF16PS:
-        // For each pair=0..15, accumulate (a_{2k}*b_{2k} + a_{2k+1}*b_{2k+1}) into c_acc with FTZ on BF16 inputs and FP32 sum.
+        // TDPBF16PS order of operations, per the Operation pseudocode of the Intel SDM / ISE reference:
+        //   for each (m, n): temp_even = temp_odd = 0;
+        //     for each of the 16 BF16 pairs: temp_even += a[2k]*b[2k]; temp_odd += a[2k+1]*b[2k+1]
+        //     (each an FP32 FMA, RNE, DAZ = FTZ = 1);
+        //   then dst = dst + (temp_even + temp_odd), both adds RNE with DAZ = FTZ = 1.
+        // The two lanes accumulate independently and dst is added once per instruction (per 32-wide K block).
+        // The FMA is emulated in double: a BF16 x BF16 product has a 16-bit significand, so it is exact in double,
+        // and the double sum of two values of at most 24 significant bits, rounded once more to FP32, is the
+        // correctly rounded FP32 result because 53 >= 2*24 + 2 (Figueroa, "When is double rounding innocuous?",
+        // SIGNUM 1995). FTZ is applied to the rounded result. Whether silicon flushes before or after rounding is
+        // not stated by the pseudocode and is not modelled; this emulator is not measured against hardware.
         for (int m = 0; m < 16; ++m) {
             for (int r = 0; r < 16; ++r) {
                 float c_acc = fp32_amx_ftz(acc_fp32[m * 16 + r]);
+                float t_even = 0.0f;
+                float t_odd = 0.0f;
                 for (int pair = 0; pair < 16; ++pair) {
-                    float a0 = bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 0]);
-                    float a1 = bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 1]);
-                    float b0 = bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 0]);
-                    float b1 = bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 1]);
-                    float p_pair = (a0 * b0) + (a1 * b1);
-                    c_acc = fp32_amx_ftz(c_acc + p_pair);
+                    const double a0 = (double)bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 0]);
+                    const double a1 = (double)bf16_to_fp32_amx_ftz(act_bf16[m * K + k + 2 * pair + 1]);
+                    const double b0 = (double)bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 0]);
+                    const double b1 = (double)bf16_to_fp32_amx_ftz(w_vnni_buf[pair * 32 + r * 2 + 1]);
+                    t_even = fp32_amx_ftz((float)((double)t_even + a0 * b0));
+                    t_odd = fp32_amx_ftz((float)((double)t_odd + a1 * b1));
                 }
+                c_acc = fp32_amx_ftz(c_acc + fp32_amx_ftz(t_even + t_odd));
                 acc_fp32[m * 16 + r] = c_acc;
             }
         }
@@ -577,6 +589,40 @@ int main(void) {
         }
     }
 
+    // Test 3b (docs/12 4.17): SDM order of operations. One K=32 block, all weights +1.0, activations
+    //   pair 0: a0 = +2^24, a1 = -2^24; pair 1: a0 = +1, a1 = +1; other pairs 0.
+    // SDM (two lanes, then lane sum): even = RNE(2^24 + 1) = 2^24 (tie to even), odd = -2^24 + 1 exactly,
+    //   result = 1.0. Pair-sum-into-dst c += (a0b0 + a1b1) gives 2.0, sequential (c + a0b0) + a1b1 gives 2.0,
+    //   and the exact sum is 2.0. With K = 64 (two instructions, same pattern) dst = 1.0 + 1.0 = 2.0.
+    // This checks the emulator against the hand-derived SDM result, not against a reference with the same loop.
+    int order_errors = 0;
+    {
+        const int K2 = 64;
+        uint16_t ord_act[16 * 64];
+        uint32_t ord_w[(64 / 32) * 16];
+        uint16_t ord_sc[16];
+        float ord_acc[16 * 16];
+        for (int r = 0; r < 16; ++r) ord_sc[r] = 0x3F80U;
+        for (int i = 0; i < (K2 / 32) * 16; ++i) ord_w[i] = 0xFFFFFFFFU;
+        for (int K_test = 32; K_test <= 64; K_test += 32) {
+            memset(ord_act, 0, sizeof(ord_act));
+            for (int m = 0; m < 16; ++m) {
+                for (int blk = 0; blk < K_test / 32; ++blk) {
+                    uint16_t* a = ord_act + m * K_test + blk * 32;
+                    a[0] = 0x4B80U; // +2^24
+                    a[1] = 0xCB80U; // -2^24
+                    a[2] = 0x3F80U; // +1
+                    a[3] = 0x3F80U; // +1
+                }
+            }
+            amx_gemm_1bit_expert_tile(ord_acc, ord_act, ord_w, ord_sc, K_test);
+            const float expect = (K_test == 32) ? 1.0f : 2.0f;
+            for (int i = 0; i < 16 * 16; ++i) {
+                if (ord_acc[i] != expect) order_errors++;
+            }
+        }
+    }
+
     // Test 4 (O10): Concurrent OS Worker Thread SPSC Ring Producer-Consumer Verification (8 dispatches over 2 slots)
     const uint64_t total_dispatches = 8ULL;
     ChorusAmxWorkerContext ctx;
@@ -685,8 +731,8 @@ int main(void) {
     printf("    Ring base %% 64 = %u (%s allocator)\n", (unsigned)((uintptr_t)ring % 64U),
            (ring[0].alloc_via_mmap & UHA_RING_ALLOC_MANUAL_ALIGN) ? "portable over-aligned" : "platform");
     assert(((uintptr_t)ring % 64U) == 0U);
-    printf("[2] AMX 16x16x32 VNNI & TDPBF16PS FTZ  : Uniform Err=%d | VNNI Err=%d | Denormal FTZ Err=%d\n",
-           errors, vnni_errors, ftz_errors);
+    printf("[2] AMX 16x16x32 VNNI & TDPBF16PS FTZ  : Uniform Err=%d | VNNI Err=%d | Denormal FTZ Err=%d | SDM Order Err=%d\n",
+           errors, vnni_errors, ftz_errors, order_errors);
 #if defined(UHA_CHORUS_SINGLE_THREADED)
     printf("[3] Single-Threaded SPSC Ring (inline) : Completed=%llu/%llu | Payload Err=%d | Final Delta_Q=%llu\n",
 #else
@@ -696,7 +742,7 @@ int main(void) {
            (unsigned long long)total_dispatches,
            ring_thread_errors,
            (unsigned long long)delta_q);
-    assert(errors == 0 && vnni_errors == 0 && ftz_errors == 0);
+    assert(errors == 0 && vnni_errors == 0 && ftz_errors == 0 && order_errors == 0);
     assert(final_completed == total_dispatches && ring_thread_errors == 0 && delta_q == 0ULL);
 
     amx_release_tiles();

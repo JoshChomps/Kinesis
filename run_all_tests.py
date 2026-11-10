@@ -4,7 +4,7 @@ File: run_all_tests.py
 Master Build, Verification, and Hygiene Protocol Runner for Unified Hardware Accel (UHA).
 
 Compiles all 8 C11, C++20, and CUDA/PTX host-emulated test binaries with strict warnings
-(-Wall -Wextra) and executes all 21 functional verification suites + repository hygiene audit (22 suites total).
+(-Wall -Wextra) and executes all 22 functional verification suites + repository hygiene audit (23 suites total).
 """
 
 import argparse
@@ -61,6 +61,13 @@ SUITES: List[VerificationSuite] = [
             "-o", "kernel_driver_patch/test_kernel_patch.exe",
         ],
         run_cmd=["./kernel_driver_patch/test_kernel_patch.exe"],
+    ),
+    VerificationSuite(
+        suite_id="A4",
+        workstream="WS-A (cuBLAS Shim Linux)",
+        name="Shim dladdr Caller Classification on Linux (native or WSL; SKIP if neither)",
+        build_cmd=None,
+        run_cmd=[sys.executable, "compiler_unlock/verify_shim_dladdr_linux.py"],
     ),
     VerificationSuite(
         suite_id="B1",

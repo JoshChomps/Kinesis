@@ -79,6 +79,14 @@ The margin in every row equals $\mathcal{I}_{\text{warp}} / (\text{ridge} \cdot 
 FLOPs/Byte, which is a quick consistency check. `smsp_roofline_sim.py` now asserts that the FLOP rate implied by
 $T_{\text{MMA}}$ equals `peak_tflops` for every row, so the two cannot drift apart again.
 
+**What the table measures (docs/12 4.18).** The margins are crossbar-throughput margins: `ldmatrix` is modelled
+as bytes over a 128 B/cycle crossbar. Per-warp register-scoreboard latency is a separate term,
+`LDMATRIX_LATENCY_CYCLES = 24` (an assumption, not measured). With fragment double-buffering (the usual CUTLASS
+mainloop) it is covered in every row, because one warp's MMA work per K=16 step (8 HMMA x tau = 256 / 128 cycles
+for 32x32) exceeds it. Without prefetch, the 1-warp-per-SMSP tiles expose it: section [1b] of the simulator
+shows 32x32 SassWait rising from 7.01% to 14.45% locked and from 13.08% to 25.22% unlocked (64x32: 5.09 -> 9.13%,
+9.68 -> 16.72%). The 2-warp-per-SMSP tiles are unchanged, since the second warp covers the wait.
+
 ### Conflict-Free `ldmatrix.x4` 128-Byte XOR Swizzling (`Swizzle<3, 3, 3>` in 16-bit elements / CuTe `Swizzle<3, 4, 3>` in bytes)
 
 In an unswizzled row-major Shared Memory tile of stride $K_{\text{tile}} = 64$ BF16 elements ($128\text{ Bytes/row} = 32\text{ banks} \times 4\text{ Bytes}$), row $r$ and row $r+1$ start at the same bank. When 8 threads in `ldmatrix.sync.aligned.m8n8.x4.shared.b16` read 16-byte segments across rows $r = 0\dots 7$, all 8 threads hit banks `0..3` (an 8-way bank conflict). Permuting the eight 16-byte chunks $c_{\text{16B}} = \lfloor k / 8 \rfloor \in \{0, \dots, 7\}$ within each 128-byte line via bitwise XOR with $(r \land 7)$ eliminates bank conflicts completely ($\beta_{\text{conflict}} = 1.0$):

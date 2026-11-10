@@ -138,6 +138,31 @@ __device__ __forceinline__ uint32_t tiled_cbc_subtile_mask(
 }
 
 #ifdef STANDALONE_VERIFY
+// Negative-control ONLY (docs/12 4.16): the pre-O9 heuristic, run for real rather than hand-computed. It gates on
+// the MEAN row L1 of the 64 x 32 sub-tile (total L1 / 64), an average-case estimate that is not a bound.
+__device__ __forceinline__ uint32_t legacy_mean_l1_subtile_mask_for_control(
+    const uint32_t a_rot_k128[4][2][4][4],
+    const float alpha_max,
+    const float tau_sieve
+) {
+    uint32_t mask = 0U;
+    for (int ks = 0; ks < 4; ++ks) {
+        float lane_l1 = 0.0f;
+        for (int sub = 0; sub < 2; ++sub)
+            for (int mi = 0; mi < 4; ++mi)
+                for (int r = 0; r < 4; ++r) lane_l1 += bf162_abs_sum_f32(a_rot_k128[ks][sub][mi][r]);
+        const float mean_row_l1 = warp_reduce_l1_energy(lane_l1) / 64.0f;
+        if (mean_row_l1 * alpha_max > tau_sieve) mask |= (1U << ks);
+    }
+    return mask;
+}
+
+static float bf16_bits_to_f32_host(uint32_t b16) {
+    uint32_t u = (b16 & 0xFFFFU) << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -244,7 +269,33 @@ int main(void) {
             pred_outlier_lanes[lane] = tiled_cbc_sieve_pred(outlier_k128[lane], 0.5f, 1.0f / 128.0f);
         });
         float row_max_l1 = row_max_lanes[0];
+        // Run the legacy mean-L1 gate on the same registers (not a hand-computed value).
+        uint32_t legacy_masks[32] = {0};
+        uint32_t sound_masks[32] = {0};
+        host_launch_grid_cta(dim3(1, 1, 1), 32, [&]() {
+            const int lane = threadIdx.x;
+            legacy_masks[lane] = legacy_mean_l1_subtile_mask_for_control(outlier_k128[lane], 0.5f, 10.0f);
+            sound_masks[lane] = tiled_cbc_subtile_rowmax_bound_mask(outlier_k128[lane], 0.5f, 10.0f);
+        });
+        // True worst-case contribution of sub-tile 0 to one output: row 13 against a column W[k] = +0.5 (alpha_max)
+        // with signs aligned, computed on the host from the decoded register contents.
+        float true_contrib = 0.0f;
+        for (int lane = 0; lane < 32; ++lane) {
+            if ((lane >> 2) != outlier_group) continue;
+            for (int sub = 0; sub < 2; ++sub)
+                for (int reg = 1; reg <= 3; reg += 2) {
+                    const uint32_t w = outlier_k128[lane][0][sub][0][reg];
+                    true_contrib += 0.5f * (fabsf(bf16_bits_to_f32_host(w)) + fabsf(bf16_bits_to_f32_host(w >> 16)));
+                }
+        }
         float mean_row_l1 = row_max_l1 / 64.0f;
+        for (int lane = 0; lane < 32; ++lane) {
+            assert(legacy_masks[lane] == 0x0U); // legacy drops every sub-tile ...
+            assert(sound_masks[lane] == 0xFU);  // ... the sound bound keeps all four
+        }
+        printf("[4b] Legacy mean-L1 gate run on same data: mask 0x%X (drops sub-tile whose true contribution = %.2f > tau 10) | sound mask 0x%X\n",
+               legacy_masks[0], true_contrib, sound_masks[0]);
+        assert(fabsf(true_contrib - 16.0f) < 1e-5f && true_contrib > 10.0f);
         for (int lane = 0; lane < 32; ++lane) {
             assert(fabsf(row_max_lanes[lane] - 32.0f) < 1e-5f);
             assert(pred_outlier_lanes[lane] == 1);

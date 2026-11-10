@@ -133,10 +133,10 @@ public:
                 if (level == 1 && (cache_type == 1 || cache_type == 3)) {
                     feat.l1d_cache_bytes = bytes;
                     found_any = true;
-                } else if (level == 2 && (cache_type == 2 || cache_type == 3)) {
+                } else if (level == 2 && (cache_type == 1 || cache_type == 3)) { // data or unified only (docs/12 3.12)
                     feat.l2_cache_bytes = bytes;
                     found_any = true;
-                } else if (level == 3 && (cache_type == 2 || cache_type == 3)) {
+                } else if (level == 3 && (cache_type == 1 || cache_type == 3)) { // data or unified only (docs/12 3.12)
                     feat.l3_cache_bytes = bytes;
                     found_any = true;
                 }
