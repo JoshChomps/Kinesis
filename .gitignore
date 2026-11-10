@@ -48,6 +48,7 @@ Full_Unlocked_GPU_CoDesign_Stack.html
 # Intermediate working verification pass checklists & ledgers
 docs/13_*.md
 docs/14_*.md
+docs/17_*.md
 
 # Local IDE, OS & assistant/editor directories
 .vscode/
