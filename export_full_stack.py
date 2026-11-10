@@ -28,6 +28,7 @@ DOC_FILES = [
     "docs/12_Independent_Verification_Caveats_and_Inconsistencies.md",
     "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
     "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
+    "docs/15_Language_and_Runtime_Architecture_C_CPP_CUDA_vs_PyTorch.md",
 ]
 
 SOURCE_FILES = [

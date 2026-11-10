@@ -166,11 +166,12 @@ def optimize_kronecker_stiefel_rotation(
 
 
 def round_f64_to_bf16_rne(y: torch.Tensor) -> torch.Tensor:
-    """Round FP64 values directly to BF16 (round-half-even), with no intermediate FP32 rounding."""
+    """Round FP64 values directly to BF16 (round-half-even), with no intermediate FP32 rounding (normal + subnormal)."""
     y = y.to(torch.float64)
-    m, e = torch.frexp(y)                         # y = m * 2^e, 0.5 <= |m| < 1
-    q = torch.round(m * 256.0)                    # 8 significant bits, half-to-even, exact in FP64
-    r = torch.ldexp(q, (e - 8).to(torch.float64))  # exact; representable in BF16 (normal range)
+    _, e = torch.frexp(y)                         # y = m * 2^e, 0.5 <= |m| < 1
+    ulp_exp = torch.clamp(e.to(torch.int32) - 8, min=-133)
+    q = torch.round(torch.ldexp(y, -ulp_exp))     # 8 significant bits (or 2^-133 subnormal quantum), half-to-even
+    r = torch.ldexp(q, ulp_exp)                   # exact in FP64, FP32, and BF16
     r = torch.where(torch.isfinite(y), r, y)
     return r.to(torch.float32).to(torch.bfloat16)  # both conversions exact
 
@@ -395,6 +396,14 @@ def main() -> None:
     print(f"[6] Kronecker-Stiefel (R_P (x) H_16, P={K//16}): kurtosis {k_init:.2f} -> {k_h16:.2f} (fixed H_16) -> {k_kron:.2f} (learned R_P), match err {kron_match_err:.2e}")
     assert kron_orth_err < 1e-5 and k_kron < k_h16 and kron_match_err < 1e-3
     print("[+] PASS: Kronecker-Stiefel Cayley-SGD rotation and online H_16 prologue factorization verified.")
+
+    # [7] Single-step FP64 -> BF16 RNE rounding (docs/12 4.19): verify both normal and subnormal double-rounding traps
+    ks = torch.arange(1, 128, dtype=torch.float64)
+    sub_traps = (ks + 0.5 - 2.0 ** -10) * (2.0 ** -133)
+    sub_got = round_f64_to_bf16_rne(sub_traps).to(torch.float64)
+    sub_want = (ks * (2.0 ** -133)).to(torch.bfloat16).to(torch.float64)
+    assert torch.equal(sub_got, sub_want), "subnormal FP64 -> BF16 double-rounding regression"
+    print(f"[7] Unified round_f64_to_bf16_rne: 0/{sub_traps.numel()} subnormal double-rounding traps missed -> PASS")
 
 
 if __name__ == "__main__":

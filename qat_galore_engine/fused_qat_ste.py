@@ -273,20 +273,16 @@ def quantize_g128_deploy_convention(w_rot: torch.Tensor, fmt: str) -> torch.Tens
     N, K = w.shape
     assert K % 128 == 0, "K must be a multiple of 128"
     g = w.reshape(N, K // 128, 128)
-    # Scale: FP64 mean, rounded once to BF16 (docs/12 4.19). Rounding is done by splitting the FP64 value into
-    # its BF16 neighbours below and above and taking the nearer (the even one on a tie).
+    # Scale: FP64 mean, rounded once to BF16 (docs/12 4.19) using the unified normal+subnormal ULP quantum
+    # ulp_exp = max(e - 8, -133), identical to spinquant_packer.round_f64_to_bf16_rne and C++ f64_to_bf16_bits_rne.
     mean64 = g.to(torch.float64).abs().sum(dim=-1, keepdim=True) / 128.0
     if fmt == "w2":
         mean64 = mean64.clamp(min=1e-6)
-    lo = mean64.to(torch.float32).to(torch.bfloat16)        # a BF16 neighbour (may be above or below)
-    lo = torch.where(lo.to(torch.float64) > mean64, torch.nextafter(lo, torch.zeros_like(lo)), lo)
-    hi = torch.nextafter(lo, torch.full_like(lo, float("inf")))
-    d_lo = mean64 - lo.to(torch.float64)
-    d_hi = hi.to(torch.float64) - mean64
-    lo_even = (lo.view(torch.int16) & 1) == 0
-    pick_lo = (d_lo < d_hi) | ((d_lo == d_hi) & lo_even)
-    s = torch.where(pick_lo, lo, hi).to(torch.float32)
-    s = torch.where(mean64 == 0, torch.zeros_like(s), s)
+    _, e = torch.frexp(mean64)
+    ulp_exp = torch.clamp(e.to(torch.int32) - 8, min=-133)
+    r64 = torch.ldexp(torch.round(torch.ldexp(mean64, -ulp_exp)), ulp_exp)
+    r64 = torch.where(torch.isfinite(mean64), r64, mean64)
+    s = r64.to(torch.float32).to(torch.bfloat16).to(torch.float32)
     if fmt == "w1":
         w_hat = torch.where(g >= 0, s, -s)
     elif fmt == "w2":
@@ -489,7 +485,7 @@ def main() -> None:
             for _ in range(60):
                 opt.zero_grad()
                 loss = torch.nn.functional.mse_loss(lay(x_t).float(), y_t)
-                l0 = float(loss) if l0 is None else l0
+                l0 = float(loss.detach()) if l0 is None else l0
                 loss.backward()
                 opt.step()
             w_dep = pack[fmt][1](*pack[fmt][0](lay.weight.detach(), R1=R))
@@ -499,9 +495,10 @@ def main() -> None:
             with torch.no_grad():
                 y_mis = int((lay(x_t) != y_dep).sum())
             zero_frac = float((w_dep == 0).float().mean())
-            deploy_report.append((mode, fmt, init_mis, w_mis, y_mis, l0, float(loss), zero_frac))
+            l1 = float(loss.detach())
+            deploy_report.append((mode, fmt, init_mis, w_mis, y_mis, l0, l1, zero_frac))
             assert init_mis == 0 and w_mis == 0 and y_mis == 0, (mode, fmt, init_mis, w_mis, y_mis)
-            assert float(loss) < 0.8 * l0, (mode, fmt, l0, float(loss))
+            assert l1 < 0.8 * l0, (mode, fmt, l0, l1)
             if fmt == "w2":
                 assert zero_frac > 0.1, zero_frac   # ternary zeros exist (binary W_hat has none)
     # Negative control: the unrotated binary QAT weights do not describe the rotated deploy (sign agreement ~ 0.5).

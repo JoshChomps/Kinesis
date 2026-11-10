@@ -500,6 +500,13 @@ int main() {
         }
         // Both sides now use an FP64 mean rounded once to BF16 (docs/12 4.19), so scales must match exactly.
         UHA_VERIFY(trit_diff == 0 && scale_diff == 0);
+        // Also verify single-rounding on all 127 BF16 subnormal double-rounding trap values (k + 0.5 - 2^-10) * 2^-133
+        for (uint16_t k = 1; k < 128; ++k) {
+            const double trap = (static_cast<double>(k) + 0.5 - std::ldexp(1.0, -10)) * std::ldexp(1.0, -133);
+            UHA_VERIFY(f64_to_bf16_bits_rne(trap) == k);
+            const double tie = (static_cast<double>(k) + 0.5) * std::ldexp(1.0, -133);
+            UHA_VERIFY(f64_to_bf16_bits_rne(tie) == static_cast<uint16_t>(k + (k & 1u)));
+        }
         std::printf("[9] Non-finite activations & W2 absmean convention (docs/12 4.12, 4.14):\n");
         std::printf("    T-MAC (AVX2 + scalar) NaN/Inf output pattern vs exact FP32 path: %zu mismatches | Inf row sieve skips = %zu\n",
                     class_mismatch, st_inf.groups_skipped);

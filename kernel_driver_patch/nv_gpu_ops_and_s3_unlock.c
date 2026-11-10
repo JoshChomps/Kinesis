@@ -186,23 +186,39 @@ static inline NV_STATUS kbusMapFbAperture_HAL(
     }
     pKernelBus->accessTick++;
 
-    // 1. Check existing Dynamic BAR1 LRU tile table for an active mapping and take a reference on it.
-    //    Reject conflicting partial/larger overlaps against an active (refCount > 0) slot.
+    // 1. Scan all existing Dynamic BAR1 LRU slots before taking any cache hit (docs/12 4.20 / Audit Check 11):
+    //    - Reject any request that overlaps a live (refCount > 0) slot of a different start or size.
+    //    - Invalidate any cold (refCount == 0) slot that overlaps [physTarget, physTarget + reqSize) with a
+    //      different start or size, so two valid slots can never cover overlapping physical FB ranges (Previously,
+    //      leaving the cold slot valid allowed a later exact-size re-map to hit the earlier cold slot at i < j
+    //      before the loop reached a live overlapping sub-range at j > i.)
+    NvU32 exactHitSlot = NV_DYN_BAR1_LRU_SLOTS;
     for (NvU32 i = 0; i < NV_DYN_BAR1_LRU_SLOTS; ++i) {
-        if (pKernelBus->lruSlots[i].valid) {
-            const NvU64 slotStart = pKernelBus->lruSlots[i].fbPhysOffset;
-            const NvU64 slotSize  = pKernelBus->lruSlots[i].size;
-            if (slotStart == physTarget && slotSize == reqSize) {
-                pKernelBus->lruSlots[i].lastUseTick = pKernelBus->accessTick;
-                pKernelBus->lruSlots[i].refCount++;
-                *pBar1VirtOffset = pKernelBus->lruSlots[i].bar1VirtOffset;
-                return NV_OK;
-            }
-            const NvBool overlaps = (physTarget < (slotStart + slotSize)) && ((physTarget + reqSize) > slotStart);
-            if (overlaps && pKernelBus->lruSlots[i].refCount > 0) {
+        if (!pKernelBus->lruSlots[i].valid) {
+            continue;
+        }
+        const NvU64 slotStart = pKernelBus->lruSlots[i].fbPhysOffset;
+        const NvU64 slotSize  = pKernelBus->lruSlots[i].size;
+        if (slotStart == physTarget && slotSize == reqSize) {
+            exactHitSlot = i;
+            continue;
+        }
+        const NvBool overlaps = (physTarget < (slotStart + slotSize)) && ((physTarget + reqSize) > slotStart);
+        if (overlaps) {
+            if (pKernelBus->lruSlots[i].refCount > 0) {
                 return NV_ERR_INVALID_ARGUMENT;
             }
+            pKernelBus->lruSlots[i].valid = NV_FALSE;
         }
+    }
+    if (exactHitSlot != NV_DYN_BAR1_LRU_SLOTS) {
+        if (pKernelBus->lruSlots[exactHitSlot].refCount == ~0U) {
+            return NV_ERR_INSUFFICIENT_RESOURCES;
+        }
+        pKernelBus->lruSlots[exactHitSlot].lastUseTick = pKernelBus->accessTick;
+        pKernelBus->lruSlots[exactHitSlot].refCount++;
+        *pBar1VirtOffset = pKernelBus->lruSlots[exactHitSlot].bar1VirtOffset;
+        return NV_OK;
     }
 
     // 2. Pick a slot and a BAR1 VA range. A slot that still has live users is NEVER reclaimed: handing its
@@ -250,6 +266,66 @@ static inline NV_STATUS kbusMapFbAperture_HAL(
         slotIdx = anyVictim;
         chosenVirtOffset = pKernelBus->nextDynBar1Offset;
         pKernelBus->nextDynBar1Offset += reqSize;
+    } else if (freeSlot != NV_DYN_BAR1_LRU_SLOTS || anyVictim != NV_DYN_BAR1_LRU_SLOTS) {
+        // Coalescing first-fit BAR1 VA gap search over live (refCount > 0) slots (closes docs/12 Caveat 2.1):
+        // When mixed-size P2P churn reaches the end of the bump pointer, reclaim unreferenced BAR1 VA holes.
+        // Any first-fit gap of size reqSize starts either at 0 or immediately after a live slot's VA range.
+        NvU64 bestCand = ~0ULL;
+        for (NvU32 c = 0; c <= NV_DYN_BAR1_LRU_SLOTS; ++c) {
+            NvU64 cand = 0;
+            if (c > 0) {
+                const DynBar1CacheEntry* s = &pKernelBus->lruSlots[c - 1];
+                if (!s->valid || s->refCount == 0) {
+                    continue;
+                }
+                cand = s->bar1VirtOffset + s->size;
+            }
+            if (cand > (pKernelBus->bar1ApertureSize - reqSize)) {
+                continue;
+            }
+            NvBool liveConflict = NV_FALSE;
+            for (NvU32 j = 0; j < NV_DYN_BAR1_LRU_SLOTS; ++j) {
+                const DynBar1CacheEntry* sj = &pKernelBus->lruSlots[j];
+                if (sj->valid && sj->refCount > 0) {
+                    if (cand < (sj->bar1VirtOffset + sj->size) && (cand + reqSize) > sj->bar1VirtOffset) {
+                        liveConflict = NV_TRUE;
+                        break;
+                    }
+                }
+            }
+            if (!liveConflict && cand < bestCand) {
+                bestCand = cand;
+            }
+        }
+        if (bestCand == ~0ULL) {
+            return NV_ERR_INSUFFICIENT_RESOURCES;
+        }
+        // Invalidate any cold (refCount == 0) slot whose cached BAR1 VA window overlaps [bestCand, bestCand + reqSize)
+        // so all valid slots remain pairwise disjoint in BAR1 VA.
+        for (NvU32 j = 0; j < NV_DYN_BAR1_LRU_SLOTS; ++j) {
+            DynBar1CacheEntry* sj = &pKernelBus->lruSlots[j];
+            if (sj->valid && sj->refCount == 0) {
+                if (bestCand < (sj->bar1VirtOffset + sj->size) && (bestCand + reqSize) > sj->bar1VirtOffset) {
+                    sj->valid = NV_FALSE;
+                    if (freeSlot == NV_DYN_BAR1_LRU_SLOTS) {
+                        freeSlot = j;
+                    }
+                }
+            }
+        }
+        slotIdx = (freeSlot != NV_DYN_BAR1_LRU_SLOTS) ? freeSlot : anyVictim;
+        chosenVirtOffset = bestCand;
+        NvU64 highWater = bestCand + reqSize;
+        for (NvU32 j = 0; j < NV_DYN_BAR1_LRU_SLOTS; ++j) {
+            const DynBar1CacheEntry* sj = &pKernelBus->lruSlots[j];
+            if (sj->valid && j != slotIdx) {
+                const NvU64 end = sj->bar1VirtOffset + sj->size;
+                if (end > highWater) {
+                    highWater = end;
+                }
+            }
+        }
+        pKernelBus->nextDynBar1Offset = highWater;
     } else {
         return NV_ERR_INSUFFICIENT_RESOURCES;
     }
@@ -697,7 +773,7 @@ int main(void) {
         OBJGPU small = {3, 48 * GB, {NV_FALSE, 0x9000000000ULL, 64 * MB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
         NvU64 live_off[8];
         MEMORY_DESCRIPTOR descs[8];
-        NvU64 pte1[1];
+        NvU64 pte1[4];
         NvU32 ap = 0;
         for (int i = 0; i < 4; ++i) {                      // 4 x 16 MB exactly fills the 64 MB aperture
             descs[i] = (MEMORY_DESCRIPTOR){&small, 48 * GB, (NvU64)(33 + i) * GB};
@@ -718,6 +794,80 @@ int main(void) {
         assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&small, &descs[3], 0) == NV_ERR_INVALID_ARGUMENT); // double free
         printf("[2b] Dynamic BAR1 lifetime: full aperture -> %d (refused), release+reuse OK, double-unmap rejected -> PASS\n\n",
                st_full);
+
+        // 2b-2. Audit Check 11 physical-overlap regression (docs/12 4.20): a cold (refCount == 0) exact-match slot
+        // must NOT be revived if a smaller sub-range of its physical FB interval is currently live in another slot.
+        OBJGPU ov = {4, 48 * GB, {NV_FALSE, 0x9200000000ULL, 64 * MB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
+        MEMORY_DESCRIPTOR d_33g = {&ov, 48 * GB, 33 * GB};
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &ov, &d_33g, 0, 16 * MB, 8 * MB, pte1, &ap) == NV_OK);
+        assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&ov, &d_33g, 0) == NV_OK); // slot 0 now cold [33 GB, +16 MB)
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &ov, &d_33g, 0, 8 * MB, 8 * MB, pte1, &ap) == NV_OK); // live [33 GB, +8 MB)
+        assert(ov.kbus.lruSlots[0].size == 8 * MB && ov.kbus.lruSlots[1].valid == NV_FALSE); // cold 16 MB entry invalidated & replaced, no duplicate slot
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &ov, &d_33g, 0, 16 * MB, 8 * MB, pte1, &ap)
+               == NV_ERR_INVALID_ARGUMENT); // overlapping 16 MB re-map rejected while 8 MB sub-range is live
+        assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&ov, &d_33g, 0) == NV_OK);
+
+        // 2b-3. Audit Check 11 & Caveat 2.1 closure: mixed-size BAR1 churn (8 MB, 16 MB, 32 MB) over 200 steps on a
+        // 64 MB aperture with 2 simultaneously live pinned mappings, exercising first-fit coalescing VA gap
+        // reclamation and checking pairwise VA + physical disjointness across all valid slots at every step.
+        OBJGPU mix = {5, 48 * GB, {NV_FALSE, 0x9400000000ULL, 64 * MB, 0, 0, {{0}}}, 0, 0, 0, NV_FALSE};
+        MEMORY_DESCRIPTOR mdesc = {&mix, 48 * GB, 33 * GB};
+        NvU64 pinned_off[2] = {0, 0};
+        NvBool pinned_live[2] = {NV_FALSE, NV_FALSE};
+        for (int step = 0; step < 200; ++step) {
+            const int pin_slot = step & 1;
+            if (pinned_live[pin_slot]) {
+                assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, pinned_off[pin_slot]) == NV_OK);
+                pinned_live[pin_slot] = NV_FALSE;
+            }
+            const NvU64 pin_sz = (pin_slot == 0) ? (8 * MB) : (16 * MB);
+            pinned_off[pin_slot] = (NvU64)((step % 12) + 1) * 64 * MB + (NvU64)pin_slot * (1ULL << 30);
+            assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &mix, &mdesc, pinned_off[pin_slot], pin_sz, 8 * MB, pte1, &ap) == NV_OK);
+            pinned_live[pin_slot] = NV_TRUE;
+
+            // By the pigeonhole principle on a 64 MB aperture (in 8 MB multiples):
+            // - With 8 + 16 = 24 MB pinned (2 intervals -> 3 gaps totaling 40 MB), max gap >= 16 MB, so 8 & 16 MB always fit.
+            // - With 8 MB pinned (1 interval -> 2 gaps totaling 56 MB), max gap >= 32 MB, so 32 MB always fits.
+            const NvU64 sizes[3] = {8 * MB, 16 * MB, 32 * MB};
+            const NvU64 sz = sizes[step % 3];
+            if (sz == 32 * MB && pinned_live[1]) {
+                assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, pinned_off[1]) == NV_OK);
+                pinned_live[1] = NV_FALSE;
+            }
+            const NvU64 sub_off = (NvU64)((step % 16) + 1) * 64 * MB + (2ULL << 30);
+            NV_STATUS st_m = nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &mix, &mdesc, sub_off, sz, 8 * MB, pte1, &ap);
+            assert(st_m == NV_OK);
+            // Invariant check: all valid slots are pairwise disjoint in both BAR1 VA space and physical FB space
+            for (int a = 0; a < 8; ++a) {
+                if (!mix.kbus.lruSlots[a].valid) continue;
+                const NvU64 va_a0 = mix.kbus.lruSlots[a].bar1VirtOffset;
+                const NvU64 va_a1 = va_a0 + mix.kbus.lruSlots[a].size;
+                const NvU64 pa_a0 = mix.kbus.lruSlots[a].fbPhysOffset;
+                const NvU64 pa_a1 = pa_a0 + mix.kbus.lruSlots[a].size;
+                assert(va_a1 <= mix.kbus.bar1ApertureSize);
+                for (int b = a + 1; b < 8; ++b) {
+                    if (!mix.kbus.lruSlots[b].valid) continue;
+                    const NvU64 va_b0 = mix.kbus.lruSlots[b].bar1VirtOffset;
+                    const NvU64 va_b1 = va_b0 + mix.kbus.lruSlots[b].size;
+                    const NvU64 pa_b0 = mix.kbus.lruSlots[b].fbPhysOffset;
+                    const NvU64 pa_b1 = pa_b0 + mix.kbus.lruSlots[b].size;
+                    assert(va_a1 <= va_b0 || va_b1 <= va_a0);
+                    assert(pa_a1 <= pa_b0 || pa_b1 <= pa_a0);
+                }
+            }
+            assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, sub_off) == NV_OK);
+        }
+        for (int s = 0; s < 2; ++s) {
+            if (pinned_live[s]) {
+                assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, pinned_off[s]) == NV_OK);
+            }
+        }
+        // Now with all 64 MB free after 200 fragmented steps, a single 32 MB + 32 MB pair must fit cleanly!
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &mix, &mdesc, 0, 32 * MB, 8 * MB, pte1, &ap) == NV_OK);
+        assert(nvGpuOpsBuildExternalAllocPtes_Unified(&gpu0, &mix, &mdesc, 64 * MB, 32 * MB, 8 * MB, pte1, &ap) == NV_OK);
+        assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, 0) == NV_OK);
+        assert(nvGpuOpsDestroyExternalAllocPtes_Unified(&mix, &mdesc, 64 * MB) == NV_OK);
+        printf("[2b-2/3] Audit Check 11 physical-overlap guard (4.20) & 200-step mixed-size VA gap coalescing (Caveat 2.1) -> PASS\n\n");
     }
 
     // 2c. ACS redirect clearing is opt-in only and leaves Source Validation intact

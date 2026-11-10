@@ -250,9 +250,10 @@ inline void gemm_fp32_register_blocked_4x8(
 [[nodiscard]] inline uint16_t f64_to_bf16_bits_rne(double mean) noexcept {
     if (!std::isfinite(mean) || mean == 0.0) return fp32_to_bf16_bits(static_cast<float>(mean));
     int e = 0;
-    const double m = std::frexp(mean, &e);                               // mean = m * 2^e, 0.5 <= |m| < 1
-    const double q = std::nearbyint(m * 256.0);                          // 8 significant bits, ties to even
-    return fp32_to_bf16_bits(static_cast<float>(std::ldexp(q, e - 8)));  // exact in FP32 and in BF16
+    (void)std::frexp(mean, &e);                                             // mean = m * 2^e, 0.5 <= |m| < 1
+    const int ulp_exp = std::max(e - 8, -133);                              // normal (e - 8) and subnormal (-133) BF16 quantum
+    const double q = std::nearbyint(std::ldexp(mean, -ulp_exp));            // single RNE rounding to BF16 grid
+    return fp32_to_bf16_bits(static_cast<float>(std::ldexp(q, ulp_exp)));   // exact in FP32 and in BF16
 }
 
 [[nodiscard]] inline float bf16_bits_to_fp32(uint16_t b) noexcept {

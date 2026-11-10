@@ -20,7 +20,7 @@ separate reviewer re-derived from scratch, what held, and what still deserves a 
 | Cayley-SGD Stiefel step | `fused_w1_hadacore/spinquant_packer.py` | Skew-symmetry of `Y = G R^T - R G^T`; orthogonality of the Cayley transform; the descent identity `<G, Y R> = 0.5*||Y||_F^2 >= 0` expanded via `P = G R^T` | Descent confirmed; the F13 fix is correct. Second pass: confirmed, and it is true Riemannian GD with a Cayley retraction (5(a)); test credits Cayley with the Hadamard-init drop (4.16) |
 | W1 binary unpacker (`lop3.b32` 0xAE) | `fused_w1_hadacore/spinquant_packer.py` | `(~a & 0x80008000) | 0x3F803F80` maps sign bit to bf16 +1.0 / -1.0, then `fma(+/-1, scale, -0.0)` | Bit-exact; 0 mismatches on run |
 | W2 ternary unpacker (`lop3.b32` 0xEA) | `fused_w1_hadacore/spinquant_packer.py` | `bf16(0x4000+q)` then `inj*64 - 129` gives -1 / 0 / +1 with a single exact fma rounding; q=1 yields exactly 0.0 for any non-negative finite scale | Zero-preserving property holds; 0 mismatches. Second pass: negative scales give -0.0 and Inf/NaN give NaN (absmean never yields these) |
-| Driver BAR1 lifetime (F7 class) | `kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c` | No two live (refCount>0) mappings can share a BAR1 VA window; VA reclaimed only at refCount 0; double-unmap rejected | Invariant holds (see caveat 2.1). Not re-checked by the second pass |
+| Driver BAR1 lifetime (F7 class) | `kernel_driver_patch/nv_gpu_ops_and_s3_unlock.c` | No two live (refCount>0) mappings can share a BAR1 VA window; VA reclaimed only at refCount 0; double-unmap rejected | **Audit Check 11 (2026-11-09):** found and fixed a cold-slot partial physical overlap bug (4.20) and closed caveat 2.1 with a first-fit coalescing VA gap allocator (`A3 [2b-2/3]`) |
 | GaLore moment reprojection (F20/O14) | `qat_galore_engine/galore_async_offload.py` | `M_new = (P_new^T P_old) M_old`; `V_new = (rot*rot) @ V_old` from `E[(rot@g)_i^2]`; QR sign fix `q * sign(diag(R))` | Reprojection algebra correct (see caveat 3.1 on V). **Disputed by second pass:** uint8 round-up `sqrt(V)` storage ratchets (4.6) |
 | Tiled-CBC row-max Holder sieve (O9) | `structural_filters/tiled_cbc_sieve.py` | `e_k = max_m mean_k(|X[m,tile]|)` is worst-case over rows; by Holder `|sum X W| <= ||X[m,tile]||_1 * max_k|W|`; single loud row keeps its tile | Bound correct (see observation 3.6). **Second pass:** NaN tiles skipped (4.12); `.cu` tau is per sub-tile, not a budget (4.13) |
 | H_2 butterfly constant (F18) | `sim_harness/ptx_bf162_emu.c`, `fused_w1_hadacore/w1a16_hadacore_kernel.cu` | `0x3F353F35` = +0.70703125 ~= +1/sqrt(2); `0.25*(1/sqrt(2)) = 1/sqrt(32)` orthonormal H_32 scale | Consistent across both files (see inconsistency 4.2) |
@@ -48,14 +48,15 @@ verification host. After the 2026-11-08 fix pass it reports 22/22 (two suites ad
 ## 2. Caveats (true limitations, not bugs)
 
 ### 2.1 Dynamic BAR1 allocator is a bump pointer with no free-list
-In `kbusMapFbAperture_HAL`, `nextDynBar1Offset` only ever increases. The exact-size
-victim path reuses a cold slot's VA in place, but the different-size eviction path
-(`anyVictim`) abandons the evicted slot's VA and bump-allocates fresh VA. Under mixed-size
-peer-to-peer churn this leaks BAR1 virtual address space and will eventually return
-`NV_ERR_INSUFFICIENT_RESOURCES` even when slots are logically free. It fails safe
-(it refuses, it never aliases two live mappings), but a production driver needs a real
-VA allocator (interval tree or free-list), not a monotonic bump pointer. The 8-slot
-test with uniform 16 MB allocations does not exercise this path.
+**CLOSED (2026-11-09, Audit Check 11).** Previously in `kbusMapFbAperture_HAL`, `nextDynBar1Offset` only ever increased:
+the exact-size victim path reused a cold slot's VA in place, while the different-size eviction path (`anyVictim`)
+abandoned the evicted slot's VA and bump-allocated fresh VA, leaking BAR1 VA space under mixed-size peer-to-peer
+churn. `kbusMapFbAperture_HAL` now falls back to a first-fit coalescing BAR1 VA gap search over the active
+(`refCount > 0`) slots whenever the bump pointer cannot satisfy a request, invalidates any cold (`refCount == 0`)
+slot whose cached BAR1 VA window overlaps the chosen gap `[bestCand, bestCand + reqSize)`, and resets
+`nextDynBar1Offset` to the active high-water mark. Verified in `A3 [2b-3]` across 200 mixed-size (`8 MB`, `16 MB`,
+`32 MB`) churn steps on a 64 MB aperture with live pinned mappings and pairwise BAR1 VA + physical FB disjointness
+assertions at every step.
 
 ### 2.2 PTX is modeled, not assembled
 The Python and host-C references model the semantics of `shl.b32`, `shr.u32`,
@@ -452,23 +453,41 @@ C11 orderings). The second reviewer should read both the code and this document 
 or dispute each finding here, including the three latent defects in section 4. Audit checks for this
 second pass are maintained outside the repository.
 
-**Second-pass answers** ([docs/14](16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md), 2026-11-08):
+**Second-pass answers** ([docs/14](16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md), 2026-11-08 / 2026-11-09):
 (a) Riemannian GD with a Cayley retraction, confirmed. (b) Only negative or non-finite scales break the
-zero, and absmean never produces them. (c) NOT checked, still open. (d) Not bounded in practice; it
+zero, and absmean never produces them. (c) **Checked via Audit Check 11 (2026-11-09):** found a cold-slot partial
+physical overlap sequence that left two live slots covering overlapping physical FB ranges (4.20, now fixed) and
+closed the mixed-size VA leak (2.1) with a first-fit coalescing VA gap allocator. (d) Not bounded in practice; it
 ratchets (4.6). (e) No missed reordering found. Latent defects: 4.3 confirmed, 4.4 unreachable today,
 4.5 confirmed and reachable.
+
+### 4.20 Defect (found 2026-11-09 by Audit Check 11): cold BAR1 slot revived across a live partial physical overlap
+**FIXED (2026-11-09).** In `kbusMapFbAperture_HAL`, Step 1 iterated `i = 0..7` and returned immediately on an exact
+match (`slotStart == physTarget && slotSize == reqSize`), while ignoring partial physical overlaps against cold
+(`refCount == 0`) slots and leaving those cold slots `valid = NV_TRUE`. Consequently, mapping 16 MB at `33 GB` into
+slot 0 and unmapping it (`slot 0` cold, `valid = 1`), then mapping an overlapping 8 MB sub-range at `33 GB` into
+slot 1 (`slot 1` live, `refCount = 1`), and finally re-mapping 16 MB at `33 GB` while slot 1 was still live caused
+the loop to hit `slot 0` at `i = 0` and return `NV_OK` before inspecting `slot 1` at `i = 1`. That left two live
+(`refCount = 1`) slots covering overlapping physical VRAM (`[33 GB, +16 MB)` and `[33 GB, +8 MB)`) at distinct BAR1
+VA offsets and made `kbusUnmapFbAperture_HAL` ambiguous because both started at `33 GB`. Step 1 now scans all 8
+slots before taking `exactHitSlot`, rejects any overlap with a `refCount > 0` slot, and invalidates (`valid =
+NV_FALSE`) any cold (`refCount == 0`) slot overlapping `[physTarget, physTarget + reqSize)` with a different start
+or size; `refCount == ~0U` is also guarded against overflow. Regression: `A3 [2b-2]`.
 
 ### 4.19 Defect (found 2026-11-09): g128 scale rounding depended on summation order
 **FIXED (2026-11-09, docs/14 section 8.6).** The new G1 cross-check (deploy-basis QAT vs every packer) found the
 C++ W1 packer and the Python packer disagreeing on one group of 1,024 (128 weights). Both computed
 bf16(mean|w|), but the FP32 sum is not order-defined: the C++ loop sums sequentially and torch pairwise, and near a
 BF16 rounding boundary the two picked adjacent scales. The rule is now: accumulate in FP64, then round once
-directly from FP64 to BF16 (round-half-even, via frexp / nearbyint / ldexp, so there is no FP32 double rounding).
-It is used by the Python W1/W2 packers, the C++ W1/W2 packers and the deploy-basis QAT quantizer. FP64 sums in
+directly from FP64 to BF16 (round-half-even, via `frexp` / `ulp_exp = max(e - 8, -133)` / `nearbyint` / `ldexp`, so
+there is no FP32 double rounding on either normal or subnormal BF16 values).
+It is unified across the Python W1/W2 packers (`round_f64_to_bf16_rne`), the C++ W1/W2 packers
+(`f64_to_bf16_bits_rne`) and the deploy-basis QAT quantizer. FP64 sums in
 different orders still differ by about 1e-16 relative, so a disagreement now needs the exact mean to sit that
 close to a BF16 tie. Regressions: G1 (QAT vs Python W1, Python W2 and C++ W1: 0/0/0), F2 [7] (C++ vs Python
 scales over 16,384 groups: 0), F1 [9] (W2 scale vs an independent FP64 reference: 0/128, tightened from "a
-few ulp"). The unrotated Triton QAT kernels still compute the scale in FP32 on the GPU and can differ from the
+few ulp", plus all 127 BF16 subnormal double-rounding traps), B4 [7] (all 127 subnormal double-rounding traps in
+Python). The unrotated Triton QAT kernels still compute the scale in FP32 on the GPU and can differ from the
 packer by one BF16 ulp in rare groups; the host deploy-basis path is the bit-exact one.
 
 ### 4.18 Model scope (third pass): roofline table omits per-warp `ldmatrix` latency
