@@ -72,6 +72,52 @@ This repository is an academic and systems engineering research project dedicate
 
 ---
 
+## Hardware Testing Disclaimer & Limitation of Liability
+
+> [!CAUTION]
+> **Experimental Research & Hardware Safety Notice:**
+> The mathematical algorithms, compiler shims, and kernel emulation in this repository have been derived from first principles and rigorously verified on host-CPU test suites (23/23 passing suites). However, **none of the physical driver modifications, MMIO/GSP registers, VBIOS, or BAR1 P2P patches have been executed on live bare-metal hardware in this repository.**
+>
+> All kernel driver and firmware components (`kernel_driver_patch/`) operate as **host-verifiable architectural models and mocks**. The authors and contributors assume **NO RESPONSIBILITY OR LIABILITY WHATSOEVER** for any hardware damage, silicon degradation, PCIe bus lockups, system instability, data corruption, bricked GPUs, or voided hardware warranties resulting from attempting to compile, flash, or execute these patches or commands on real physical hardware. Users who attempt to deploy or adapt any driver/firmware code onto physical machines do so entirely at their own risk.
+
+---
+
+## Deployment Scope: Software Drop-Ins vs. Hardware-Specific Requirements
+
+This repository spans pure software algorithms (which can be dropped into existing frameworks today) and low-level microarchitectural experiments (which require specific silicon features):
+
+### 1. Pure Software Drop-Ins (Universal & Framework-Agnostic)
+These modules require no special hardware permissions or driver hacks and can be directly integrated into existing inference frameworks (PyTorch, vLLM, TensorRT-LLM, llama.cpp):
+* **AVX2 Sub-2-Bit T-MAC LUT Engine (`kinesis_unified/`):**
+  - *Drop-in for:* CPU inference engines (e.g. `llama.cpp`, BitNet).
+  - *Hardware requirement:* Any x86-64 processor supporting AVX2 + FMA (Intel Haswell / Core 4th Gen [2013] or AMD Zen 1 [2017] and newer).
+* **Fused In-SRAM Clipped-STE QAT (`qat_galore_engine/fused_qat_ste.py`):**
+  - *Drop-in for:* Any PyTorch low-bit training pipeline. Materializes 0 bytes of dequantized weights in global VRAM.
+  - *Hardware requirement:* Any standard CUDA or CPU PyTorch setup.
+* **Log8-SR GaLore Low-Rank Optimizer (`qat_galore_engine/galore_async_offload.py`):**
+  - *Drop-in for:* PyTorch optimizer wrappers (e.g., `bitsandbytes`, Hugging Face PEFT).
+  - *Hardware requirement:* Any host CPU + GPU system.
+* **Hölder Row-Max Dynamic Sieve (`structural_filters/tiled_cbc_sieve.py`):**
+  - *Drop-in for:* Attention/MLP projection sparsification in Triton or CUDA.
+  - *Hardware requirement:* Standard CUDA SM80+ GPUs or CPU vector units.
+* **LServe Sparse Attention & Centroid Bounding (`structural_filters/lserve_sparse_attn.py`):**
+  - *Drop-in for:* Long-context KV-cache management.
+  - *Hardware requirement:* Standard CPU/GPU PyTorch environment.
+
+### 2. Hardware-Specific Kernels & Physical Silicon Boundaries
+These modules depend on specific ISA extensions or physical interconnect architectures:
+* **HadaCore Fused Kronecker CUDA Kernel (`fused_w1_hadacore/w1a16_hadacore_kernel.cu`):**
+  - *Targets:* NVIDIA Ada Lovelace (`sm_89`: RTX 4090, RTX 4080, L4, L40) and Ampere (`sm_80`/`sm_86`: A100, RTX 3090).
+  - *Hardware requirement:* Native 16-bit Tensor Cores (`HMMA.16816.F32`), 32-bank shared memory crossbar, and `lop3.b32` bit-manipulation ALUs.
+* **Chorus AMX MoE Engine (`hetero_runtime/chorus_amx_moe.c`):**
+  - *Targets:* Intel Xeon 4th Gen (Sapphire Rapids), 5th Gen (Emerald Rapids), 6th Gen (Granite Rapids), or Core Ultra (Meteor/Arrow Lake).
+  - *Hardware requirement:* Intel Advanced Matrix Extensions (`AMX-BF16` / `AMX-INT8` via `_tile_dpbf16ps`) and AVX-512 VNNI (`_mm512_i32scatter_epi32`).
+* **Dynamic BAR1 GMMU Aperture & P2P Engine (`kernel_driver_patch/`):**
+  - *Targets:* Dual-GPU PCIe configurations (e.g., 2x RTX 3090, 2x RTX 4090, or modded 48GB AD102).
+  - *Hardware requirement:* PCIe root complex with Resizable BAR (ReBAR) support, ACS (Access Control Services) compliant switches, and `open-gpu-kernel-modules` driver build trees. (Operates strictly as a host mock in this repository).
+
+---
+
 ## License
 
 This project is licensed under the **Apache License, Version 2.0**. See the [`LICENSE`](file:///d:/Coding_Projects/.Unified_Hardware_Accel/LICENSE) file for the full license text.
