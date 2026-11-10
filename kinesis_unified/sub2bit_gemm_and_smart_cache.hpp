@@ -444,10 +444,11 @@ struct W2GotoBlasPanelSet {
                     if (n_base + c < out.N) {
                         const float v = W(static_cast<int64_t>(k), static_cast<int64_t>(n_base + c));
                         // std::nearbyint under the default FE_TONEAREST mode is round-half-even, matching torch.round
-                        // Non-finite ratio (docs/12 4.21): an Inf weight gives an Inf scale and Inf/Inf = NaN, and casting
-                        // NaN or Inf to int is undefined (x86 returns INT_MIN, which packed +Inf as -1). Clamp in float
-                        // first, and for a non-finite ratio keep the sign of the weight (NaN weight -> 0).
-                        const float ratio = (scales_f32[c] > 0.0f) ? (v / scales_f32[c]) : 0.0f;
+                        // Non-finite ratio (docs/12 4.21, 4.29): an Inf weight gives an Inf scale and Inf/Inf = NaN, and casting
+                        // NaN or Inf to int is undefined (x86 returns INT_MIN, which packed +Inf as -1). Also use != 0.0f
+                        // rather than > 0.0f so a NaN scale (from a group containing a NaN weight alongside finite or +-Inf
+                        // weights) produces ratio = NaN instead of finite 0.0f, matching Python spinquant_packer.py bit-for-bit.
+                        const float ratio = (scales_f32[c] != 0.0f) ? (v / scales_f32[c]) : 0.0f;
                         const int tr = std::isfinite(ratio)
                                            ? static_cast<int>(std::clamp(std::nearbyint(ratio), -1.0f, 1.0f))
                                            : ((v > 0.0f) ? 1 : ((v < 0.0f) ? -1 : 0));
@@ -1178,8 +1179,13 @@ public:
         const size_t take = std::min(max_vram_panels_, n);
         std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(take), order.end(),
                           [&](size_t a, size_t b) {
-                              return panel_importance_scores[a] > panel_importance_scores[b] ||
-                                     (panel_importance_scores[a] == panel_importance_scores[b] && a < b);
+                              const float sa = std::isnan(panel_importance_scores[a])
+                                                   ? -std::numeric_limits<float>::infinity()
+                                                   : panel_importance_scores[a];
+                              const float sb = std::isnan(panel_importance_scores[b])
+                                                   ? -std::numeric_limits<float>::infinity()
+                                                   : panel_importance_scores[b];
+                              return sa > sb || (sa == sb && a < b);
                           });
         for (size_t i = 0; i < take; ++i) {
             panel_in_vram_[order[i]] = true;
@@ -1280,7 +1286,10 @@ private:
             std::stable_sort(order_.begin(), order_.end(), [&](size_t x, size_t y) { return bound_[x] < bound_[y]; });
             double spent = 0.0;
             for (const size_t g : order_) {
-                if (spent + static_cast<double>(bound_[g]) > static_cast<double>(error_budget_)) break;
+                if (!std::isfinite(bound_[g]) ||
+                    spent + static_cast<double>(bound_[g]) > static_cast<double>(error_budget_)) {
+                    break;
+                }
                 spent += static_cast<double>(bound_[g]);
                 skip_[g] = 1;
             }

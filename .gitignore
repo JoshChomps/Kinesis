@@ -1,6 +1,62 @@
+# Compiled binaries & shared libraries
 *.exe
 *.o
+*.obj
 *.so
 *.dll
+*.dylib
+*.lib
+*.a
+*.exp
+*.pdb
+*.ilk
+
+# CUDA / PTX / Compiler intermediates
+*.ptx
+*.cubin
+*.fatbin
+*.ii
+*.i
+*.s
+*.bc
+*.ll
+
+# Python / PyTorch / Triton caches & serialized weights
 *.pyc
+*.pyo
+*.pyd
 __pycache__/
+.pytest_cache/
+.triton/
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Profiling, benchmark & log outputs
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.prof
+*.log
+
+# Generated full-stack bundles (reproducible via `python export_full_stack.py`)
+Full_Unlocked_GPU_CoDesign_Stack.md
+Full_Unlocked_GPU_CoDesign_Stack.html
+
+# Intermediate working verification pass checklists & ledgers
+docs/13_*.md
+docs/14_*.md
+
+# Local IDE, OS & assistant/editor directories
+.vscode/
+.idea/
+.vs/
+.DS_Store
+Thumbs.db
+.gemini/
+.claude/
+.cursor/
+.aider*
+.env

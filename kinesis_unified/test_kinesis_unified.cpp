@@ -321,11 +321,13 @@ int main() {
         zero_cache.execute_smart_w1_gemm(Az, wz, Cz, /*force_exact=*/true);
         for (size_t j = 0; j < 8; ++j) UHA_VERIFY(c_zero[j] == 0.0f);
 
-        // (d) Offline power-law seeding places exactly the top-scoring panels; aging halves counters
+        // (d) Offline power-law seeding places exactly the top-scoring panels; aging halves counters;
+        //     NaN importance scores sort last under a strict weak ordering (docs/12 4.31).
         SmartTieredCache seeded(8, 3, 0.85f, 2);
-        seeded.seed_offline_powerlaw_hot_panels({0.1f, 9.0f, 0.2f, 8.0f, 0.3f, 7.0f, 0.4f, 0.5f});
+        seeded.seed_offline_powerlaw_hot_panels({NAN, 9.0f, 0.2f, 8.0f, NAN, 7.0f, 0.4f, 0.5f});
         UHA_VERIFY(seeded.panel_resident_in_vram(1) && seeded.panel_resident_in_vram(3) &&
-                   seeded.panel_resident_in_vram(5) && !seeded.panel_resident_in_vram(0));
+                   seeded.panel_resident_in_vram(5) && !seeded.panel_resident_in_vram(0) &&
+                   !seeded.panel_resident_in_vram(4));
         seeded.record_panel_access_and_promote(1);
         UHA_VERIFY(seeded.telemetry().tier1_vram_hits == 1);
         seeded.decay_access_frequencies();
@@ -565,17 +567,32 @@ int main() {
         for (size_t i = 0; i < Mq * Nq; ++i) nan_pattern_diff += (std::isnan(c_ex[i]) != std::isnan(c_sv[i]));
         UHA_VERIFY(std::isnan(c_ex[0]) && nan_pattern_diff == 0);
 
-        // (c) W2 packer: +Inf / -Inf weights keep their sign, a NaN weight packs as 0 (code 1).
+        // (c) W2 packer: +Inf / -Inf weights keep their sign, a NaN weight packs as 0 (code 1), both in separate
+        //     columns and when mixed inside the SAME g128 column group (docs/12 4.21, 4.29).
         std::vector<float> wi = wq;
         wi[7 * Nq + 2] = INFINITY;
         wi[9 * Nq + 3] = -INFINITY;
         wi[11 * Nq + 4] = NAN;
+        // Column 5 mixes +Inf, -Inf, NaN, +2.5, -2.5, 0.0 inside the SAME g128 group:
+        wi[0 * Nq + 5] = INFINITY;
+        wi[1 * Nq + 5] = -INFINITY;
+        wi[2 * Nq + 5] = NAN;
+        wi[3 * Nq + 5] = 2.5f;
+        wi[4 * Nq + 5] = -2.5f;
+        wi[5 * Nq + 5] = 0.0f;
         TensorView<const float> Wi(wi.data(), Shape{static_cast<int64_t>(Kq), static_cast<int64_t>(Nq)});
         const W2GotoBlasPanelSet Pi = pack_w2_gotoblas_panels(Wi);
         const unsigned c_pos = (Pi.packed_trits[7] >> (2 * 2)) & 3u;
         const unsigned c_neg = (Pi.packed_trits[9] >> (2 * 3)) & 3u;
         const unsigned c_nan = (Pi.packed_trits[11] >> (2 * 4)) & 3u;
         UHA_VERIFY(c_pos == 2u && c_neg == 0u && c_nan == 1u);
+        const unsigned m0 = (Pi.packed_trits[0] >> (2 * 5)) & 3u;
+        const unsigned m1 = (Pi.packed_trits[1] >> (2 * 5)) & 3u;
+        const unsigned m2 = (Pi.packed_trits[2] >> (2 * 5)) & 3u;
+        const unsigned m3 = (Pi.packed_trits[3] >> (2 * 5)) & 3u;
+        const unsigned m4 = (Pi.packed_trits[4] >> (2 * 5)) & 3u;
+        const unsigned m5 = (Pi.packed_trits[5] >> (2 * 5)) & 3u;
+        UHA_VERIFY(m0 == 2u && m1 == 0u && m2 == 1u && m3 == 2u && m4 == 0u && m5 == 1u);
         std::printf("[10] Non-finite sieve and packer inputs (docs/12 4.21):\n");
         std::printf("    tau sieve with one Inf: pruned %zu tiles, finite-row diffs %zu | NaN-scale group kept under eps budget: "
                     "NaN pattern diffs %zu | W2 codes +Inf/-Inf/NaN = %u/%u/%u (want 2/0/1) -> PASS\n",

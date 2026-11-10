@@ -31,7 +31,12 @@ class GaLoreState8Bit:
 
 def quantize_signed_int8(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     scale = (t.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-12)
-    q = torch.clamp(torch.round(t / scale), -127.0, 127.0).to(torch.int8)
+    ratio = t / scale
+    q = torch.where(
+        torch.isfinite(ratio),
+        torch.clamp(torch.round(ratio), -127.0, 127.0),
+        127.0 * torch.sign(torch.nan_to_num(t, nan=0.0)),
+    ).to(torch.int8)
     return q, scale
 
 
@@ -48,7 +53,12 @@ def quantize_signed_int8_sr(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     argument as quantize_sqrt_v_log8_sr. Same memory: 1 byte per coordinate plus one fp32 scale per row.
     """
     scale = (t.abs().amax(dim=-1, keepdim=True) / 127.0).clamp(min=1e-12)
-    q = torch.clamp(torch.floor(t / scale + torch.rand_like(t)), -127.0, 127.0).to(torch.int8)
+    ratio = t / scale
+    q = torch.where(
+        torch.isfinite(ratio),
+        torch.clamp(torch.floor(ratio + torch.rand_like(t)), -127.0, 127.0),
+        127.0 * torch.sign(torch.nan_to_num(t, nan=0.0)),
+    ).to(torch.int8)
     return q, scale
 
 
@@ -88,7 +98,12 @@ def quantize_unsigned_uint8(t: torch.Tensor, round_up: bool = False) -> Tuple[to
     """
     scale = (t.clamp(min=0.0).amax(dim=-1, keepdim=True) / 255.0).clamp(min=1e-16)
     scaled = t.clamp(min=0.0) / scale
-    q = torch.clamp(torch.ceil(scaled) if round_up else torch.round(scaled), 0.0, 255.0).to(torch.uint8)
+    rounded = torch.ceil(scaled) if round_up else torch.round(scaled)
+    q = torch.where(
+        torch.isfinite(scaled),
+        torch.clamp(rounded, 0.0, 255.0),
+        torch.where(t > 0.0, 255.0, 0.0),
+    ).to(torch.uint8)
     return q, scale
 
 
@@ -178,7 +193,12 @@ def quantize_int4_stochastic(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tenso
     """
     scale = (t.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-12)
     noise = torch.rand_like(t)
-    q = torch.clamp(torch.floor(t / scale + noise), -7.0, 7.0).to(torch.int16)
+    ratio = t / scale
+    q = torch.where(
+        torch.isfinite(ratio),
+        torch.clamp(torch.floor(ratio + noise), -7.0, 7.0),
+        7.0 * torch.sign(torch.nan_to_num(t, nan=0.0)),
+    ).to(torch.int16)
     if q.shape[-1] % 2 == 1:
         q = torch.cat([q, torch.zeros_like(q[..., :1])], dim=-1)
     lo = (q[..., 0::2] + 8).to(torch.uint8) & 0x0F
@@ -779,6 +799,20 @@ def main() -> None:
     # The 0.45 GB transient and 6.80 GB activation figures are stated assumptions, not derived here.
     assert (std["peak_per_gpu_2x24gb"], q8["peak_per_gpu_2x24gb"], gal["peak_per_gpu_2x24gb"]) == (227.40, 131.40, 23.63)
     assert fits, galore_budget["peak_per_gpu_2x24gb"]
+
+    # [6] docs/12 4.29 sibling regression: non-finite inputs (+Inf, -Inf, NaN) in quantize_signed_int8,
+    #     quantize_signed_int8_sr, quantize_unsigned_uint8, and quantize_int4_stochastic must preserve extremal
+    #     codes (+127/-127, 255/0, +7/-7) instead of collapsing Inf/Inf=NaN to code 0.
+    t_nf = torch.tensor([[float("inf"), float("-inf"), float("nan"), 0.0]], dtype=torch.float32)
+    q8_nf, _ = quantize_signed_int8(t_nf)
+    q8sr_nf, _ = quantize_signed_int8_sr(t_nf)
+    qu8_nf, _ = quantize_unsigned_uint8(t_nf)
+    p4_nf, _ = quantize_int4_stochastic(t_nf)
+    assert q8_nf[0].tolist() == [127, -127, 0, 0] and q8sr_nf[0].tolist() == [127, -127, 0, 0]
+    assert qu8_nf[0].tolist() == [255, 0, 0, 0]
+    assert int(p4_nf[0, 0].item() & 0x0F) - 8 == 7 and int((p4_nf[0, 0].item() >> 4) & 0x0F) - 8 == -7
+    assert int(p4_nf[0, 1].item() & 0x0F) - 8 == 0 and int((p4_nf[0, 1].item() >> 4) & 0x0F) - 8 == 0
+    print("[6] Non-finite quantizer guard (docs/12 4.29)         : int8/int8_sr/uint8/int4_sr +Inf/-Inf/NaN codes PASS")
     print("[+] PASS: Per-layer 8-bit GaLore post-accumulate hooks and 32B memory budget verified.")
 
 

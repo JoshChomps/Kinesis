@@ -579,6 +579,21 @@ itself is still not run on silicon. Regression: E1 and E4 [4].
 * Binary STE loss on a small regression falls to its minimum near step 50 and then rises (0.10 to 0.29 by step
   400), with or without gradient through the scale; the 60-step check in D1 [7] cannot see it.
 
+### 4.29 Seam & sibling defects (sixth pass): C++ vs. Python W2 packer on mixed `NaN` groups and sibling `Inf/Inf = NaN` integer casts
+**FIXED (2026-11-10).**
+* **C++ vs. Python W2 packer seam (`kinesis_unified/sub2bit_gemm_and_smart_cache.hpp`):** In `pack_w2_gotoblas_panels`, line 450 computed `const float ratio = (scales_f32[c] > 0.0f) ? (v / scales_f32[c]) : 0.0f;`. When a 128-weight group contained a `NaN` alongside `+Inf`, `-Inf`, or finite weights, `scales_f32[c]` became `NaN`. Because `NaN > 0.0f` is `false` in IEEE-754, C++ set `ratio = 0.0f` (which is finite!) for **all 128 weights in that group**, packing every weight in the group as `0` (`q_code = 1`, e.g. `[1, 1, 1, 1, 1, 1]`). By contrast, Python (`spinquant_packer.py` and `fused_qat_ste.py`) evaluated `ratio = w_groups / scales_f32 = NaN` (`isfinite(ratio) == False`) and preserved each weight's sign (`[2, 0, 1, 2, 0, 1]`). Earlier test `F1 [10](c)` missed this because it placed `+Inf`, `-Inf`, and `NaN` in three *different* columns (`c = 2, 3, 4`) rather than inside the same group. Changed the C++ guard to `(scales_f32[c] != 0.0f)` so a `NaN` scale produces `ratio = NaN` and matches Python bit-for-bit. Also added `"U32"` (`torch.uint32`) and `"U16"` (`torch.uint16`) to `_TORCH_TO_SAFETENSORS_DTYPE` / `_SAFETENSORS_TO_TORCH_DTYPE` in `kinesis_bridge.py` so `quantize_and_pack_w1_g128_interleaved` outputs round-trip directly through `save_safetensors_bytes`.
+* **Sibling `ratio = x / scale` `NaN`-to-integer casts (`lserve_sparse_attn.py`, `galore_async_offload.py`):** Sweeping all remaining `.to(torch.int*)` / `.to(torch.uint*)` casts across the repository exposed the same `±Inf / Inf = NaN` integer-cast pattern in `quantize_kv_pages_int4_hadamard` (`lserve_sparse_attn.py`) and in `quantize_signed_int8`, `quantize_signed_int8_sr`, `quantize_unsigned_uint8`, and `quantize_int4_stochastic` (`galore_async_offload.py`), which collapsed `±Inf` entries to code `0` (`0 * Inf = NaN` on dequantization). All five now guard `torch.isfinite(ratio)` before casting, preserving extremal codes (`±7`, `±127`, `255`). Regressions: `F1 [10](c)`, `F2 [8]`, `C3 [8]`, `D2 [6]`.
+
+### 4.30 Defects (sixth pass): LServe `-1e9` static-page mask sentinel collision and empty-static-window crash (`lserve_sparse_attn.py`)
+**FIXED (2026-11-10).**
+* In `lserve_sparse_hadamard_attention`, already-selected static (`sink` and `local`) pages were masked out of `torch.topk` by replacing their scores with `-1e9` (`masked_scores = torch.where(static_mask[:, retr_idx], -1e9, page_scores)`). Whenever candidate non-static pages had upper-bound scores `< -1e9` (e.g. large negative inner products or `-inf`), `-1e9` exceeded the candidate scores, so `torch.topk` re-selected the static pages and `retr_active.scatter_(-1, top_idx, True)` became a no-op (dropping `avg_active_pages` from `6.0` to `3.0`). Dynamic `topk` now indexes strictly over the non-static candidate page indices `cand_idx = torch.nonzero(~static_mask[0, 0])`, making static-page re-selection impossible regardless of score magnitude or tie-breaking.
+* In `profile_streaming_head_mask`, `page_scores[:, :, static_pages].amax(dim=-1)` was unguarded when `sink_pages == 0` and `local_pages == 0` (crashing with `IndexError: amax(): Expected reduction dim -1 to have non-zero size`, even though `~static_pages` on the next line was guarded). Both `profile_streaming_head_mask` and `lserve_sparse_hadamard_attention` now clamp `sink_pages` and `local_pages` to `[0, num_pages]` and guard empty page selections. Regression: `C3 [8]`.
+
+### 4.31 Defects (sixth pass): `NaN` comparator UB in `seed_offline_powerlaw_hot_panels` and Python `max(0.0, NaN) == 0.0` telemetry trap (`closed_loop_governor.py`)
+**FIXED (2026-11-10).**
+* In `SmartTieredCache::seed_offline_powerlaw_hot_panels` (`sub2bit_gemm_and_smart_cache.hpp`), the `std::partial_sort` comparator evaluated `score[a] > score[b] || (score[a] == score[b] && a < b)`. If any score was `NaN`, both comparisons returned `false`, violating transitivity of equivalence (`a ~ NaN` and `NaN ~ b` while `a > b` via index tie-breaker `b < a`, undefined behavior in `std::partial_sort`). `NaN` scores are now mapped to `-infinity` inside the comparator so they sort last under a strict weak ordering, and `plan_panel_sieve` explicitly guards `!std::isfinite(bound_[g])`.
+* In `ClosedLoopHardwareGovernor.route_moe_and_regulate_sieve` (`closed_loop_governor.py`), `sag_frac = max(0.0, (floor_mhz - sample.effective_sm_clock_mhz) / floor_mhz)` silently evaluated to `0.0` when `effective_sm_clock_mhz` was `NaN` (because Python's `max(0.0, nan)` tests `nan > 0.0`, which is `False`, and returns `0.0`). Because `0.0 <= 0.01`, a `NaN` clock reading triggered `RELAX_SIEVE_-2%_RESTORE_DENSITY` instead of holding `tau_sieve` unchanged as C `nvrm_poll_and_adjust_sieve` does. The Python governor now checks `math.isfinite(...)` on clock and power telemetry before adjusting `tau_sieve`. Regressions: `F1 [7](d)`, `E3`.
+
 ## 6. Coverage summary
 
 This pass reviewed the full host-verifiable surface of the repository, file by file:
@@ -617,3 +632,35 @@ doc 11 (sections 4.1, 4.2, both fixed), and a set of caveats and modelling assum
 that are true-by-design limits rather than bugs. The single largest unverified surface remains the GPU
 device code: the PTX is modelled, not assembled, and the Triton kernels have no host execution path, so
 nothing here proves `ptxas` acceptance, register or occupancy counts, or any on-GPU performance figure.
+
+---
+
+## 7. Adversarial "Try-to-Break-It" & Interleaving-Seam Verification Philosophy
+
+The contrast between the first pass (which inspected each file's math and existing tests and found 3 latent issues) and the subsequent adversarial passes (which uncovered `4.6` through `4.31`) establishes four mandatory verification invariants for this repository:
+
+1. **Active Break-Probing Over Passive Code Inspection:**
+   Reading an equation and running its happy-path unit test only confirms that the code works on the inputs its author thought of. Every verification pass must actively construct hostile inputs designed to falsify the implementation:
+   - Non-finite values (`NaN`, `+Inf`, `-Inf`) alone *and* mixed with finite values inside the **same** quantization group or reduction tile (e.g., `4.12`, `4.21`, `4.24`, `4.29`, `4.31`).
+   - Exact floating-point tie and subnormal boundaries, such as all 127 BF16 subnormal double-rounding trap values `(k + 0.5 - 2^-10) * 2^-133` and exact FMA ties `a * b + c` where `a * b` lands on a BF16 midpoint and `|c| < 0.5 * ulp_fp32` (`4.19`, `4.24`).
+   - Non-multiple dimensions (`M` not divisible by `BM`, `K % 32 == 16` tail tiles under Kronecker $H_{32}$, `sink_pages = local_pages = 0`, `K` mismatch between packed buffers and runtime call, `4.5`, `4.22`, `4.23`, `4.27`, `4.30`).
+   - Compiler optimization and ABI stress (`-O0`, `-O3 -fno-inline`, `-O3` on Windows x64 16-byte stack alignment for 32-byte AVX2 YMM spills, `4.11`).
+
+2. **Mandatory Whole-Repo Sibling-Pattern Sweeps:**
+   Whenever a bug pattern is discovered in one file, the auditor must immediately grep the entire repository for every sibling occurrence of that pattern across C, C++, CUDA, and Python:
+   - Finding `Inf / Inf = NaN` reaching a float-to-integer cast in `spinquant_packer.py` (`4.21`) required sweeping every `.to(torch.int*)`, `.to(torch.uint*)`, and `static_cast<int>` across `sub2bit_gemm_and_smart_cache.hpp`, `lserve_sparse_attn.py`, and `galore_async_offload.py` (`4.29`).
+   - Finding `std::max(x, NaN)` / Python `max(0.0, NaN)` swallowing `NaN` in one reduction or governor required checking all reductions in `w1a16_hadacore_kernel.cu`, `tiled_cbc_sieve.cu`, `sub2bit_gemm_and_smart_cache.hpp`, and `closed_loop_governor.py` (`4.12`, `4.21`, `4.31`).
+   - Finding FP64->FP32->BF16 double rounding on normal values (`4.19`) required sweeping all three `round_f64_to_bf16_rne` / `f64_to_bf16_bits_rne` implementations for subnormal double rounding (`ulp_exp = max(e - 8, -133)`).
+
+3. **Multi-Hundred-Step Dynamical Feedback Horizons:**
+   In stateful training and control loops (QAT, GaLore, adaptive sieves, BAR1 LRU caches), per-step errors that look negligible at $t = 1$ compound over time:
+   - Linear `uint8` `ceil` rounding on $\sqrt{V_t}$ looked harmless on 1-4 steps (`e2e_transformer_pipeline.py`) but ratcheted $10\times$ over 3,000 steps (`4.6`).
+   - `int8` round-to-nearest on the first moment $M_t$ silently zeroed coordinates below $1/254$ of the row maximum on every step (`4.26`).
+   - Projector refreshes at step $T = 200$ created a $3.06\times$ step spike on newly entered subspace directions until missing second-moment mass was seeded (`4.26`).
+   - Every stateful component must be tested over multi-hundred-step trajectories that cross state transitions (projector refreshes, cache evictions/coalescing, clock-sag hysteresis cycles).
+
+4. **Cross-Module Interleaving Seam Verification:**
+   Passing unit tests in Module A and Module B separately does not prove that Module A's output satisfies Module B's invariants when they are wired together. Verification must explicitly test the live seams where subsections interleave:
+   - **Seam A (QAT $\leftrightarrow$ GaLore $\leftrightarrow$ SpinQuant Packer $\leftrightarrow$ C++ Bridge $\leftrightarrow$ GPU Host-CTA Kernel):** `DeployBasisQATLinear` (`fused_qat_ste.py`) trained under `LayerWise8BitGaLoreEngine` (`galore_async_offload.py`) must produce `deploy_weight()` bit-identical to `spinquant_packer.py` (`quantize_and_pack_w1_g128_interleaved` / `quantize_and_pack_w2_ternary_interleaved`), which in turn must match C++ `KinesisNativeBridge` (`pack_w1_panels` / `pack_w2_panels` / `convert_w1_to_gpu_interleaved`) and `fused_w1a16_hadacore_gemm_kernel` / `fused_w2a16_hadacore_gemm_kernel` across all rotation modes (`0`, `H_16`, `H_32`).
+   - **Seam B (Structural Sieves $\leftrightarrow$ Closed-Loop Governor $\leftrightarrow$ Chorus AMX Ring):** `ClosedLoopHardwareGovernor` (`closed_loop_governor.c` / `.py`) regulates `tau_sieve` consumed by `tiled_cbc_sieve` and `w1a16_hadacore_kernel.cu`, and routes MoE dispatches into `HeteroMoERingSlot` (`chorus_amx_moe.c`), where producer/consumer cache-line separation, `expert_k == hidden_dim` validation, and `Delta_Q` backpressure must agree across C and Python.
+   - **Seam C (Driver BAR1 Aperture Manager $\leftrightarrow$ P2P L2 PTE Encoder):** `kbusMapFbAperture_HAL` (`nv_gpu_ops_and_s3_unlock.c`) arbitrates 48 GB VRAM mappings through the 32 GB BAR1 aperture with full `[va, va+size)` and `[phys, phys+size)` interval overlap checks and first-fit gap coalescing, feeding `kgmmuEncodeP2pPte_HAL` with isolated IOMMU peer-domain whitelisting and 64-bit overflow wrap-around guards.

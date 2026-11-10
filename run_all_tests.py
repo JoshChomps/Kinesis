@@ -275,6 +275,13 @@ def run_hygiene_audit(root_dir: str) -> Tuple[bool, str]:
         "gemi" + "ni",
         "open" + "ai",
         "chat" + "gpt",
+        "anti" + "gravity",
+        "op" + "us",
+        "son" + "net",
+        "hai" + "ku",
+        "copi" + "lot",
+        "prompt" + " pack",
+        "second-" + "eyes",
     ]
     checked_files = 0
     violations: List[str] = []
@@ -292,14 +299,31 @@ def run_hygiene_audit(root_dir: str) -> Tuple[bool, str]:
             checked_files += 1
             if "\u2014" in text:
                 violations.append(f"{rel}: contains em dash (U+2014)")
+            low_rel = rel.lower()
             low = text.lower()
             for w in forbid_words:
+                if w in low_rel:
+                    violations.append(f"{rel}: filename contains forbidden token '{w}'")
                 if w in low:
                     violations.append(f"{rel}: contains forbidden token '{w}'")
 
+    git_log_proc = subprocess.run(
+        ["git", "log", "--format=%h %s %b"],
+        cwd=root_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if git_log_proc.returncode == 0:
+        for line in git_log_proc.stdout.splitlines():
+            low_line = line.lower()
+            for w in forbid_words:
+                if w in low_line:
+                    violations.append(f"git log ({line.split()[0]}): contains forbidden token '{w}'")
+
     if violations:
         return False, "; ".join(violations)
-    return True, f"Audited {checked_files} source/doc files (0 em dashes, 0 forbidden tokens)"
+    return True, f"Audited {checked_files} source/doc files + git log (0 em dashes, 0 forbidden tokens)"
 
 
 def main() -> int:

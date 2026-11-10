@@ -84,12 +84,22 @@ def quantize_kv_pages_int4_hadamard(
     k_page_min = bf16_round_outward(k_pages.amin(dim=3), toward_pos_inf=False)  # [B, H, num_pages, D]
     k_page_max = bf16_round_outward(k_pages.amax(dim=3), toward_pos_inf=True)   # [B, H, num_pages, D]
 
-    # Symmetric INT4 quantization per token-page
+    # Symmetric INT4 quantization per token-page (docs/12 4.29: guard non-finite ratio Inf/Inf = NaN before .to(int8))
     k_scale = (k_pages.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-6).to(torch.bfloat16)
     v_scale = (v_pages.abs().amax(dim=-1, keepdim=True) / 7.0).clamp(min=1e-6).to(torch.bfloat16)
 
-    k_int4 = torch.clamp(torch.round(k_pages / k_scale.to(torch.float32)), -7, 7).to(torch.int8)
-    v_int4 = torch.clamp(torch.round(v_pages / v_scale.to(torch.float32)), -7, 7).to(torch.int8)
+    k_ratio = k_pages / k_scale.to(torch.float32)
+    v_ratio = v_pages / v_scale.to(torch.float32)
+    k_int4 = torch.where(
+        torch.isfinite(k_ratio),
+        torch.clamp(torch.round(k_ratio), -7.0, 7.0),
+        7.0 * torch.sign(torch.nan_to_num(k_pages, nan=0.0)),
+    ).to(torch.int8)
+    v_int4 = torch.where(
+        torch.isfinite(v_ratio),
+        torch.clamp(torch.round(v_ratio), -7.0, 7.0),
+        7.0 * torch.sign(torch.nan_to_num(v_pages, nan=0.0)),
+    ).to(torch.int8)
 
     # Pack two signed INT4 values (biased by +8 into [1..15]) per uint8 byte:
     # At page_size = 64, D = 128 -> shape [B, H, num_pages, 64, 64] = 4,096 bytes/page (UHA_KV_PAGE_INT4_BYTES)
@@ -162,10 +172,15 @@ def profile_streaming_head_mask(
     page_scores = torch.maximum(q_exp * k_min_exp, q_exp * k_max_exp).sum(dim=-1).amax(dim=2)  # [B, H, P]
 
     static_pages = torch.zeros(num_pages, dtype=torch.bool, device=q.device)
-    static_pages[:sink_pages] = True
-    static_pages[max(0, num_pages - local_pages):] = True
+    sink_n = min(num_pages, max(0, int(sink_pages)))
+    local_n = min(num_pages, max(0, int(local_pages)))
+    static_pages[:sink_n] = True
+    static_pages[num_pages - local_n:] = True
 
-    in_win_max = page_scores[:, :, static_pages].amax(dim=-1).mean(dim=0)  # [H]
+    if static_pages.any():
+        in_win_max = page_scores[:, :, static_pages].amax(dim=-1).mean(dim=0)  # [H]
+    else:
+        in_win_max = torch.zeros(H, dtype=torch.float32, device=q.device)
     if (~static_pages).any():
         out_win_max = page_scores[:, :, ~static_pages].amax(dim=-1).mean(dim=0)  # [H]
     else:
@@ -222,11 +237,16 @@ def lserve_sparse_hadamard_attention(
 
     # Always force static sink pages and local window pages to be retained (all heads)
     static_mask = torch.zeros((B, H, num_pages), dtype=torch.bool, device=q.device)
-    static_mask[:, :, :sink_pages] = True
-    static_mask[:, :, max(0, num_pages - local_pages):] = True
+    sink_n = min(num_pages, max(0, int(sink_pages)))
+    local_n = min(num_pages, max(0, int(local_pages)))
+    static_mask[:, :, :sink_n] = True
+    static_mask[:, :, num_pages - local_n:] = True
     active_mask = static_mask.clone()
 
-    dyn_k = min(top_k_pages, max(0, num_pages - sink_pages - local_pages))
+    # Select dynamic top-k pages strictly from the non-static candidate pages (docs/12 4.30: masking static pages
+    # with -1e9 used to re-select static pages whenever candidate upper-bound scores were < -1e9).
+    cand_idx = torch.nonzero(~static_mask[0, 0], as_tuple=False).squeeze(-1)
+    dyn_k = min(max(0, int(top_k_pages)), int(cand_idx.numel()))
     if dyn_k > 0 and retr_idx.numel() > 0:
         # Retrieval heads only: per-query convex upper-bound inner product against page min/max centroids.
         q_exp = q_rot[:, retr_idx].unsqueeze(3)       # [B, Hr, Sq, 1, D]
@@ -234,8 +254,9 @@ def lserve_sparse_hadamard_attention(
         k_max_exp = k_max[:, retr_idx].unsqueeze(2)
         per_query_ub = torch.maximum(q_exp * k_min_exp, q_exp * k_max_exp).sum(dim=-1)  # [B, Hr, Sq, P]
         page_scores = per_query_ub.amax(dim=2)                                         # [B, Hr, P]
-        masked_scores = torch.where(static_mask[:, retr_idx], torch.full_like(page_scores, -1e9), page_scores)
-        _, top_idx = torch.topk(masked_scores, k=dyn_k, dim=-1)
+        cand_scores = page_scores[:, :, cand_idx]
+        _, rel_top = torch.topk(cand_scores, k=dyn_k, dim=-1)
+        top_idx = cand_idx[rel_top]
         retr_active = active_mask[:, retr_idx].clone()
         retr_active.scatter_(-1, top_idx, True)
         active_mask[:, retr_idx] = retr_active
@@ -247,7 +268,10 @@ def lserve_sparse_hadamard_attention(
     for b in range(B):
         for h in range(H):
             sel_pages = torch.nonzero(active_mask[b, h], as_tuple=False).squeeze(-1)
-            total_pages_evaluated += int(sel_pages.numel())
+            n_sel = int(sel_pages.numel())
+            total_pages_evaluated += n_sel
+            if n_sel == 0:
+                continue
 
             k_unpacked_i8 = unpack_kv_pages_u8_to_int8(k_packed_u8[b, h, sel_pages])
             v_unpacked_i8 = unpack_kv_pages_u8_to_int8(v_packed_u8[b, h, sel_pages])
@@ -274,7 +298,7 @@ def lserve_sparse_hadamard_attention(
     read_bits = total_pages_evaluated * elems_per_page * (bpe["k"] + bpe["v"])
     read_bits += B * int(retr_idx.numel()) * centroid_bits_per_page * num_pages
     read_bits -= float(active_mask[:, retr_idx].sum()) * centroid_bits_per_page if retr_idx.numel() > 0 else 0.0
-    kv_compression_ratio = dense_bits / read_bits
+    kv_compression_ratio = (dense_bits / read_bits) if read_bits > 0.0 else float("inf")
     return out, {
         "num_pages": float(num_pages),
         "avg_active_pages": avg_active_pages,
@@ -380,6 +404,32 @@ def main() -> None:
           f"cosine vs ref {cos_blind_real:.5f} (profiled {cos_prof:.5f})")
     assert abs(stats_blind_real["avg_active_pages"] - expected_avg) < 1e-6
     assert cos_prof > cos_blind_real + 0.01, (cos_prof, cos_blind_real)
+
+    # [8] docs/12 4.29 / 4.30 regressions:
+    #   (a) candidate page scores < -1e9 must still select all dyn_k non-static pages (the old -1e9 static mask
+    #       made topk re-select the 3 static pages, dropping avg_active_pages from 6.0 to 3.0);
+    #   (b) sink_pages=0, local_pages=0 must not crash profile_streaming_head_mask or lserve_sparse_hadamard_attention;
+    #   (c) +-Inf in K/V quantizes to +-7 (not 0 from Inf/Inf=NaN cast) and NaN quantizes to 0.
+    q_neg = torch.full((1, 2, 4, 128), 1e5, dtype=torch.bfloat16)
+    k_neg = torch.full((1, 2, 512, 128), -1e5, dtype=torch.bfloat16)
+    v_neg = torch.ones((1, 2, 512, 128), dtype=torch.bfloat16)
+    kv_neg = quantize_kv_pages_int4_hadamard(k_neg, v_neg, page_size=64)
+    _, st_neg = lserve_sparse_hadamard_attention(q_neg, kv_neg, top_k_pages=3, sink_pages=1, local_pages=2)
+    assert st_neg["avg_active_pages"] == 6.0, st_neg["avg_active_pages"]
+    m_zero_static = profile_streaming_head_mask(q, kv_real, streaming_head_ratio=0.5, sink_pages=0, local_pages=0)
+    assert int(m_zero_static.sum().item()) == 2
+    _, st_zero_static = lserve_sparse_hadamard_attention(
+        q, kv_real, top_k_pages=0, sink_pages=0, local_pages=0, streaming_head_mask=m_zero_static
+    )
+    assert st_zero_static["avg_active_pages"] == 0.0
+    k_inf = torch.zeros((1, 1, 64, 16), dtype=torch.float32)
+    v_inf = torch.zeros((1, 1, 64, 16), dtype=torch.float32)
+    k_inf[0, 0, 0, :] = float("inf")   # uniform +Inf across the 16-block so H_16 maps channel 0 to +4*Inf = +Inf
+    k_inf[0, 0, 1, 0] = float("nan")
+    kv_inf = quantize_kv_pages_int4_hadamard(k_inf, v_inf, page_size=64)
+    assert int(kv_inf["k_int4"][0, 0, 0, 0, 0].item()) == 7 and int(kv_inf["k_int4"][0, 0, 0, 1, 0].item()) == 0
+    print(f"[8] Candidate scores < -1e9 & 0-static window (4.29/4.30): active={st_neg['avg_active_pages']:.1f}/6.0 | "
+          f"+Inf INT4 code={int(kv_inf['k_int4'][0, 0, 0, 0, 0].item())} | PASS")
     print("[+] PASS: LServe unified sparse + 4-bit Hadamard KV attention and salience head profiler verified.")
 
 

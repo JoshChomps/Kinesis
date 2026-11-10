@@ -413,13 +413,19 @@ _TORCH_TO_SAFETENSORS_DTYPE = {
     torch.uint8: ("U8", 1),
     torch.int8: ("I8", 1),
 }
+if hasattr(torch, "uint32"):
+    _TORCH_TO_SAFETENSORS_DTYPE[torch.uint32] = ("U32", 4)
+if hasattr(torch, "uint16"):
+    _TORCH_TO_SAFETENSORS_DTYPE[torch.uint16] = ("U16", 2)
 
 _SAFETENSORS_TO_TORCH_DTYPE = {
     "F32": (torch.float32, 4),
     "BF16": (torch.bfloat16, 2),
     "F16": (torch.float16, 2),
     "I32": (torch.int32, 4),
+    "U32": (getattr(torch, "uint32", torch.int32), 4),
     "I16": (torch.int16, 2),
+    "U16": (getattr(torch, "uint16", torch.int16), 2),
     "U8": (torch.uint8, 1),
     "I8": (torch.int8, 1),
 }
@@ -747,6 +753,23 @@ def run_kinesis_bridge_verification() -> None:
     # cross-check is the case that exposed it and stays as its regression.
     assert scale_rule_diff == 0, scale_rule_diff
     print(f"[7] g128 scale rule C++ vs Python (docs/12 4.19): {scale_rule_diff}/{N_s * gs} differ | PASS")
+
+    # [8] docs/12 4.29 seam regression: mixed (+Inf, -Inf, NaN, finite) in the SAME g128 W2 group must produce
+    # identical ternary codes [2, 0, 1, 2, 0, 1] across Python spinquant_packer and C++ pack_w2_panels, and
+    # save_safetensors_bytes must round-trip torch.uint32 outputs from quantize_and_pack_w1_g128_interleaved.
+    w_mix = torch.zeros((8, 128), dtype=torch.float32)
+    w_mix[0, :6] = torch.tensor([float("inf"), float("-inf"), float("nan"), 2.5, -2.5, 0.0])
+    w2_py_u32, _ = quantize_and_pack_w2_ternary_interleaved(w_mix)
+    u0 = int(w2_py_u32[0, 0].item()) & 0xFFFFFFFF
+    py_mix_codes = [((u0 >> ((2 * (k // 2)) if (k % 2 == 0) else (2 * (k // 2) + 16))) & 3) for k in range(6)]
+    trits_mix, _ = bridge.pack_w2_panels(w_mix.T.contiguous())
+    cpp_mix_codes = [int(trits_mix[k].item()) & 3 for k in range(6)]
+    assert py_mix_codes == [2, 0, 1, 2, 0, 1] and cpp_mix_codes == py_mix_codes, (py_mix_codes, cpp_mix_codes)
+    w1_u32_rt, w1_sc_rt = quantize_and_pack_w1_g128_interleaved(torch.randn((8, 128)))
+    st_u32_blob = save_safetensors_bytes({"w1_u32": w1_u32_rt, "w1_sc": w1_sc_rt})
+    st_u32_loaded, _ = load_safetensors_bytes(st_u32_blob)
+    assert torch.equal(st_u32_loaded["w1_u32"].view(torch.int32), w1_u32_rt.view(torch.int32))
+    print(f"[8] W2 Mixed NaN/Inf Group & U32 SafeTensors (4.29): Py={py_mix_codes} == C++={cpp_mix_codes} | U32 round-trip PASS")
     print("\n[+] ALL SUITE F2 NATIVE C++20 BRIDGE & SAFETENSORS CHECKS PASSED.")
 
 

@@ -26,9 +26,8 @@ DOC_FILES = [
     "docs/10_Related_Projects_Community_Buzz_and_Wave2_Upgrades.md",
     "docs/11_Adversarial_Review_Status_and_Known_Limitations.md",
     "docs/12_Independent_Verification_Caveats_and_Inconsistencies.md",
-    "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
-    "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
     "docs/15_Language_and_Runtime_Architecture_C_CPP_CUDA_vs_PyTorch.md",
+    "docs/16_Subsystem_Audit_Interleaving_Seams_and_Testing_Architecture.md",
 ]
 
 SOURCE_FILES = [
@@ -107,7 +106,7 @@ def export_everything() -> None:
   pre {{ white-space: pre-wrap; word-wrap: break-word; background: #f6f8fa; border: 1px solid #d0d7de; padding: 14px; border-radius: 6px; font-size: 11.5px; line-height: 1.45; }}
   @media print {{ .bar {{ display: none; }} pre {{ font-size: 9.5px; border: none; }} }}
 </style></head><body>
-<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 20 Verification Suites Included)</span>
+<div class="bar"><span><strong>Complete Co-Design Stack Bundle</strong> (All 5 Pillars &amp; 23 Verification Suites Included)</span>
 <button onclick="window.print()">Save Complete PDF</button></div>
 <pre>{html.escape(full_md)}</pre></body></html>""")
     print(f"[+] Wrote print-ready HTML bundle: {html_out}")

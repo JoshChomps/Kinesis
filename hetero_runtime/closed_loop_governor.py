@@ -16,6 +16,7 @@ Implements:
 """
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List
 
 
@@ -37,10 +38,14 @@ class HardwareTelemetrySample:
 
     @property
     def vram_pressure(self) -> float:
+        if not (math.isfinite(self.vram_used_gb) and math.isfinite(self.vram_capacity_gb)):
+            return float("nan")
         return self.vram_used_gb / max(1e-6, self.vram_capacity_gb)
 
     @property
     def clock_sag_fraction(self) -> float:
+        if not (math.isfinite(self.locked_clock_floor_mhz) and math.isfinite(self.effective_sm_clock_mhz)):
+            return float("nan")
         if self.locked_clock_floor_mhz <= 0.0:
             return 0.0
         return max(0.0, (self.locked_clock_floor_mhz - self.effective_sm_clock_mhz) / self.locked_clock_floor_mhz)
@@ -88,10 +93,30 @@ class ClosedLoopHardwareGovernor:
             execution_target = "GPU_STREAM_0_BACKPRESSURE_FALLBACK"
 
         # 2. Active Clock-Floor & Power-Brake Governor (polls every 16 layers)
+        # docs/12 4.31: Python's max(0.0, float("nan")) returns 0.0 (because nan > 0.0 is False), which used to turn
+        # a NaN clock reading into sag_frac = 0.0 <= 0.01 and trigger RELAX_SIEVE_-2%_RESTORE_DENSITY. Guard finite
+        # telemetry explicitly so non-finite readings hold tau_sieve, matching C nvrm_poll_and_adjust_sieve.
         governor_action = "HOLD"
         floor_mhz = sample.locked_clock_floor_mhz if sample.locked_clock_floor_mhz > 0.0 else self.locked_clock_floor_mhz
-        sag_frac = max(0.0, (floor_mhz - sample.effective_sm_clock_mhz) / floor_mhz) if floor_mhz > 0.0 else 0.0
-        if sample.layer_idx % self.clock_poll_interval_layers == 0 and floor_mhz > 0.0 and sample.power_cap_watts > 0.0:
+        telemetry_finite = (
+            math.isfinite(floor_mhz)
+            and math.isfinite(sample.effective_sm_clock_mhz)
+            and math.isfinite(sample.board_power_watts)
+            and math.isfinite(sample.power_cap_watts)
+        )
+        if not math.isfinite(floor_mhz) or not math.isfinite(sample.effective_sm_clock_mhz):
+            sag_frac = float("nan")
+        elif floor_mhz > 0.0:
+            sag_frac = max(0.0, (floor_mhz - sample.effective_sm_clock_mhz) / floor_mhz)
+        else:
+            sag_frac = 0.0
+        if (
+            self.clock_poll_interval_layers > 0
+            and sample.layer_idx % self.clock_poll_interval_layers == 0
+            and telemetry_finite
+            and floor_mhz > 0.0
+            and sample.power_cap_watts > 0.0
+        ):
             if (
                 sag_frac > self.clock_sag_threshold
                 and sample.board_power_watts >= 0.90 * sample.power_cap_watts
@@ -148,6 +173,12 @@ def main() -> None:
     assert abs(float(results[1]["tau_sieve"]) - 0.0420) < 1e-6
     assert results[2]["execution_target"] == "GPU_STREAM_0_BACKPRESSURE_FALLBACK"
     assert abs(float(results[2]["tau_sieve"]) - 0.0441) < 1e-6
+    # docs/12 4.31 regression: NaN clock or power telemetry must HOLD tau_sieve (max(0.0, nan) == 0.0 used to relax it)
+    tau_before = gov.tau_sieve
+    r_nan = gov.route_moe_and_regulate_sieve(
+        HardwareTelemetrySample(64, 24, 24, 18.0, 24.0, float("nan"), 2520.0, 350.0, 450.0)
+    )
+    assert r_nan["governor_action"] == "HOLD" and gov.tau_sieve == tau_before, r_nan
     print("[+] PASS: Closed-loop Chorus AMX offload routing and NVRM clock-sag governor verified.")
 
 
