@@ -260,6 +260,7 @@ class LayerWise8BitGaLoreEngine:
         subspace_iters: int = 0,
         reproject_moments: bool = True,
         refresh_v_fill: bool = True,
+        pin_memory: bool = True,
     ) -> None:
         assert proj_bits in (4, 8)
         self.proj_bits = proj_bits
@@ -291,6 +292,7 @@ class LayerWise8BitGaLoreEngine:
         self.weight_decay = weight_decay
         self.scale_alpha = scale_alpha
         self.states: Dict[torch.nn.Parameter, GaLoreState8Bit] = {}
+        self.pin_memory = bool(pin_memory)
         self.hooks = []
         self.peak_transient_grad_bytes = 0
         # docs/12 4.26: full-size tensors alive at the peak of one layer step (param.grad, its FP32 copy, the
@@ -341,25 +343,52 @@ class LayerWise8BitGaLoreEngine:
         h = param.register_post_accumulate_grad_hook(_post_grad_hook)
         self.hooks.append(h)
 
+    def _to_host(self, t: torch.Tensor, dst: torch.Tensor = None) -> torch.Tensor:
+        src = t.detach()
+        if src.is_cuda:
+            if (
+                dst is not None
+                and dst.device.type == "cpu"
+                and dst.shape == src.shape
+                and dst.dtype == src.dtype
+                and (not self.pin_memory or dst.is_pinned())
+            ):
+                dst.copy_(src)
+                return dst
+            if self.pin_memory and torch.cuda.is_available():
+                try:
+                    pinned = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+                    pinned.copy_(src)
+                    return pinned
+                except RuntimeError:
+                    pass
+        return src.cpu()
+
+    def _to_device(self, t: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if device.type == "cuda" and self.pin_memory and t.is_pinned():
+            return t.to(device, non_blocking=True)
+        return t.to(device)
+
     def _store_projector(self, st: GaLoreState8Bit, p_mat: torch.Tensor) -> None:
         # Quantize on device first so only 1 byte (int8) or 0.5 byte (int4) per element crosses PCIe
         if st.proj_bits == 4:
             q_p, sc_p = quantize_int4_stochastic(p_mat)
         else:
             q_p, sc_p = quantize_signed_int8(p_mat)
-        st.proj_q, st.proj_scale = q_p.cpu(), sc_p.cpu()
+        st.proj_q = self._to_host(q_p, st.proj_q)
+        st.proj_scale = self._to_host(sc_p, st.proj_scale)
 
     def _load_projector(self, st: GaLoreState8Bit, device: torch.device) -> torch.Tensor:
         if st.proj_bits == 4:
-            p = dequantize_int4(st.proj_q.to(device), st.proj_scale.to(device), st.rank)
+            p = dequantize_int4(self._to_device(st.proj_q, device), self._to_device(st.proj_scale, device), st.rank)
             return p / p.norm(dim=0, keepdim=True).clamp(min=1e-12)
-        return dequantize_signed_int8(st.proj_q.to(device), st.proj_scale.to(device))
+        return dequantize_signed_int8(self._to_device(st.proj_q, device), self._to_device(st.proj_scale, device))
 
     @torch.no_grad()
     def _reproject_moments(self, st: GaLoreState8Bit, rot: torch.Tensor, dev: torch.device,
                            lost: torch.Tensor = None, r_new: torch.Tensor = None) -> None:
-        m_old = dequantize_signed_int8(st.exp_avg_q.to(dev), st.exp_avg_scale.to(dev))
-        sv_old = dequantize_sqrt_v_log8(st.exp_avg_sq_q.to(dev), st.exp_avg_sq_scale.to(dev))
+        m_old = dequantize_signed_int8(self._to_device(st.exp_avg_q, dev), self._to_device(st.exp_avg_scale, dev))
+        sv_old = dequantize_sqrt_v_log8(self._to_device(st.exp_avg_sq_q, dev), self._to_device(st.exp_avg_sq_scale, dev))
         m_new = rot @ m_old
         v_new = (rot * rot) @ (sv_old * sv_old)
         if self.refresh_v_fill and lost is not None and r_new is not None:
@@ -367,8 +396,10 @@ class LayerWise8BitGaLoreEngine:
             v_new = v_new + (lost * bias2).unsqueeze(1) * (r_new * r_new)
         q_m, sc_m = quantize_signed_int8_sr(m_new)
         q_sv, sc_sv = quantize_sqrt_v_log8_sr(torch.sqrt(v_new.clamp(min=0.0)))
-        st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
-        st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
+        st.exp_avg_q = self._to_host(q_m, st.exp_avg_q)
+        st.exp_avg_scale = self._to_host(sc_m, st.exp_avg_scale)
+        st.exp_avg_sq_q = self._to_host(q_sv, st.exp_avg_sq_q)
+        st.exp_avg_sq_scale = self._to_host(sc_sv, st.exp_avg_sq_scale)
 
     @torch.no_grad()
     def _step_parameter(self, param: torch.nn.Parameter) -> None:
@@ -419,10 +450,10 @@ class LayerWise8BitGaLoreEngine:
         #    Note: exp_avg_sq_q stores the root second moment sqrt(V_{t-1}) in uint8 so its dynamic
         #    range matches M_{t-1} (preventing <4.4% coordinate underflow to 0 and 10^5x step spikes).
         m_t = dequantize_signed_int8(
-            st.exp_avg_q.to(grad.device), st.exp_avg_scale.to(grad.device)
+            self._to_device(st.exp_avg_q, grad.device), self._to_device(st.exp_avg_scale, grad.device)
         )
         sqrt_v_prev = dequantize_sqrt_v_log8(
-            st.exp_avg_sq_q.to(grad.device), st.exp_avg_sq_scale.to(grad.device)
+            self._to_device(st.exp_avg_sq_q, grad.device), self._to_device(st.exp_avg_sq_scale, grad.device)
         )
         v_t = sqrt_v_prev * sqrt_v_prev
 
@@ -434,8 +465,10 @@ class LayerWise8BitGaLoreEngine:
         # Quantize updated moments (M_t and sqrt(V_t)) to 8-bit before transferring to Host RAM
         q_m, sc_m = quantize_signed_int8_sr(m_t)
         q_sv, sc_sv = quantize_sqrt_v_log8_sr(sqrt_v_t)
-        st.exp_avg_q, st.exp_avg_scale = q_m.cpu(), sc_m.cpu()
-        st.exp_avg_sq_q, st.exp_avg_sq_scale = q_sv.cpu(), sc_sv.cpu()
+        st.exp_avg_q = self._to_host(q_m, st.exp_avg_q)
+        st.exp_avg_scale = self._to_host(sc_m, st.exp_avg_scale)
+        st.exp_avg_sq_q = self._to_host(q_sv, st.exp_avg_sq_q)
+        st.exp_avg_sq_scale = self._to_host(sc_sv, st.exp_avg_sq_scale)
 
         # 4. Bias-corrected low-rank update and projection back to full parameter space: P_t @ N_t
         bias_corr1 = 1.0 - (beta1 ** st.step)

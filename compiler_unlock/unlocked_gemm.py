@@ -107,6 +107,8 @@ def unlocked_bf16_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             c.stride(0), c.stride(1),
         )
         return c
+    if a.is_cuda and b.is_cuda and a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16:
+        return torch.matmul(a, b)
     return (a.to(torch.float32) @ b.to(torch.float32)).to(torch.bfloat16)
 
 

@@ -17,7 +17,8 @@ Implements:
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List
+import subprocess
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -64,7 +65,13 @@ class ClosedLoopHardwareGovernor:
         clock_sag_threshold: float = 0.02,
     ) -> None:
         self.arch = arch
-        self.locked_clock_floor_mhz = 2520.0 if arch.upper() == "AD102" else 1920.0
+        arch_upper = arch.upper()
+        if arch_upper == "AD102":
+            self.locked_clock_floor_mhz = 2520.0
+        elif arch_upper in ("AD107", "RTX_4060_LAPTOP"):
+            self.locked_clock_floor_mhz = 1800.0
+        else:
+            self.locked_clock_floor_mhz = 1920.0
         self.tau_sieve = initial_tau_sieve
         self.tau_min = tau_min
         self.tau_max = tau_max
@@ -97,7 +104,12 @@ class ClosedLoopHardwareGovernor:
         # a NaN clock reading into sag_frac = 0.0 <= 0.01 and trigger RELAX_SIEVE_-2%_RESTORE_DENSITY. Guard finite
         # telemetry explicitly so non-finite readings hold tau_sieve, matching C nvrm_poll_and_adjust_sieve.
         governor_action = "HOLD"
-        floor_mhz = sample.locked_clock_floor_mhz if sample.locked_clock_floor_mhz > 0.0 else self.locked_clock_floor_mhz
+        if not math.isfinite(sample.locked_clock_floor_mhz):
+            floor_mhz = float("nan")
+        elif sample.locked_clock_floor_mhz > 0.0:
+            floor_mhz = sample.locked_clock_floor_mhz
+        else:
+            floor_mhz = self.locked_clock_floor_mhz
         telemetry_finite = (
             math.isfinite(floor_mhz)
             and math.isfinite(sample.effective_sm_clock_mhz)
@@ -142,6 +154,72 @@ class ClosedLoopHardwareGovernor:
         }
 
 
+def poll_live_gpu_telemetry(
+    layer_idx: int = 0,
+    gpu_ready_seq: int = 0,
+    cpu_done_seq: int = 0,
+    gpu_index: int = 0,
+    locked_clock_floor_mhz: float = 0.0,
+    fallback_power_cap_watts: float = 45.0,
+) -> Optional[HardwareTelemetrySample]:
+    """
+    Polls live GPU memory, SM clock, and board power telemetry via nvidia-smi on Windows or Linux.
+    Returns None when nvidia-smi is unavailable or fails.
+    """
+    def _parse_float(tok: str, default: float) -> float:
+        s = tok.strip()
+        if not s or s.upper() in ("[N/A]", "N/A", "[NOT SUPPORTED]"):
+            return default
+        try:
+            return float(s)
+        except ValueError:
+            return default
+
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,clocks.sm,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+                "-i",
+                str(gpu_index),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    line = proc.stdout.strip().splitlines()
+    if not line:
+        return None
+    parts = line[0].split(",")
+    if len(parts) < 5:
+        return None
+
+    vram_used_gb = _parse_float(parts[0], 0.0) / 1024.0
+    vram_total_gb = _parse_float(parts[1], 0.0) / 1024.0
+    sm_clock_mhz = _parse_float(parts[2], float("nan"))
+    power_draw_w = _parse_float(parts[3], float("nan"))
+    power_cap_w = _parse_float(parts[4], fallback_power_cap_watts)
+    if power_cap_w <= 0.0:
+        power_cap_w = fallback_power_cap_watts
+
+    return HardwareTelemetrySample(
+        layer_idx=layer_idx,
+        gpu_ready_seq=gpu_ready_seq,
+        cpu_done_seq=cpu_done_seq,
+        vram_used_gb=vram_used_gb,
+        vram_capacity_gb=vram_total_gb,
+        effective_sm_clock_mhz=sm_clock_mhz,
+        locked_clock_floor_mhz=locked_clock_floor_mhz,
+        board_power_watts=power_draw_w,
+        power_cap_watts=power_cap_w,
+    )
+
+
 def main() -> None:
     print("================================================================================")
     print("  WORKSTREAM 7B: CLOSED-LOOP TELEMETRY GOVERNOR (CHORUS + NVRM CLOCK ARBITRATION)")
@@ -179,6 +257,10 @@ def main() -> None:
         HardwareTelemetrySample(64, 24, 24, 18.0, 24.0, float("nan"), 2520.0, 350.0, 450.0)
     )
     assert r_nan["governor_action"] == "HOLD" and gov.tau_sieve == tau_before, r_nan
+    r_nan_floor = gov.route_moe_and_regulate_sieve(
+        HardwareTelemetrySample(64, 24, 24, 18.0, 24.0, 2520.0, float("nan"), 350.0, 450.0)
+    )
+    assert r_nan_floor["governor_action"] == "HOLD" and gov.tau_sieve == tau_before, r_nan_floor
     print("[+] PASS: Closed-loop Chorus AMX offload routing and NVRM clock-sag governor verified.")
 
 

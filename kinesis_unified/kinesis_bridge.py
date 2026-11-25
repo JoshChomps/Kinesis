@@ -521,7 +521,7 @@ def convert_hf_transformer_layer_to_sub2bit(
     r_kron, r_p, k_init, k_h16, k_kron = optimize_kronecker_stiefel_rotation(
         h_pre, q_hadamard=16, steps=15, lr=0.25
     )
-    r_prev_absorb = torch.kron(r_p, torch.eye(16, dtype=torch.float32))
+    r_prev_absorb = torch.kron(r_p, torch.eye(16, dtype=torch.float32, device=r_p.device))
     w_o_absorbed = (r_prev_absorb.T @ w_o).to(torch.bfloat16)
 
     # Rotate MLP weights offline by R_kron: W_rot [N, K] = W @ R_kron; transpose to [K, N] for GotoBLAS panels

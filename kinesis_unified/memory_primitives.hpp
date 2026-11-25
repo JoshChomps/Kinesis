@@ -1,5 +1,5 @@
 // File: kinesis_unified/memory_primitives.hpp
-// Unified & Hardened Memory Subsystem pulled from AI_Library (Kinesis) into .Unified_Hardware_Accel.
+// Unified & Hardened Memory Subsystem for Kinesis.
 // Fixes applied over original AI_Library:
 //   1. Prefaulted + Page-Locked OS VirtualMemory (VirtualLock / mlock + 4KB page-stride touch)
 //      to eliminate 4x first-touch page-fault latency spikes in hot loops (Design Review §1.10, T1).

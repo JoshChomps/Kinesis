@@ -228,7 +228,7 @@ def lserve_sparse_hadamard_attention(
     q_rot = q.to(torch.float32) @ h_mat  # [B, H, Sq, D]
 
     if streaming_head_mask is not None:
-        stream_mask = streaming_head_mask.to(torch.bool)
+        stream_mask = streaming_head_mask.to(device=q.device, dtype=torch.bool)
     else:
         n_stream = min(H, max(0, int(H * streaming_head_ratio)))
         stream_mask = torch.zeros(H, dtype=torch.bool, device=q.device)

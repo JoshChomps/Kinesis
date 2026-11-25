@@ -1,6 +1,6 @@
 // File: kinesis_unified/sub2bit_gemm_and_smart_cache.hpp
 // Unified CPU + Single-GPU Smart Cache & Sub-2-Bit AVX2 GotoBLAS Engine.
-// Fuses AI_Library (Kinesis) with .Unified_Hardware_Accel:
+// Unifies Kinesis C++20 runtime with sub-2-bit AVX2 and SmartTieredCache kernels:
 //   1. Upgrades Kinesis's 1x8 B-only GEMM into a true 4x8 Register-Blocked GotoBLAS AVX2 FMA
 //      micro-kernel with live CPUID cache blocking (KC, MC, NC), cutting L1 B-loads by 4x.
 //   2. Adds Sub-2-Bit GotoBLAS Micro-Panel Packing (1.125-bit Binary W1 & 2.125-bit Ternary W2)

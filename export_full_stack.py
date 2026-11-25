@@ -65,9 +65,11 @@ SOURCE_FILES = [
     ("hetero_runtime/closed_loop_governor.c", "c"),
     ("hetero_runtime/closed_loop_governor.py", "python"),
     ("e2e_transformer_pipeline.py", "python"),
+    ("verify_windows_gpu.py", "python"),
     ("run_all_tests.py", "python"),
     ("Makefile", "makefile"),
     ("verify_bare_metal.sh", "bash"),
+    ("verify_windows_gpu.ps1", "powershell"),
 ]
 
 

@@ -329,6 +329,11 @@ def run_hygiene_audit(root_dir: str) -> Tuple[bool, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run all UHA verification suites.")
     parser.add_argument("--jobs", "-j", type=int, default=8, help="Parallel worker count")
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Also run Suite G2 (live CUDA GPU verification & 8GB QAT+GaLore benchmark)",
+    )
     args = parser.parse_args()
 
     root_dir = os.path.dirname(os.path.abspath(__file__))
@@ -338,12 +343,24 @@ def main() -> int:
     print("UNIFIED HARDWARE ACCEL (UHA) -- MASTER BUILD & VERIFICATION PROTOCOL")
     print("================================================================================")
 
+    active_suites = list(SUITES)
+    if args.gpu:
+        active_suites.append(
+            VerificationSuite(
+                suite_id="G2",
+                workstream="WS-G (Live CUDA GPU)",
+                name="Live Windows/Linux CUDA GPU Verification & 8GB QAT+GaLore Benchmark",
+                build_cmd=None,
+                run_cmd=[sys.executable, "verify_windows_gpu.py"],
+            )
+        )
+
     total_start = time.perf_counter()
-    # Pre-build the shared C++20 ABI library once so F2 and G1 do not race on DLL creation
+    # Pre-build the shared C++20 ABI library once so F2, G1, and G2 do not race on DLL creation
     from kinesis_unified.kinesis_bridge import build_or_locate_kinesis_shared_lib
     build_or_locate_kinesis_shared_lib()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        results = list(pool.map(run_single_suite, SUITES))
+        results = list(pool.map(run_single_suite, active_suites))
 
     for suite_id, workstream, name, ok, dt, out in results:
         status_str = "PASS" if ok else "FAIL"
