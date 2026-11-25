@@ -41,6 +41,8 @@ for subdir in (
 from unlocked_gemm import unlocked_bf16_gemm  # noqa: E402
 from spinquant_packer import (  # noqa: E402
     build_kernel_online_rotation,
+    fused_w1_g128_gemm,
+    fused_w2_ternary_gemm,
     optimize_kronecker_stiefel_rotation,
     quantize_and_pack_w1_g128_interleaved,
     unpack_w1_g128_lop3_reference,
@@ -173,6 +175,11 @@ def main() -> int:
     cos_w1 = float(torch.nn.functional.cosine_similarity(y_w1.float().flatten(), y_gt.flatten(), dim=0).item())
     cos_w2 = float(torch.nn.functional.cosine_similarity(y_w2.float().flatten(), y_gt.flatten(), dim=0).item())
     assert cos_w1 > 0.75 and cos_w2 > 0.85, (cos_w1, cos_w2)
+    y_w1_fus = fused_w1_g128_gemm(x_rot, p1, s1)
+    y_w2_fus = fused_w2_ternary_gemm(x_rot, p2, s2)
+    fus_err1 = float((y_w1_fus.float() - y_w1.float()).norm().item() / (y_w1.float().norm().item() + 1e-8))
+    fus_err2 = float((y_w2_fus.float() - y_w2.float()).norm().item() / (y_w2.float().norm().item() + 1e-8))
+    assert fus_err1 < 1.5e-2 and fus_err2 < 1.5e-2, (fus_err1, fus_err2)
 
     for mode in (1, 2):
         r_online = build_kernel_online_rotation(256, mode=mode, device=dev)
@@ -207,6 +214,19 @@ def main() -> int:
             y_pack = unlocked_bf16_gemm(x_3d_nc.detach().reshape(-1, 512), uf.T).reshape_as(y_fl)
             fl_rel = float((y_fl.detach().float() - y_pack.float()).norm().item() / (y_pack.float().norm().item() + 1e-8))
         assert fl_rel < 1.0e-2, f"FusedQAT vs packed CUDA mismatch: {fl_rel}"
+
+    # Verify fused W2 Ternary (b1.58) FusedQATG128Linear on CUDA (Triton + fallback)
+    fl_w2 = FusedQATG128Linear(512, 256, clip_mult=2.5, device=dev, master_dtype=torch.bfloat16, fmt="w2")
+    x_w2 = torch.randn((19, 512), device=dev, dtype=torch.bfloat16, requires_grad=True)
+    y_w2_qat = fl_w2(x_w2)
+    y_w2_qat.float().pow(2).mean().backward()
+    assert bool(torch.isfinite(y_w2_qat).all().item()) and bool(torch.isfinite(x_w2.grad).all().item())
+    p_w2q, s_w2q = quantize_and_pack_w2_ternary_interleaved(fl_w2.packer_input_weight())
+    u_w2q = unpack_w2_ternary_lop3_reference(p_w2q, s_w2q)
+    with torch.no_grad():
+        y_w2_ref_q = unlocked_bf16_gemm(x_w2.detach(), u_w2q.T)
+        w2_rel = float((y_w2_qat.detach().float() - y_w2_ref_q.float()).norm().item() / (y_w2_ref_q.float().norm().item() + 1e-8))
+    assert w2_rel < 1.5e-2, f"FusedQAT W2 CUDA mismatch: {w2_rel}"
 
     print(
         f"[2] SpinQuant + QAT Parity (CUDA) : Kurtosis {k_init:.2f} -> {k_h16:.2f} -> {k_kron:.2f} | "
@@ -251,6 +271,21 @@ def main() -> int:
     kv_ext = quantize_kv_pages_int4_hadamard(k_ext_nc, v_ext_nc, page_size=64)
     out_ext, _ = lserve_sparse_hadamard_attention(q_ext_nc, kv_ext, top_k_pages=2, sink_pages=1, local_pages=1, streaming_head_ratio=0.5)
     assert bool(torch.isfinite(out_ext).all().item())
+
+    # Persistent channel-outlier Keys on CUDA: per_channel UINT4 causal LServe
+    k_ch = torch.randn((1, 4, 256, 64), dtype=torch.bfloat16, device=dev) * 0.6
+    v_ch = torch.randn((1, 4, 256, 64), dtype=torch.bfloat16, device=dev) * 0.25
+    q_ch = torch.randn((1, 4, 128, 64), dtype=torch.bfloat16, device=dev)
+    k_ch[:, :, :, 0] = 120.0
+    k_ch[:, :, :, 1] = -95.0
+    kv_pch = quantize_kv_pages_int4_hadamard(k_ch, v_ch, page_size=64, key_quant_mode="per_channel")
+    out_pch, _ = lserve_sparse_hadamard_attention(q_ch, kv_pch, top_k_pages=4, sink_pages=1, local_pages=2, is_causal=True)
+    qp_ch = torch.arange(128, device=dev).unsqueeze(1)
+    kp_ch = torch.arange(256, device=dev).unsqueeze(0)
+    sc_ch_ref = (q_ch.float() @ k_ch.float().transpose(-1, -2)) / math.sqrt(64)
+    out_ch_ref = (torch.softmax(sc_ch_ref.masked_fill(kp_ch > qp_ch, float("-inf")), dim=-1) @ v_ch.float()).to(torch.bfloat16)
+    cos_pch = float(torch.nn.functional.cosine_similarity(out_pch.float().flatten(), out_ch_ref.float().flatten(), dim=0).item())
+    assert cos_pch > 0.98, f"per_channel CUDA causal LServe failed: {cos_pch}"
 
     x_sieve = x_rot.clone()
     x_sieve[:, 128:256] *= 0.005

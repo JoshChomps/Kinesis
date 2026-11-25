@@ -52,6 +52,83 @@ class HardwareTelemetrySample:
         return max(0.0, (self.locked_clock_floor_mhz - self.effective_sm_clock_mhz) / self.locked_clock_floor_mhz)
 
 
+def _infer_arch_and_floor(gpu_name: str, max_sm_mhz: float) -> tuple[str, float]:
+    name_up = gpu_name.upper()
+    if "AD102" in name_up or "4090" in name_up or "L40" in name_up:
+        return "AD102", 2520.0
+    if "AD107" in name_up or "4060" in name_up or "4070" in name_up or "4050" in name_up:
+        return "AD107", 1800.0
+    if "GB202" in name_up or "5090" in name_up:
+        return "GB202", 2400.0
+    if "GA102" in name_up or "3090" in name_up or "3080" in name_up or "A6000" in name_up:
+        return "GA102", 1920.0
+    if "A100" in name_up:
+        return "GA100", 1410.0
+    if "H100" in name_up or "H200" in name_up:
+        return "GH100", 1830.0
+    if math.isfinite(max_sm_mhz) and max_sm_mhz > 0.0:
+        return "GENERIC", round(0.75 * max_sm_mhz, 1)
+    return "GENERIC", 1920.0
+
+
+def detect_live_gpu_profile(gpu_index: int = 0) -> Optional[Dict[str, object]]:
+    """
+    Auto-detects active NVIDIA GPU name, architecture tier, conservative locked clock floor,
+    rated power limit, and VRAM capacity via nvidia-smi. Returns None if unavailable.
+    """
+    def _pf(tok: str) -> float:
+        s = tok.strip()
+        if not s or s.upper() in ("[N/A]", "N/A", "[NOT SUPPORTED]"):
+            return float("nan")
+        try:
+            return float(s)
+        except ValueError:
+            return float("nan")
+
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,clocks.max.sm,power.limit,power.default_limit,memory.total",
+                "--format=csv,noheader,nounits",
+                "-i",
+                str(gpu_index),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.strip().splitlines()
+    if not lines:
+        return None
+    parts = [p.strip() for p in lines[0].split(",")]
+    if len(parts) < 5:
+        return None
+
+    gpu_name = parts[0]
+    max_sm_mhz = _pf(parts[1])
+    power_lim_w = _pf(parts[2])
+    power_def_w = _pf(parts[3])
+    vram_total_mib = _pf(parts[4])
+
+    arch_tag, floor_mhz = _infer_arch_and_floor(gpu_name, max_sm_mhz)
+    cap_w = power_lim_w if (math.isfinite(power_lim_w) and power_lim_w > 0.0) else (
+        power_def_w if (math.isfinite(power_def_w) and power_def_w > 0.0) else None
+    )
+    return {
+        "gpu_name": gpu_name,
+        "arch": arch_tag,
+        "locked_clock_floor_mhz": floor_mhz,
+        "max_sm_clock_mhz": max_sm_mhz,
+        "power_cap_watts": cap_w,
+        "vram_capacity_gb": (vram_total_mib / 1024.0) if math.isfinite(vram_total_mib) else float("nan"),
+    }
+
+
 class ClosedLoopHardwareGovernor:
     def __init__(
         self,
@@ -63,14 +140,29 @@ class ClosedLoopHardwareGovernor:
         vram_watermark: float = 0.80,
         clock_poll_interval_layers: int = 16,
         clock_sag_threshold: float = 0.02,
+        gpu_index: int = 0,
     ) -> None:
-        self.arch = arch
         arch_upper = arch.upper()
-        if arch_upper == "AD102":
+        self.detected_gpu_name: Optional[str] = None
+        self.detected_power_cap_watts: Optional[float] = None
+        if arch_upper == "AUTO":
+            prof = detect_live_gpu_profile(gpu_index=gpu_index)
+            if prof is not None:
+                self.arch = str(prof["arch"])
+                self.locked_clock_floor_mhz = float(prof["locked_clock_floor_mhz"])
+                self.detected_gpu_name = str(prof["gpu_name"])
+                self.detected_power_cap_watts = prof["power_cap_watts"]  # type: ignore[assignment]
+            else:
+                self.arch = "GENERIC"
+                self.locked_clock_floor_mhz = 1920.0
+        elif arch_upper == "AD102":
+            self.arch = arch
             self.locked_clock_floor_mhz = 2520.0
         elif arch_upper in ("AD107", "RTX_4060_LAPTOP"):
+            self.arch = arch
             self.locked_clock_floor_mhz = 1800.0
         else:
+            self.arch = arch
             self.locked_clock_floor_mhz = 1920.0
         self.tau_sieve = initial_tau_sieve
         self.tau_min = tau_min
@@ -160,7 +252,7 @@ def poll_live_gpu_telemetry(
     cpu_done_seq: int = 0,
     gpu_index: int = 0,
     locked_clock_floor_mhz: float = 0.0,
-    fallback_power_cap_watts: float = 45.0,
+    fallback_power_cap_watts: Optional[float] = None,
 ) -> Optional[HardwareTelemetrySample]:
     """
     Polls live GPU memory, SM clock, and board power telemetry via nvidia-smi on Windows or Linux.
@@ -179,7 +271,7 @@ def poll_live_gpu_telemetry(
         proc = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=memory.used,memory.total,clocks.sm,power.draw,power.limit",
+                "--query-gpu=memory.used,memory.total,clocks.sm,power.draw,power.limit,power.default_limit",
                 "--format=csv,noheader,nounits",
                 "-i",
                 str(gpu_index),
@@ -203,9 +295,15 @@ def poll_live_gpu_telemetry(
     vram_total_gb = _parse_float(parts[1], 0.0) / 1024.0
     sm_clock_mhz = _parse_float(parts[2], float("nan"))
     power_draw_w = _parse_float(parts[3], float("nan"))
-    power_cap_w = _parse_float(parts[4], fallback_power_cap_watts)
-    if power_cap_w <= 0.0:
-        power_cap_w = fallback_power_cap_watts
+    power_cap_w = _parse_float(parts[4], float("nan"))
+    default_cap_w = _parse_float(parts[5], float("nan")) if len(parts) > 5 else float("nan")
+    if not (math.isfinite(power_cap_w) and power_cap_w > 0.0):
+        if fallback_power_cap_watts is not None and fallback_power_cap_watts > 0.0:
+            power_cap_w = float(fallback_power_cap_watts)
+        elif math.isfinite(default_cap_w) and default_cap_w > 0.0:
+            power_cap_w = default_cap_w
+        else:
+            power_cap_w = 45.0
 
     return HardwareTelemetrySample(
         layer_idx=layer_idx,
@@ -261,6 +359,11 @@ def main() -> None:
         HardwareTelemetrySample(64, 24, 24, 18.0, 24.0, 2520.0, float("nan"), 350.0, 450.0)
     )
     assert r_nan_floor["governor_action"] == "HOLD" and gov.tau_sieve == tau_before, r_nan_floor
+    gov_auto = ClosedLoopHardwareGovernor(arch="AUTO")
+    assert math.isfinite(gov_auto.locked_clock_floor_mhz) and gov_auto.locked_clock_floor_mhz > 0.0
+    assert _infer_arch_and_floor("NVIDIA GeForce RTX 4060 Laptop GPU", 3105.0) == ("AD107", 1800.0)
+    assert _infer_arch_and_floor("NVIDIA RTX 4090", 2520.0) == ("AD102", 2520.0)
+    print(f"[+] AUTO governor profile: arch={gov_auto.arch}, floor={gov_auto.locked_clock_floor_mhz:.0f} MHz, gpu={gov_auto.detected_gpu_name}")
     print("[+] PASS: Closed-loop Chorus AMX offload routing and NVRM clock-sag governor verified.")
 
 

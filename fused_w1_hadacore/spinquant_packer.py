@@ -13,6 +13,13 @@ Implements:
 from typing import Tuple
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 
 def build_hadamard_matrix(n: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
     """Constructs a normalized n x n Sylvester Walsh-Hadamard matrix H_n with H_n @ H_n^T = I."""
@@ -325,6 +332,177 @@ def unpack_w2_ternary_lop3_reference(
     return scaled.view(N, K)
 
 
+if HAS_TRITON:
+    @triton.jit
+    def fused_w1_g128_gemm_kernel(
+        x_ptr, pw_ptr, sc_ptr, y_ptr,
+        M, N, K,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_sn, stride_sk,
+        stride_ym, stride_yn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        word_in_grp = offs_k >> 5
+        bit_pos = ((offs_k >> 1) & 15) + ((offs_k & 1) * 16)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        num_groups = K // BLOCK_K
+        for g in range(0, num_groups):
+            x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (g * BLOCK_K + offs_k[None, :]) * stride_xk
+            x_mask = (offs_m[:, None] < M) & ((g * BLOCK_K + offs_k[None, :]) < K)
+            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.bfloat16)
+
+            pw_ptrs = pw_ptr + offs_n[:, None] * stride_wn + (g * 4 + word_in_grp[None, :]) * stride_wk
+            pw_mask = (offs_n[:, None] < N) & ((g * 4 + word_in_grp[None, :]) < (K // 32))
+            p_tile = tl.load(pw_ptrs, mask=pw_mask, other=0)
+
+            sc_ptrs = sc_ptr + offs_n * stride_sn + g * stride_sk
+            s_tile = tl.load(sc_ptrs, mask=(offs_n < N), other=0.0).to(tl.bfloat16)
+
+            sign_bit = (p_tile >> bit_pos[None, :]) & 1
+            w_bf16 = tl.where(sign_bit != 0, s_tile[:, None], -s_tile[:, None])
+            acc = tl.dot(x_tile, tl.trans(w_bf16), acc=acc, out_dtype=tl.float32)
+
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(y_ptrs, acc.to(tl.bfloat16), mask=y_mask)
+
+    @triton.jit
+    def fused_w2_ternary_gemm_kernel(
+        x_ptr, pw_ptr, sc_ptr, y_ptr,
+        M, N, K,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_sn, stride_sk,
+        stride_ym, stride_yn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+        word_in_grp = offs_k >> 4
+        bit_pos = (((offs_k >> 1) & 7) * 2) + ((offs_k & 1) * 16)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        num_groups = K // BLOCK_K
+        for g in range(0, num_groups):
+            x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (g * BLOCK_K + offs_k[None, :]) * stride_xk
+            x_mask = (offs_m[:, None] < M) & ((g * BLOCK_K + offs_k[None, :]) < K)
+            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.bfloat16)
+
+            pw_ptrs = pw_ptr + offs_n[:, None] * stride_wn + (g * 8 + word_in_grp[None, :]) * stride_wk
+            pw_mask = (offs_n[:, None] < N) & ((g * 8 + word_in_grp[None, :]) < (K // 16))
+            p_tile = tl.load(pw_ptrs, mask=pw_mask, other=0)
+
+            sc_ptrs = sc_ptr + offs_n * stride_sn + g * stride_sk
+            s_tile = tl.load(sc_ptrs, mask=(offs_n < N), other=0.0).to(tl.float32)
+
+            code = ((p_tile >> bit_pos[None, :]) & 3).to(tl.float32) - 1.0
+            w_bf16 = (code * s_tile[:, None]).to(tl.bfloat16)
+            acc = tl.dot(x_tile, tl.trans(w_bf16), acc=acc, out_dtype=tl.float32)
+
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(y_ptrs, acc.to(tl.bfloat16), mask=y_mask)
+
+
+def _select_packed_gemm_launch(device: torch.device, M: int) -> Tuple[int, int, int]:
+    block_m = 16 if M <= 16 else (32 if M <= 32 else 64)
+    block_n = 64
+    if not torch.cuda.is_available() or device.type != "cuda":
+        return block_m, block_n, 1
+    dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(dev_idx)
+    smem_limit = int(
+        getattr(props, "shared_memory_per_block_optin", 0)
+        or getattr(props, "shared_memory_per_block", 49152)
+    )
+    # x_tile [BM, 128] bf16 + p_tile [64, 128] int32 (32 KB)
+    stage_bytes = (block_m * 128 * 2) + (block_n * 128 * 4)
+    num_stages = 2 if (2 * stage_bytes <= smem_limit) else 1
+    return block_m, block_n, num_stages
+
+
+def fused_w1_g128_gemm(
+    x_bf16: torch.Tensor,
+    packed_w1: torch.Tensor,
+    scales_bf16: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Zero-materialization inference GEMM Y = X @ W_hat^T directly from 1.125 bpw W1 packed words.
+    """
+    assert x_bf16.ndim == 2 and packed_w1.ndim == 2
+    M, K = x_bf16.shape
+    N, k_words = packed_w1.shape
+    assert K == k_words * 32 and K % 128 == 0
+    if HAS_TRITON and x_bf16.is_cuda and packed_w1.is_cuda:
+        pw_i32 = packed_w1.view(torch.int32)
+        sc = scales_bf16.to(torch.bfloat16)
+        y = torch.empty((M, N), device=x_bf16.device, dtype=torch.bfloat16)
+        bm, bn, stages = _select_packed_gemm_launch(x_bf16.device, M)
+        grid = (triton.cdiv(M, bm), triton.cdiv(N, bn))
+        fused_w1_g128_gemm_kernel[grid](
+            x_bf16, pw_i32, sc, y,
+            M, N, K,
+            x_bf16.stride(0), x_bf16.stride(1),
+            pw_i32.stride(0), pw_i32.stride(1),
+            sc.stride(0), sc.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, num_stages=stages,
+        )
+        return y
+    w_bf16 = unpack_w1_g128_lop3_reference(packed_w1, scales_bf16)
+    if x_bf16.is_cuda and w_bf16.is_cuda and x_bf16.dtype == torch.bfloat16:
+        return torch.matmul(x_bf16, w_bf16.T)
+    return (x_bf16.to(torch.float32) @ w_bf16.to(torch.float32).T).to(torch.bfloat16)
+
+
+def fused_w2_ternary_gemm(
+    x_bf16: torch.Tensor,
+    packed_w2: torch.Tensor,
+    scales_bf16: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Zero-materialization inference GEMM Y = X @ W_hat^T directly from 2.125 bpw W2 ternary packed words.
+    """
+    assert x_bf16.ndim == 2 and packed_w2.ndim == 2
+    M, K = x_bf16.shape
+    N, k_words = packed_w2.shape
+    assert K == k_words * 16 and K % 128 == 0
+    if HAS_TRITON and x_bf16.is_cuda and packed_w2.is_cuda:
+        pw_i32 = packed_w2.view(torch.int32)
+        sc = scales_bf16.to(torch.bfloat16)
+        y = torch.empty((M, N), device=x_bf16.device, dtype=torch.bfloat16)
+        bm, bn, stages = _select_packed_gemm_launch(x_bf16.device, M)
+        grid = (triton.cdiv(M, bm), triton.cdiv(N, bn))
+        fused_w2_ternary_gemm_kernel[grid](
+            x_bf16, pw_i32, sc, y,
+            M, N, K,
+            x_bf16.stride(0), x_bf16.stride(1),
+            pw_i32.stride(0), pw_i32.stride(1),
+            sc.stride(0), sc.stride(1),
+            y.stride(0), y.stride(1),
+            BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, num_stages=stages,
+        )
+        return y
+    w_bf16 = unpack_w2_ternary_lop3_reference(packed_w2, scales_bf16)
+    if x_bf16.is_cuda and w_bf16.is_cuda and x_bf16.dtype == torch.bfloat16:
+        return torch.matmul(x_bf16, w_bf16.T)
+    return (x_bf16.to(torch.float32) @ w_bf16.to(torch.float32).T).to(torch.bfloat16)
+
+
 def main() -> None:
     print("================================================================================")
     print("  WORKSTREAM 3: SPINQUANT CAYLEY-SGD ROTATION & INTERLEAVED BIT-PACKER")
@@ -417,6 +595,20 @@ def main() -> None:
     codes = [(word0 >> (2 * (k // 2) + 16 * (k % 2))) & 3 for k in (3, 4, 5)]
     assert codes == [2, 0, 1], codes
     print(f"[8] W2 packer non-finite weights (+Inf, -Inf, NaN) -> codes {codes} (want [2, 0, 1]) -> PASS")
+
+    # [9] Fused W1 / W2 packed inference GEMM parity (reads uint32/int32 packed words directly)
+    xg_inf = torch.randn((17, 256), dtype=torch.bfloat16)
+    wg_inf = torch.randn((128, 256), dtype=torch.float32)
+    pw1_g, sc1_g = quantize_and_pack_w1_g128_interleaved(wg_inf)
+    pw2_g, sc2_g = quantize_and_pack_w2_ternary_interleaved(wg_inf)
+    y1_fus = fused_w1_g128_gemm(xg_inf, pw1_g, sc1_g)
+    y1_ref = (xg_inf.float() @ unpack_w1_g128_lop3_reference(pw1_g, sc1_g).float().T).to(torch.bfloat16)
+    y2_fus = fused_w2_ternary_gemm(xg_inf, pw2_g, sc2_g)
+    y2_ref = (xg_inf.float() @ unpack_w2_ternary_lop3_reference(pw2_g, sc2_g).float().T).to(torch.bfloat16)
+    e1_g = float((y1_fus.float() - y1_ref.float()).norm() / (y1_ref.float().norm() + 1e-8))
+    e2_g = float((y2_fus.float() - y2_ref.float()).norm() / (y2_ref.float().norm() + 1e-8))
+    assert e1_g < 1.5e-2 and e2_g < 1.5e-2, (e1_g, e2_g)
+    print(f"[9] Fused W1/W2 packed inference GEMM parity: W1_rel={e1_g:.3e}, W2_rel={e2_g:.3e} -> PASS")
 
 
 if __name__ == "__main__":

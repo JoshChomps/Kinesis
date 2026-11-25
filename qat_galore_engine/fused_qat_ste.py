@@ -42,6 +42,60 @@ def _check_clip_mult(clip_mult: float) -> float:
         )
     return c
 
+
+_TRITON_STAGE_CACHE = {}
+
+
+def select_triton_num_stages(
+    device: torch.device,
+    w_dtype: torch.dtype,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    is_bwd_dx: bool = False,
+    max_stages: int = 3,
+    smem_limit_override: int = None,
+) -> int:
+    """
+    Picks the largest Triton software-pipelining stage count (1..max_stages) whose staged input/weight
+    shared memory fits within the active CUDA device's opt-in per-block SRAM ceiling.
+    """
+    if smem_limit_override is None:
+        if not isinstance(device, torch.device) or device.type != "cuda":
+            return 2
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        cache_key = (dev_idx, w_dtype, block_m, block_n, block_k, is_bwd_dx, max_stages)
+        cached = _TRITON_STAGE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        props = torch.cuda.get_device_properties(dev_idx)
+        smem_limit = int(
+            getattr(props, "shared_memory_per_block_optin", 0)
+            or getattr(props, "shared_memory_per_block", 49152)
+        )
+    else:
+        cache_key = None
+        smem_limit = int(smem_limit_override)
+
+    w_bytes = 2 if w_dtype in (torch.bfloat16, torch.float16) else 4
+    if is_bwd_dx:
+        # dy_tile [BLOCK_M, BLOCK_N] in BF16 + w_tile [BLOCK_N, BLOCK_K] in w.dtype
+        stage_bytes = (block_m * block_n * 2) + (block_n * block_k * w_bytes)
+    else:
+        # x_tile [BLOCK_M, BLOCK_K] in BF16 + w_tile [BLOCK_N, BLOCK_K] in w.dtype
+        stage_bytes = (block_m * block_k * 2) + (block_n * block_k * w_bytes)
+
+    chosen = 1
+    for stages in range(max_stages, 0, -1):
+        if stages * stage_bytes <= smem_limit:
+            chosen = stages
+            break
+
+    if cache_key is not None:
+        _TRITON_STAGE_CACHE[cache_key] = chosen
+    return chosen
+
+
 try:
     import triton
     import triton.language as tl
@@ -61,6 +115,7 @@ if HAS_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,  # Must be 128 to align exactly with g128 group size
+        IS_TERNARY: tl.constexpr = False,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -78,14 +133,21 @@ if HAS_TRITON:
             w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < k_rem)
             # .to(bfloat16) is a no-op for BF16 inputs. For FP32 masters (master_dtype=float32, docs/12 4.25) it is
             # the same rounding the host reference applies; without it the kernel took alpha and the sign from the
-            # unrounded FP32 weight and fed tl.dot mixed dtypes. NOT RUN on this host (no Triton / CUDA here).
+            # unrounded FP32 weight and fed tl.dot mixed dtypes. Both launches query select_triton_num_stages() so
+            # pipeline depth adapts to the GPU's per-block SRAM ceiling (e.g. 3 stages for BF16, 2 for FP32 at 99 KB).
             x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.bfloat16)
             w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.bfloat16)  # Shape: [BLOCK_N, 128] in BF16
             # On-the-fly g128 absmean scale calculation inside registers/SRAM
             w_fp32 = w_tile.to(tl.float32)
-            alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
-            # Branchless register sign quantization: +alpha if w >= 0 else -alpha
-            w_quant = tl.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
+            if IS_TERNARY:
+                alpha = tl.maximum(tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0), 1e-6).to(tl.bfloat16)
+                ratio = w_fp32 / alpha.to(tl.float32)[:, None]
+                trit = tl.where(ratio > 0.5, 1.0, tl.where(ratio < -0.5, -1.0, 0.0))
+                w_quant = (trit * alpha.to(tl.float32)[:, None]).to(tl.bfloat16)
+            else:
+                alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
+                # Branchless register sign quantization: +alpha if w >= 0 else -alpha
+                w_quant = tl.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
             # Issue unlocked HMMA.16816.F32 Tensor Core MMA
             acc = tl.dot(x_tile, tl.trans(w_quant), acc=acc, out_dtype=tl.float32)
             x_ptrs += BLOCK_K * stride_xk
@@ -107,6 +169,7 @@ if HAS_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_K: tl.constexpr,  # Fixed to 128 (g128 group dimension)
         BLOCK_N: tl.constexpr,
+        IS_TERNARY: tl.constexpr = False,
     ):
         pid_m = tl.program_id(0)
         pid_k = tl.program_id(1)  # Each program_id(1) handles one g128 K-group of size 128
@@ -125,8 +188,14 @@ if HAS_TRITON:
             dy_tile = tl.load(dy_ptrs, mask=dy_mask, other=0.0).to(tl.bfloat16)
             w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.bfloat16)  # [BLOCK_N, 128] - complete g128 groups
             w_fp32 = w_tile.to(tl.float32)
-            alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
-            w_quant = tl.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
+            if IS_TERNARY:
+                alpha = tl.maximum(tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0), 1e-6).to(tl.bfloat16)
+                ratio = w_fp32 / alpha.to(tl.float32)[:, None]
+                trit = tl.where(ratio > 0.5, 1.0, tl.where(ratio < -0.5, -1.0, 0.0))
+                w_quant = (trit * alpha.to(tl.float32)[:, None]).to(tl.bfloat16)
+            else:
+                alpha = (tl.sum(tl.abs(w_fp32), axis=1) * (1.0 / 128.0)).to(tl.bfloat16)
+                w_quant = tl.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
             # dX = dY @ W_quant -> [BLOCK_M, BLOCK_N] @ [BLOCK_N, 128]
             acc_dx = tl.dot(dy_tile, w_quant, acc=acc_dx, out_dtype=tl.float32)
             dy_ptrs += BLOCK_N * stride_dyn
@@ -137,8 +206,66 @@ if HAS_TRITON:
         mask = (offs_dxm[:, None] < M) & (offs_k[None, :] < K)
         tl.store(dx_ptrs, acc_dx.to(tl.bfloat16), mask=mask)
 
+    @triton.jit
+    def fused_qat_g128_bwd_dw_kernel(
+        dy_ptr, x_ptr, w_ptr, dw_ptr,
+        M, N, K,
+        stride_dym, stride_dyn,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_dwn, stride_dwk,
+        clip_mult,
+        USE_CLIP: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_n = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        offs_m = tl.arange(0, BLOCK_M)
 
-def sram_tiled_qat_fwd_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        dy_ptrs = dy_ptr + (offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn)
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+
+        for m in range(0, tl.cdiv(M, BLOCK_M)):
+            m_rem = M - m * BLOCK_M
+            dy_mask = (offs_m[:, None] < m_rem) & (offs_n[None, :] < N)
+            x_mask = (offs_m[:, None] < m_rem) & (offs_k[None, :] < K)
+            dy_tile = tl.load(dy_ptrs, mask=dy_mask, other=0.0).to(tl.bfloat16)
+            x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.bfloat16)
+            acc = tl.dot(tl.trans(dy_tile), x_tile, acc=acc, out_dtype=tl.float32)
+            dy_ptrs += BLOCK_M * stride_dym
+            x_ptrs += BLOCK_M * stride_xm
+
+        if USE_CLIP:
+            w_ptrs = w_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+            w_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+            w_tile = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.bfloat16)
+            w_abs = tl.abs(w_tile.to(tl.float32))
+            alpha_g = (tl.sum(w_abs, axis=1) * (1.0 / 128.0)).to(tl.bfloat16).to(tl.float32)
+            acc = tl.where(w_abs <= clip_mult * alpha_g[:, None], acc, 0.0)
+
+        dw_ptrs = dw_ptr + (offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk)
+        dw_mask = (offs_n[:, None] < N) & (offs_k[None, :] < K)
+        tl.store(dw_ptrs, acc.to(dw_ptr.dtype.element_ty), mask=dw_mask)
+
+
+def _quant_tile_bf16(w_tile: torch.Tensor, fmt: str = "w1") -> torch.Tensor:
+    w_fp32 = w_tile.to(torch.float32)
+    mean_abs = w_fp32.abs().sum(dim=1) * (1.0 / 128.0)
+    if fmt == "w2":
+        alpha = mean_abs.clamp(min=1e-6).to(torch.bfloat16)
+        ratio = w_fp32 / alpha.to(torch.float32)[:, None]
+        trit = torch.where(ratio > 0.5, 1.0, torch.where(ratio < -0.5, -1.0, 0.0))
+        return (trit * alpha.to(torch.float32)[:, None]).to(torch.bfloat16)
+    alpha = mean_abs.to(torch.bfloat16)
+    return torch.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
+
+
+def sram_tiled_qat_fwd_reference(x: torch.Tensor, w: torch.Tensor, fmt: str = "w1") -> torch.Tensor:
     """
     Simulates the exact tile-by-tile BLOCK_K=128 in-SRAM quantization and FP32 MMA accumulation
     of fused_qat_g128_fwd_kernel without allocating a global W_hat tensor.
@@ -150,13 +277,12 @@ def sram_tiled_qat_fwd_reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tens
     for k_start in range(0, K, 128):
         x_tile = x[:, k_start : k_start + 128].to(torch.bfloat16)
         w_tile = w[:, k_start : k_start + 128].to(torch.bfloat16)
-        alpha = (w_tile.to(torch.float32).abs().sum(dim=1) * (1.0 / 128.0)).to(torch.bfloat16)
-        w_quant = torch.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
+        w_quant = _quant_tile_bf16(w_tile, fmt=fmt)
         acc += x_tile.to(torch.float32) @ w_quant.to(torch.float32).T
     return acc.to(torch.bfloat16)
 
 
-def sram_tiled_qat_bwd_dx_reference(dy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def sram_tiled_qat_bwd_dx_reference(dy: torch.Tensor, w: torch.Tensor, fmt: str = "w1") -> torch.Tensor:
     """
     Simulates the exact BLOCK_K=128 in-SRAM recomputation of W_hat during the backward dX pass
     without saving W_hat from the forward pass or transposing W in global memory.
@@ -167,8 +293,7 @@ def sram_tiled_qat_bwd_dx_reference(dy: torch.Tensor, w: torch.Tensor) -> torch.
     dx = torch.empty((M, K), dtype=torch.bfloat16, device=dy.device)
     for k_start in range(0, K, 128):
         w_tile = w[:, k_start : k_start + 128].to(torch.bfloat16)
-        alpha = (w_tile.to(torch.float32).abs().sum(dim=1) * (1.0 / 128.0)).to(torch.bfloat16)
-        w_quant = torch.where(w_tile >= 0, alpha[:, None], -alpha[:, None])
+        w_quant = _quant_tile_bf16(w_tile, fmt=fmt)
         acc_dx = dy.to(torch.bfloat16).to(torch.float32) @ w_quant.to(torch.float32)
         dx[:, k_start : k_start + 128] = acc_dx.to(torch.bfloat16)
     return dx
@@ -176,60 +301,79 @@ def sram_tiled_qat_bwd_dx_reference(dy: torch.Tensor, w: torch.Tensor) -> torch.
 
 class FusedQATG128Function(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x: torch.Tensor, w: torch.Tensor, clip_mult: float = 0.0) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, w: torch.Tensor, clip_mult: float = 0.0, fmt: str = "w1") -> torch.Tensor:
         # Notice: Only x and master weight w are saved (0 bytes allocated for quantized W_hat!)
         M, K = x.shape
         N, Kw = w.shape
         assert K == Kw and K % 128 == 0, f"Invalid FusedQATG128 shapes: x={x.shape}, w={w.shape}"
+        if fmt not in ("w1", "w2"):
+            raise ValueError(f"fmt must be 'w1' or 'w2', got {fmt!r}")
         ctx.save_for_backward(x, w)
         ctx.clip_mult = _check_clip_mult(clip_mult)
+        ctx.fmt = fmt
         if HAS_TRITON and x.is_cuda and w.is_cuda:
             y = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
             grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
+            stages = select_triton_num_stages(x.device, w.dtype, 64, 64, 128, is_bwd_dx=False)
             fused_qat_g128_fwd_kernel[grid](
                 x, w, y, M, N, K,
                 x.stride(0), x.stride(1),
                 w.stride(0), w.stride(1),
                 y.stride(0), y.stride(1),
-                BLOCK_M=64, BLOCK_N=64, BLOCK_K=128,
+                BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, IS_TERNARY=(fmt == "w2"), num_stages=stages,
             )
             return y
-        return sram_tiled_qat_fwd_reference(x, w)
+        return sram_tiled_qat_fwd_reference(x, w, fmt=fmt)
 
     @staticmethod
     def backward(ctx, dy: torch.Tensor):
         x, w = ctx.saved_tensors
+        fmt = ctx.fmt
         if HAS_TRITON and dy.is_cuda and w.is_cuda:
             M, N = dy.shape
             _, K = w.shape
             dx = torch.empty((M, K), device=dy.device, dtype=torch.bfloat16)
             grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), K // 128)
+            stages = select_triton_num_stages(dy.device, w.dtype, 64, 64, 128, is_bwd_dx=True)
             fused_qat_g128_bwd_dx_kernel[grid](
                 dy, w, dx, M, N, K,
                 dy.stride(0), dy.stride(1),
                 w.stride(0), w.stride(1),
                 dx.stride(0), dx.stride(1),
-                BLOCK_M=64, BLOCK_K=128, BLOCK_N=64,
+                BLOCK_M=64, BLOCK_K=128, BLOCK_N=64, IS_TERNARY=(fmt == "w2"), num_stages=stages,
             )
         else:
-            dx = sram_tiled_qat_bwd_dx_reference(dy, w)
+            dx = sram_tiled_qat_bwd_dx_reference(dy, w, fmt=fmt)
         # Straight-Through Estimator: dW = dY^T @ X, optionally gated by Clipped STE indicator 1(|W| <= c * alpha_g)
-        # Tiled by BLOCK_K = 128 (docs/12 4.10 follow-up): the FP32 dW block, the |W| block and the clip mask are
-        # each N x 128, so the backward never holds an N x K FP32 temporary (it used to hold several, about 7x a
-        # BF16 W_hat at 4096^2). Only the dW output itself (in the master dtype) is N x K.
         N_w, K_w = w.shape
+        if HAS_TRITON and dy.is_cuda and x.is_cuda and w.is_cuda:
+            M_dy, _ = dy.shape
+            dw = torch.empty((N_w, K_w), dtype=w.dtype, device=w.device)
+            grid_dw = lambda meta: (triton.cdiv(N_w, meta['BLOCK_N']), K_w // 128)
+            stages_dw = select_triton_num_stages(dy.device, torch.bfloat16, 64, 64, 128, is_bwd_dx=True)
+            fused_qat_g128_bwd_dw_kernel[grid_dw](
+                dy, x, w, dw,
+                M_dy, N_w, K_w,
+                dy.stride(0), dy.stride(1),
+                x.stride(0), x.stride(1),
+                w.stride(0), w.stride(1),
+                dw.stride(0), dw.stride(1),
+                float(ctx.clip_mult),
+                USE_CLIP=(ctx.clip_mult > 0.0),
+                BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, num_stages=stages_dw,
+            )
+            return dx, dw, None, None
+        # Tiled by BLOCK_K = 128 fallback when Triton / CUDA is unavailable.
         dy_t = dy.to(torch.float32).T.contiguous()
         dw = torch.empty((N_w, K_w), dtype=w.dtype, device=w.device)
         for k0 in range(0, K_w, 128):
             blk = dy_t @ x[:, k0:k0 + 128].to(torch.float32)
             if ctx.clip_mult > 0.0:
-                # The gate uses the BF16-rounded master, the same value the forward takes alpha and the sign from
-                # (docs/12 4.25: with an FP32 master the raw weight gave a different alpha in 56 of 2,048 groups).
                 w_abs = w[:, k0:k0 + 128].to(torch.bfloat16).to(torch.float32).abs()
                 alpha_g = (w_abs.sum(dim=-1, keepdim=True) * (1.0 / 128.0)).to(torch.bfloat16).to(torch.float32)
                 blk.masked_fill_(~(w_abs <= ctx.clip_mult * alpha_g), 0.0)
             dw[:, k0:k0 + 128] = blk.to(w.dtype)
-        return dx, dw, None
+        return dx, dw, None, None
 
 
 class FusedQATG128Linear(torch.nn.Module):
@@ -251,13 +395,16 @@ class FusedQATG128Linear(torch.nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, clip_mult: float = 0.0, device=None,
-                 master_dtype: torch.dtype = torch.bfloat16) -> None:
+                 master_dtype: torch.dtype = torch.bfloat16, fmt: str = "w1") -> None:
         super().__init__()
         assert in_features % 128 == 0
         if master_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError(f"master_dtype must be torch.bfloat16 or torch.float32, got {master_dtype}")
+        if fmt not in ("w1", "w2"):
+            raise ValueError(f"fmt must be 'w1' or 'w2', got {fmt!r}")
         self.in_features = in_features
         self.out_features = out_features
+        self.fmt = fmt
         self.clip_mult = _check_clip_mult(clip_mult)
         self.weight = torch.nn.Parameter(
             (torch.randn((out_features, in_features), device=device, dtype=torch.float32) * 0.02).to(master_dtype)
@@ -265,13 +412,13 @@ class FusedQATG128Linear(torch.nn.Module):
 
     @torch.no_grad()
     def packer_input_weight(self) -> torch.Tensor:
-        """FP32 copy of the BF16-rounded master: the tensor to hand to quantize_and_pack_w1_g128_interleaved."""
+        """FP32 copy of the BF16-rounded master: the tensor to hand to quantize_and_pack_w1/w2_interleaved."""
         return self.weight.detach().to(torch.bfloat16).to(torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1])
-        y_2d = FusedQATG128Function.apply(x_2d, self.weight, self.clip_mult)
+        y_2d = FusedQATG128Function.apply(x_2d, self.weight, self.clip_mult, self.fmt)
         return y_2d.reshape(*orig_shape[:-1], self.out_features)
 
 
@@ -554,6 +701,41 @@ def main() -> None:
     assert gate_mis == 0, gate_mis
     print(f"[8] FP32 master deploy (4.25): W_hat vs packer(packer_input_weight) {mis_ok} mismatches | raw FP32 master "
           f"{mis_raw} (control) | clip gate vs forward alpha {gate_mis}")
+
+    # [9] GPU-aware Triton SRAM stage selection across hardware opt-in shared memory limits
+    expected_stages = {
+        49152:  (1, 2, 1, 1),   # 48 KB (legacy/Pascal)
+        65536:  (2, 2, 1, 1),   # 64 KB (Turing sm_75)
+        101376: (3, 3, 2, 2),   # 99 KB (Ampere sm_86 / Ada sm_89)
+        167936: (3, 3, 3, 3),   # 164 KB (A100 sm_80)
+        232448: (3, 3, 3, 3),   # 227 KB (H100 sm_90)
+    }
+    cpu_dev = torch.device("cpu")
+    for smem_lim, (bf_f, bf_b, fp_f, fp_b) in expected_stages.items():
+        got = (
+            select_triton_num_stages(cpu_dev, torch.bfloat16, 64, 64, 128, is_bwd_dx=False, smem_limit_override=smem_lim),
+            select_triton_num_stages(cpu_dev, torch.bfloat16, 64, 64, 128, is_bwd_dx=True, smem_limit_override=smem_lim),
+            select_triton_num_stages(cpu_dev, torch.float32, 64, 64, 128, is_bwd_dx=False, smem_limit_override=smem_lim),
+            select_triton_num_stages(cpu_dev, torch.float32, 64, 64, 128, is_bwd_dx=True, smem_limit_override=smem_lim),
+        )
+        assert got == (bf_f, bf_b, fp_f, fp_b), f"smem={smem_lim}: got {got}, expected {(bf_f, bf_b, fp_f, fp_b)}"
+    print("[9] GPU SRAM stage selector (48/64/99/164/227 KB): verified adaptive num_stages for BF16 & FP32")
+
+    # [10] Fused W2 Ternary (BitNet b1.58) STE QAT parity + >10% zero-weight verification
+    torch.manual_seed(41)
+    lay_w2 = FusedQATG128Linear(256, 128, clip_mult=CLIP_MULT_SAFE_MIN, master_dtype=torch.bfloat16, fmt="w2")
+    x_w2 = torch.randn((32, 256), dtype=torch.bfloat16, requires_grad=True)
+    y_w2 = lay_w2(x_w2)
+    dy_w2 = torch.randn_like(y_w2)
+    y_w2.backward(dy_w2)
+    with torch.no_grad():
+        w2_hat = lay_w2(torch.eye(256, dtype=torch.bfloat16)).T.contiguous()
+        y_w2_ref = sram_tiled_qat_fwd_reference(x_w2, lay_w2.weight, fmt="w2")
+        dx_w2_ref = sram_tiled_qat_bwd_dx_reference(dy_w2, lay_w2.weight, fmt="w2")
+        zero_w2 = float((w2_hat == 0).float().mean())
+    assert zero_w2 > 0.10, zero_w2
+    assert int((y_w2 != y_w2_ref).sum().item()) == 0 and int((x_w2.grad != dx_w2_ref).sum().item()) == 0
+    print(f"[10] Fused W2 Ternary STE (b1.58): 0 fwd/dx mismatches | ternary zeros={100.0 * zero_w2:.1f}% | PASS")
     print("[+] PASS: In-SRAM BLOCK_K=128 Fused STE QAT forward, backward, and Clipped STE verified.")
 
 

@@ -20,19 +20,72 @@ except ImportError:
 SM86_SM89_MAX_DYN_SMEM_BYTES = 101376  # 99 KB (99 * 1024 B) opt-in dynamic Shared Memory ceiling
 
 
-def get_unlocked_sm86_sm89_autotune_configs():
+def detect_device_smem_limit_bytes(device=None) -> int:
+    """
+    Returns the hardware dynamic shared-memory ceiling per threadblock (in bytes) for the target
+    CUDA device, or across all visible CUDA devices when device is None.
+    """
+    if not torch.cuda.is_available():
+        return SM86_SM89_MAX_DYN_SMEM_BYTES
+    if device is None:
+        limits = []
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            limits.append(int(
+                getattr(props, "shared_memory_per_block_optin", 0)
+                or getattr(props, "shared_memory_per_block", 49152)
+            ))
+        return min(limits) if limits else SM86_SM89_MAX_DYN_SMEM_BYTES
+    if isinstance(device, torch.device) and device.type != "cuda":
+        return SM86_SM89_MAX_DYN_SMEM_BYTES
+    dev_idx = device.index if isinstance(device, torch.device) else int(device)
+    if dev_idx is None:
+        dev_idx = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(dev_idx)
+    return int(
+        getattr(props, "shared_memory_per_block_optin", 0)
+        or getattr(props, "shared_memory_per_block", 49152)
+    )
+
+
+def select_gemm_autotune_specs(smem_limit_bytes: int):
+    """
+    Filters BF16 Triton GEMM tile specs (BM, BN, BK, GROUP_SIZE_M, num_stages, num_warps)
+    to those whose double/multi-buffered shared memory footprint fits within smem_limit_bytes.
+    """
+    candidates = [
+        # 164 KB+ tier (A100 / H100)
+        (128, 256, 64, 8, 3, 8),
+        # 99 KB tier (Ampere sm_86 / Ada sm_89)
+        (128, 256, 32, 8, 4, 8),
+        (256, 128, 32, 8, 4, 8),
+        (128, 128, 64, 8, 3, 8),
+        (128, 128, 32, 8, 5, 8),
+        (64,  128, 64, 4, 4, 4),
+        (64,  256, 32, 8, 4, 8),
+        # 48-64 KB tier (Turing / Pascal / compact fallback)
+        (128, 128, 32, 8, 3, 8),
+        (64,  128, 32, 8, 3, 4),
+        (64,  64,  32, 8, 2, 4),
+    ]
+    valid = [
+        spec for spec in candidates
+        if (spec[0] + spec[1]) * spec[2] * 2 * spec[4] <= smem_limit_bytes
+    ]
+    return valid if valid else [(64, 64, 32, 8, 1, 4)]
+
+
+def get_unlocked_sm86_sm89_autotune_configs(smem_limit_bytes: int = None):
     if not HAS_TRITON:
         return []
+    limit = smem_limit_bytes if smem_limit_bytes is not None else detect_device_smem_limit_bytes()
     return [
-        # High arithmetic intensity configs for Unlocked HMMA.16816.F32 (8-cycle issue)
-        # SMEM usage: (BM + BN) * BK * 2 bytes * num_stages <= 99,328 bytes (sm_86/sm_89 limit)
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
-        # Speculative Verification / Small-M configs (M = 32..128)
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
+        triton.Config(
+            {'BLOCK_M': bm, 'BLOCK_N': bn, 'BLOCK_K': bk, 'GROUP_SIZE_M': grp},
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm, bn, bk, grp, stages, warps in select_gemm_autotune_specs(limit)
     ]
 
 
@@ -139,6 +192,16 @@ def verify_autotune_sram_and_intensity() -> None:
     print("-" * 88)
 
     torch.manual_seed(0)
+    # Verify GPU-adaptive autotune filtering across 48 / 64 / 99 / 164 / 227 KB SRAM tiers
+    for lim in (49152, 65536, 101376, 167936, 232448):
+        filtered = select_gemm_autotune_specs(lim)
+        assert len(filtered) >= 1, f"No valid GEMM configs for {lim} B"
+        for bm, bn, bk, _, st, _ in filtered:
+            assert (bm + bn) * bk * 2 * st <= lim, f"Overflow for {lim} B"
+    assert (128, 256, 64, 8, 3, 8) not in select_gemm_autotune_specs(101376)
+    assert (128, 256, 64, 8, 3, 8) in select_gemm_autotune_specs(167936)
+    print(f"Adaptive SRAM GEMM configs: live_limit={detect_device_smem_limit_bytes()} B -> {len(select_gemm_autotune_specs(detect_device_smem_limit_bytes()))} valid configs")
+
     a = torch.randn((128, 256), dtype=torch.bfloat16)
     b = torch.randn((256, 128), dtype=torch.bfloat16)
     c = unlocked_bf16_gemm(a, b)

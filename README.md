@@ -72,26 +72,26 @@ This repository is an academic and systems engineering research project dedicate
 
 ---
 
-### 3. Windows 11 + Live CUDA GPU Verification
+### 3. Windows 11 & Linux / WSL2 Live CUDA GPU Verification
 
-On Windows 11 (x86-64 AVX2 + NVIDIA CUDA GPU, no `nvcc` or `make` required):
+On Windows 11 (x86-64 AVX2 + NVIDIA CUDA GPU, no `nvcc` or `make` required) or Linux / WSL2 (`Ubuntu-22.04` with PyTorch + Triton):
 ```powershell
-# Run all 22 host suites + live CUDA GPU Suite G2 + H1 hygiene + C++20 CPU Roofline
+# Windows 11: Run all host suites + live CUDA GPU Suite G2 + H1 hygiene + C++20 CPU Roofline
 .\verify_windows_gpu.ps1
 
-# Or invoke the master runner directly
+# Windows or Linux/WSL2: invoke the master runner directly (24/24 on both platforms)
 python run_all_tests.py --gpu
 ```
 Suite `G2` (`verify_windows_gpu.py`) runs a 7-stage live CUDA and adversarial red-team stress pass on consumer NVIDIA GPUs (such as the 8 GB RTX 4060 Laptop GPU):
-1. `unlocked_bf16_gemm` Tensor Core throughput vs FP32 cast fallback plus odd, strided/non-contiguous, zero, subnormal, and extreme-value inputs.
-2. SpinQuant Kronecker-Stiefel W1/W2 packing and `DeployBasisQATLinear` / `FusedQATG128Linear` CUDA bit-exact packer parity (`mode=1/2`, `BF16`/`FP32`).
-3. LServe INT4 Hadamard KV attention (`Sq=1` decode, CPU-mask regression, 0-active-page finite guard, extreme keys) and Tiled-CBC sieve (`Inf`/`NaN` guards).
+1. `unlocked_bf16_gemm` Tensor Core throughput vs FP32 cast fallback with GPU-adaptive SRAM autotune configs plus odd, strided/non-contiguous, zero, subnormal, and extreme-value inputs.
+2. SpinQuant Kronecker-Stiefel W1/W2 packing, fused Triton packed `W1`/`W2` inference GEMMs, and `DeployBasisQATLinear` / `FusedQATG128Linear` (`fmt="w1"` & `"w2"`) CUDA bit-exact packer parity (`mode=1/2`, `BF16`/`FP32`).
+3. LServe INT4 KV attention (Hadamard `per_token` & channel-outlier `per_channel` modes, causal masking, `Sq=1` decode, CPU-mask regression, 0-active-page finite guard, extreme keys) and Tiled-CBC sieve (`Inf`/`NaN` guards).
 4. Native C++20 AVX2 DLL (`libkinesis_unified.dll`) to CUDA parity across odd `(M, N, K)`, direct C ABI `-3` short-buffer guard, 8-thread concurrent determinism, and CUDA HF layer SafeTensors conversion.
-5. Live `nvidia-smi` telemetry polling, `AD107` 45 W clock-sag `RAISE_SIEVE_+5%_SHED_POWER`, and `NaN` clock-floor `HOLD` guards.
+5. Live `nvidia-smi` telemetry polling with `arch="AUTO"` GPU detection, `AD107` 45 W clock-sag `RAISE_SIEVE_+5%_SHED_POWER`, and `NaN` clock-floor `HOLD` guards.
 6. Non-square, odd-batch (`M=17`), odd-rank (`rank=1`), all-zero gradient recovery QAT + GaLore checks with persistent pinned host buffer reuse.
 7. 100.7M-parameter (`24 x 2048x2048`) 8 GB VRAM QAT + 4-bit pinned GaLore vs `BF16` AdamW benchmark (>45% peak VRAM savings, `< 2 MiB` step leak) plus sustained `4096^3` BF16 Tensor Core stability.
 
-Note: `kernel_driver_patch/` and `compiler_unlock/libcublas_unlock_shim.c` remain Linux-only architectural research models (`A4` skips cleanly on Windows). All userspace PyTorch/CUDA compute paths (`unlocked_gemm.py`, `spinquant_packer.py`, `lserve_sparse_attn.py`, `tiled_cbc_sieve.py`, `fused_qat_ste.py`, `galore_async_offload.py`, `closed_loop_governor.py`) and the C++20 `libkinesis_unified.dll` bridge run natively on Windows 11.
+Note: `kernel_driver_patch/` and `compiler_unlock/libcublas_unlock_shim.c` remain Linux-only architectural research models (`A4` runs natively on Linux/WSL2 and skips cleanly on Windows). All userspace PyTorch/CUDA/Triton compute paths (`unlocked_gemm.py`, `spinquant_packer.py`, `lserve_sparse_attn.py`, `tiled_cbc_sieve.py`, `fused_qat_ste.py`, `galore_async_offload.py`, `closed_loop_governor.py`) and C++20/POSIX `ucontext` / Windows Fibers (`B3`, `C1`, `F1-F4`) pass `24/24` suites with zero warnings on both platforms.
 
 ---
 

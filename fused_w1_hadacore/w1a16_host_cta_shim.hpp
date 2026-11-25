@@ -19,6 +19,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__linux__) || defined(__unix__) || defined(__APPLE__)
+#include <ucontext.h>
+#define HOST_CTA_USE_UCONTEXT 1
 #else
 #error "w1a16_host_cta_shim.hpp requires Windows Fibers (_WIN32) or POSIX ucontext"
 #endif
@@ -245,9 +248,11 @@ struct HostWarpCollectiveSlot {
     uint32_t ballot_mask_out;
 };
 
+#ifdef _WIN32
 static LPVOID g_main_fiber = nullptr;
 static LPVOID g_cta_fibers[HOST_MAX_CTA_THREADS] = {nullptr};
 static bool g_fibers_initialized = false;
+#endif
 
 static int g_active_cta_threads = 256;
 static int g_current_tid = 0;
@@ -256,6 +261,7 @@ static uint64_t g_cta_barrier_epoch[HOST_MAX_CTA_THREADS] = {0};
 static HostWarpCollectiveSlot g_warp_slots[HOST_MAX_WARPS][2];
 static void (*g_active_kernel_body)(void) = nullptr;
 
+#ifdef _WIN32
 static inline void host_switch_to_tid(int next_tid) {
     g_current_tid = next_tid;
     threadIdx.x = next_tid;
@@ -291,6 +297,56 @@ static inline void host_init_cta_fibers(void) {
     }
     g_fibers_initialized = true;
 }
+#else
+static ucontext_t g_main_ctx;
+static ucontext_t g_cta_ctx[HOST_MAX_CTA_THREADS];
+alignas(16) static uint8_t g_cta_stacks[HOST_MAX_CTA_THREADS][65536];
+static bool g_fibers_initialized = false;
+static bool g_in_fiber = false;
+
+static inline void host_switch_to_tid(int next_tid) {
+    ucontext_t* from_ctx = g_in_fiber ? &g_cta_ctx[g_current_tid] : &g_main_ctx;
+    g_in_fiber = true;
+    g_current_tid = next_tid;
+    threadIdx.x = next_tid;
+    threadIdx.y = 0;
+    threadIdx.z = 0;
+    int rc = swapcontext(from_ctx, &g_cta_ctx[next_tid]);
+    assert(rc == 0);
+    (void)rc;
+}
+
+static void host_cta_fiber_proc_posix(void) {
+    const int tid = g_current_tid;
+    while (true) {
+        g_active_kernel_body();
+        if (tid + 1 < g_active_cta_threads) {
+            host_switch_to_tid(tid + 1);
+        } else {
+            g_in_fiber = false;
+            int rc = swapcontext(&g_cta_ctx[tid], &g_main_ctx);
+            assert(rc == 0);
+            (void)rc;
+        }
+    }
+}
+
+static inline void host_init_cta_fibers(void) {
+    if (g_fibers_initialized) {
+        return;
+    }
+    for (int t = 0; t < HOST_MAX_CTA_THREADS; ++t) {
+        int rc = getcontext(&g_cta_ctx[t]);
+        assert(rc == 0);
+        (void)rc;
+        g_cta_ctx[t].uc_stack.ss_sp = g_cta_stacks[t];
+        g_cta_ctx[t].uc_stack.ss_size = sizeof(g_cta_stacks[t]);
+        g_cta_ctx[t].uc_link = &g_main_ctx;
+        makecontext(&g_cta_ctx[t], host_cta_fiber_proc_posix, 0);
+    }
+    g_fibers_initialized = true;
+}
+#endif
 
 // CTA-wide barrier: cycles tid 0 -> 1 -> ... -> g_active_cta_threads - 1 -> 0
 static inline void __syncthreads(void) {

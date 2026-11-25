@@ -92,7 +92,7 @@ SUITES: List[VerificationSuite] = [
         workstream="WS-B (CUDA CTA/Warp)",
         name="256-Fiber CTA & 32-Lane Warp __global__ Kernel Verification (45 Cases)",
         build_cmd=[
-            "g++", "-std=c++20", "-O2", "-Wall", "-Wextra",
+            "g++", "-std=c++20", "-O2", "-Wall", "-Wextra", "-Wno-unknown-pragmas",
             "-DSTANDALONE_VERIFY", "-x", "c++",
             "fused_w1_hadacore/w1a16_hadacore_kernel.cu",
             "-o", "fused_w1_hadacore/test_w1a16_kernel.exe",
@@ -111,7 +111,7 @@ SUITES: List[VerificationSuite] = [
         workstream="WS-C (Tiled-CBC CUDA)",
         name="32-Lane Warp-Butterfly Row-Max Holder & Tile L1 Sieve (__device__)",
         build_cmd=[
-            "g++", "-std=c++20", "-O2", "-mavx2", "-mfma", *MINGW_AVX2, "-Wall", "-Wextra",
+            "g++", "-std=c++20", "-O2", "-mavx2", "-mfma", *MINGW_AVX2, "-Wall", "-Wextra", "-Wno-unknown-pragmas",
             "-DSTANDALONE_VERIFY", "-x", "c++",
             "structural_filters/tiled_cbc_sieve.cu",
             "-o", "structural_filters/test_tiled_cbc.exe",
